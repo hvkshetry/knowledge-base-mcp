@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "knowledge-base": {
+      "command": "/path/to/your/venv/bin/python",
+      "args": ["server.py", "stdio"],
+      "env": {
+        "OLLAMA_URL": "http://localhost:11434",
+        "OLLAMA_MODEL": "snowflake-arctic-embed:xs",
+        "TEI_RERANK_URL": "http://localhost:8087",
+        "QDRANT_URL": "http://localhost:6333",
+        "FTS_DB_PATH": "data/fts.db",
+        "NOMIC_KB_SCOPES": "{\"kb\":{\"collection\":\"main_kb\",\"title\":\"Main Knowledge Base\"}}"
+      },
+      "autoApprove": ["search_kb"]
+    }
+  }
+}

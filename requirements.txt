@@ -1,0 +1,10 @@
+markitdown[all]
+docling
+qdrant-client
+requests
+numpy
+tqdm
+mcp[cli]
+fastmcp>=0.1.0
+pydantic>=2.0.0
+pymupdf

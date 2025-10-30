@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "knowledge-base": {
+      "command": "wsl",
+      "args": [
+        "-e",
+        "bash",
+        "-c",
+        "cd /home/your-username/knowledge-base-mcp && OLLAMA_URL='http://localhost:11434' OLLAMA_MODEL='snowflake-arctic-embed:xs' TEI_RERANK_URL='http://localhost:8087' QDRANT_URL='http://localhost:6333' FTS_DB_PATH='/home/your-username/knowledge-base-mcp/data/fts.db' NOMIC_KB_SCOPES='{\"kb\":{\"collection\":\"main_kb\",\"title\":\"Main Knowledge Base\"}}' /home/your-username/knowledge-base-mcp/.venv/bin/python /home/your-username/knowledge-base-mcp/server.py stdio"
+      ],
+      "autoApprove": [
+        "search_kb"
+      ]
+    }
+  }
+}

@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    command: ["--model-id", "BAAI/bge-reranker-base", "--payload-limit", "5000000"]
+    ports:
+      - "8087:80"
+    environment:
+      OMP_NUM_THREADS: "8"
+      TOKENIZERS_PARALLELISM: "false"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__ENABLE_TLS: "false"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  qdrant_storage:
