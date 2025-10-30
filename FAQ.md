@@ -4,15 +4,15 @@
 
 ### What is this project?
 
-A production-grade MCP (Model Context Protocol) server that provides hybrid semantic search over private document collections. It combines vector embeddings, lexical search (BM25), and cross-encoder reranking for high-quality results, all running locally.
+A production-grade MCP (Model Context Protocol) server that provides hybrid semantic search over private document collections. It combines vector embeddings, lexical search (BM25), and cross-encoder reranking for high-quality results, all running locally. **Key benefit: zero-cost embeddings and reranking** - no per-document or per-query charges.
 
-### Why use local semantic search?
+### Why use local embeddings and reranking?
 
-- **Privacy**: Documents never leave your machine
-- **Cost**: No API fees, unlimited searches
-- **Control**: Full customization of models and parameters
-- **Speed**: No network latency
-- **Offline**: Works without internet
+- **Zero Embedding Cost**: Use Ollama locally - no per-document charges for embeddings during ingestion
+- **Zero Reranking Cost**: Local TEI reranking - no per-query charges for result reranking
+- **Unlimited Scale**: Ingest and search unlimited documents without incremental API costs
+- **Speed**: <300ms search latency - no API roundtrips for embeddings or reranking
+- **Control**: Full customization of embedding models, search parameters, and chunking
 
 ### What document formats are supported?
 
@@ -26,12 +26,13 @@ A production-grade MCP (Model Context Protocol) server that provides hybrid sema
 
 | Feature | This Project | Cloud (e.g., Pinecone + OpenAI) |
 |---------|-------------|----------------------------------|
-| **Cost** | Free (hardware only) | $$ per query/storage |
-| **Privacy** | 100% local | Data sent to cloud |
-| **Latency** | <300ms | 500-2000ms |
-| **Customization** | Full control | Limited |
-| **Offline** | Yes | No |
-| **Scale** | Limited by hardware | Unlimited |
+| **Embedding Cost** | $0 (local Ollama) | $0.0001-0.0004 per 1K tokens |
+| **Reranking Cost** | $0 (local TEI) | $0.002-0.01 per query |
+| **Storage Cost** | Local hardware only | $0.25-0.50 per GB/month |
+| **Total Cost** | Claude subscription + hardware | Claude + per-document + per-query + storage |
+| **Search Latency** | <300ms | 500-2000ms |
+| **Internet Required** | Yes (for Claude API) | Yes |
+| **Scale** | Limited by local hardware | Unlimited (cloud infrastructure) |
 
 ## Installation & Setup
 

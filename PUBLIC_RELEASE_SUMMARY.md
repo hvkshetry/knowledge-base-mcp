@@ -225,14 +225,14 @@ On GitHub repository page, add topics:
 
 When promoting the repository, emphasize:
 
-1. **Local & Private**: No cloud dependencies, full data privacy
-2. **Production-Ready**: Robust error handling, incremental ingestion
-3. **High Quality**: Hybrid search with reranking
-4. **Well Documented**: Comprehensive guides for all skill levels
-5. **Easy Setup**: Docker Compose + example scripts
-6. **Cost-Free**: Uses only open-source tools
-7. **MCP Integration**: Works with Claude Desktop and Codex CLI
-8. **Flexible**: Multi-collection support, configurable search modes
+1. **Zero-Cost Embeddings & Reranking**: No per-document or per-query charges - only Claude subscription
+2. **Unlimited Scale**: Ingest and search unlimited documents without incremental API costs
+3. **High Quality**: Hybrid search with reranking (semantic + BM25 + cross-encoder)
+4. **Production-Ready**: Robust error handling, incremental ingestion
+5. **Well Documented**: Comprehensive guides for all skill levels
+6. **Easy Setup**: Docker Compose + example scripts
+7. **Open Source Stack**: Local Ollama embeddings, Qdrant, SQLite FTS, TEI reranker
+8. **MCP Integration**: Works with Claude Desktop, Claude Code, and Codex CLI
 
 ## 📋 Pre-Release Checklist
 

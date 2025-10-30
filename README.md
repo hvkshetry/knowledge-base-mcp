@@ -1,15 +1,14 @@
 # Semantic Search MCP Server
 
-A production-grade **Model Context Protocol (MCP)** server that provides hybrid semantic search over private document collections using local, open-source tools. Built for privacy-conscious users who want powerful document search without cloud dependencies.
+A production-grade **Model Context Protocol (MCP)** server that provides hybrid semantic search over private document collections using local, open-source tools. **Zero-cost embeddings and reranking** - no per-document or per-query charges beyond your Claude subscription.
 
 ## 🌟 Features
 
+- **Zero-Cost Embeddings**: Uses local Ollama for unlimited document embeddings - no per-document charges
+- **Zero-Cost Reranking**: Local TEI cross-encoder reranking - no per-query charges
 - **Hybrid Search**: Combines dense vector embeddings (semantic) with BM25 lexical search using Reciprocal Rank Fusion (RRF)
-- **Cross-Encoder Reranking**: Improves result quality with Hugging Face TEI reranker
 - **Multi-Collection Support**: Organize documents into separate knowledge bases with dedicated search tools
-- **Context-Aware Results**: Automatically expands results with neighboring chunks for better context
 - **Incremental Ingestion**: Smart update detection only reprocesses changed documents
-- **Local & Private**: All processing happens on your machine - no API keys, no cloud services
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, and Codex CLI
 
 ## 🏗️ Architecture
@@ -293,9 +292,8 @@ Built with:
 
 ---
 
-**Why local semantic search?**
-- 🔒 **Privacy**: Your documents never leave your machine
-- 💰 **Cost**: No API fees, unlimited searches
-- 🎯 **Control**: Full customization of models and parameters
-- ⚡ **Speed**: No network latency for searches
-- 🔌 **Offline**: Works without internet connection
+**Why local embeddings and reranking?**
+- 💰 **Zero Additional Cost**: No per-document embedding fees, no per-query reranking charges - only Claude subscription
+- 📈 **Unlimited Scale**: Ingest and search unlimited documents without incremental costs
+- ⚡ **Fast**: Local search with <300ms latency - no API roundtrips for embeddings or reranking
+- 🎯 **Control**: Full customization of embedding models, search parameters, and chunking strategy
