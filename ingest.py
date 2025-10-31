@@ -5,7 +5,7 @@ import uuid
 import time
 import fnmatch
 import hashlib
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 import gc
 import re
 
@@ -34,32 +34,65 @@ def file_uri(p: pathlib.Path) -> str:
 
 
 # -------------------- Extractors --------------------
-def extract_markitdown(p: pathlib.Path) -> str:
+def extract_markitdown(p: pathlib.Path) -> Tuple[str, Dict[str, Any]]:
     from markitdown import MarkItDown
     md = MarkItDown()
     res = md.convert(str(p))
-    return res.text_content or ""
+    return res.text_content or "", {}
 
 
-def extract_docling(p: pathlib.Path) -> str:
+def extract_docling(p: pathlib.Path) -> Tuple[str, Dict[str, Any]]:
     from docling.document_converter import DocumentConverter
     doc = DocumentConverter().convert(str(p)).document
-    return doc.export_to_markdown() or ""
+    return doc.export_to_markdown() or "", {}
 
 
-def extract_pdf_pymupdf(p: pathlib.Path) -> str:
+def extract_pdf_pymupdf(p: pathlib.Path) -> Tuple[str, Dict[str, Any]]:
     try:
         import fitz  # PyMuPDF
     except Exception:
-        return ""
+        return "", {}
     try:
         texts = []
+        spans: List[Tuple[int, int, int]] = []
         with fitz.open(str(p)) as doc:
-            for page in doc:
-                texts.append(page.get_text("text") or "")
-        return "\n".join(texts).strip()
+            offset = 0
+            total_pages = len(doc)
+            for idx, page in enumerate(doc):
+                page_text = page.get_text("text") or ""
+                texts.append(page_text)
+                end_offset = offset + len(page_text)
+                spans.append((offset, end_offset, idx + 1))
+                # Account for the newline inserted by join (except after last page)
+                offset = end_offset
+                if idx < total_pages - 1:
+                    offset += 1
+        raw_text = "\n".join(texts)
+        if not raw_text:
+            return "", {}
+        leading_trim = len(raw_text) - len(raw_text.lstrip())
+        text = raw_text.strip()
+        adjusted_spans = []
+        text_len = len(text)
+        for start, end, page_num in spans:
+            adj_start = max(0, start - leading_trim)
+            adj_end = max(adj_start, min(text_len, end - leading_trim))
+            if adj_end <= adj_start:
+                continue
+            if adj_start >= text_len:
+                continue
+            if adj_end <= 0:
+                continue
+            adjusted_spans.append(
+                {
+                    "page": page_num,
+                    "start": adj_start,
+                    "end": adj_end,
+                }
+            )
+        return text, {"page_spans": adjusted_spans}
     except Exception:
-        return ""
+        return "", {}
 
 
 def choose_extractor(extractor: str, p: pathlib.Path):
@@ -69,33 +102,35 @@ def choose_extractor(extractor: str, p: pathlib.Path):
     return extract_markitdown
 
 
-def extract_with_fallback(extractor: str, p: pathlib.Path) -> str:
+def extract_with_fallback(extractor: str, p: pathlib.Path) -> Tuple[str, Dict[str, Any]]:
     """Try preferred extractor; for PDFs, fall back to Docling on failure.
 
     Docling fallback can be disabled by setting env NO_DOCLING_FALLBACK to
     one of: '1', 'true', 'yes'.
     """
     text = ""
+    meta: Dict[str, Any] = {}
     ext = p.suffix.lower()
     no_docling = os.getenv("NO_DOCLING_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
     # For PDFs, try fast PyMuPDF first
     if ext == ".pdf":
-        text = extract_pdf_pymupdf(p)
+        text, meta = extract_pdf_pymupdf(p)
         if text.strip():
-            return text
+            return text, meta
     # Try preferred extractor (MarkItDown by default)
     try:
-        text = choose_extractor(extractor, p)(p)
+        text, meta = choose_extractor(extractor, p)(p)
     except Exception:
         text = ""
+        meta = {}
     # If PDF and no text, try Docling as fallback (CPU-only to avoid CUDA issues)
     if not text.strip() and ext == ".pdf" and extractor != "docling" and not no_docling:
         try:
             os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-            text = extract_docling(p)
+            text, meta = extract_docling(p)
         except Exception:
-            pass
-    return text or ""
+            text, meta = "", {}
+    return text or "", meta
 
 
 # -------------------- Chunking --------------------
@@ -474,7 +509,7 @@ def main():
                         continue
 
                 # Extract early and apply content filters before heavy work
-                text = extract_with_fallback(args.extractor, p)
+                text, extraction_meta = extract_with_fallback(args.extractor, p)
                 if not text.strip():
                     continue
                 if args.min_words and alpha_word_count(text) < args.min_words:
@@ -495,10 +530,28 @@ def main():
 
                 # Only now chunk (and embed if not fts-only)
                 pieces = chunk(text, args.max_chars, args.overlap)
+                page_spans = extraction_meta.get("page_spans") if extraction_meta else None
+
+                def pages_for_span(start: int, end: int) -> List[int]:
+                    if not page_spans:
+                        return []
+                    pages: List[int] = []
+                    for span in page_spans:
+                        span_start = span.get("start", 0)
+                        span_end = span.get("end", 0)
+                        page_num = span.get("page")
+                        if page_num is None:
+                            continue
+                        if span_end > start and span_start < end:
+                            if page_num not in pages:
+                                pages.append(page_num)
+                    return pages
+
                 # Precompute ids/payloads to use in both vector and FTS paths
                 ids, payloads = [], []
                 for (s, e, t) in [(s, e, t) for (s, e, t) in pieces]:
                     chunk_uuid = uuid.uuid5(uuid.UUID(doc_id), f"{s}-{e}")
+                    page_numbers = pages_for_span(s, e)
                     ids.append(str(chunk_uuid))
                     payloads.append({
                         "doc_id": doc_id,
@@ -509,6 +562,7 @@ def main():
                         "filename": p.name,
                         "mtime": mtime,
                         "content_hash": content_hash,
+                        "page_numbers": page_numbers,
                     })
 
                 # Vector upsert path
@@ -560,6 +614,7 @@ def main():
                     try:
                         rows = []
                         for i, (s, e, t) in enumerate(pieces):
+                            page_numbers = pages_for_span(s, e)
                             rows.append({
                                 "text": t,
                                 "chunk_id": ids[i],
@@ -569,6 +624,7 @@ def main():
                                 "chunk_start": s,
                                 "chunk_end": e,
                                 "mtime": mtime,
+                                "page_numbers": ",".join(str(n) for n in page_numbers) if page_numbers else "",
                             })
                         fts_writer.upsert_many(rows)
                     except Exception as fex:

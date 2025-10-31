@@ -9,6 +9,7 @@ A production-grade **Model Context Protocol (MCP)** server that provides hybrid 
 - **Hybrid Search**: Combines dense vector embeddings (semantic) with BM25 lexical search using Reciprocal Rank Fusion (RRF)
 - **Multi-Collection Support**: Organize documents into separate knowledge bases with dedicated search tools
 - **Incremental Ingestion**: Smart update detection only reprocesses changed documents
+- **Page-Level Provenance**: Chunk payloads carry originating page numbers so UI layers can surface precise citations
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, and Codex CLI
 
 ## 🏗️ Architecture

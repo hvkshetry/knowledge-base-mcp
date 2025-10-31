@@ -11,6 +11,11 @@ This guide mirrors the successful `aerobic_treatment_kb` ingestion and shows how
   - Ollama: `ollama serve` and `ollama pull snowflake-arctic-embed:xs`
 - Work from repo root so relative paths like `data/*.db` resolve. Create the folder if needed: `mkdir -p data`.
 
+## Page-Level Metadata
+- Every chunk written to Qdrant now carries a `page_numbers` list so downstream tools can cite the originating page(s).
+- The SQLite FTS index mirrors this in a new `page_numbers` column; rebuild older FTS databases with `--fts-rebuild` once to pick up the schema change.
+- For non-PDF formats (for example, Markdown notes) the page list defaults to empty because no page provenance is available.
+
 ## Bulk Run Template (Linux/WSL)
 ```bash
 ./.venv/bin/python ingest.py \

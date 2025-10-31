@@ -4,6 +4,49 @@ import time
 from typing import Iterable, Dict, Any, List, Optional
 
 
+FTS_CREATE_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+    text,
+    chunk_id UNINDEXED,
+    doc_id UNINDEXED,
+    path UNINDEXED,
+    filename UNINDEXED,
+    chunk_start UNINDEXED,
+    chunk_end UNINDEXED,
+    mtime UNINDEXED,
+    page_numbers UNINDEXED,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+"""
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'")
+    exists = cur.fetchone() is not None
+    if exists:
+        cur = conn.execute("PRAGMA table_info(fts_chunks)")
+        columns = [row[1] for row in cur.fetchall()]
+        if "page_numbers" not in columns:
+            cur = conn.execute(
+                "SELECT text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime FROM fts_chunks"
+            )
+            existing_rows = cur.fetchall()
+            conn.execute("DROP TABLE IF EXISTS fts_chunks")
+            conn.execute(FTS_CREATE_SQL)
+            if existing_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')
+                    """,
+                    existing_rows,
+                )
+            conn.commit()
+            return
+    conn.execute(FTS_CREATE_SQL)
+    conn.commit()
+
+
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.exists(parent):
@@ -19,22 +62,7 @@ def ensure_fts(db_path: str) -> None:
             conn = sqlite3.connect(db_path)
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=5000;")
-            conn.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
-                    text,
-                    chunk_id UNINDEXED,
-                    doc_id UNINDEXED,
-                    path UNINDEXED,
-                    filename UNINDEXED,
-                    chunk_start UNINDEXED,
-                    chunk_end UNINDEXED,
-                    mtime UNINDEXED,
-                    tokenize = 'unicode61 remove_diacritics 2'
-                );
-                """
-            )
-            conn.commit()
+            _ensure_schema(conn)
             return
         except sqlite3.OperationalError as ex:
             last_err = ex
@@ -69,6 +97,7 @@ class FTSWriter:
                 self.conn = sqlite3.connect(db_path)
                 self.conn.execute("PRAGMA journal_mode=WAL;")
                 self.conn.execute("PRAGMA busy_timeout=5000;")
+                _ensure_schema(self.conn)
                 break
             except sqlite3.OperationalError as ex:
                 last_err = ex
@@ -82,21 +111,7 @@ class FTSWriter:
         cur = self.conn.cursor()
         if recreate:
             cur.execute("DROP TABLE IF EXISTS fts_chunks")
-        cur.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
-                text,
-                chunk_id UNINDEXED,
-                doc_id UNINDEXED,
-                path UNINDEXED,
-                filename UNINDEXED,
-                chunk_start UNINDEXED,
-                chunk_end UNINDEXED,
-                mtime UNINDEXED,
-                tokenize = 'unicode61 remove_diacritics 2'
-            );
-            """
-        )
+        cur.execute(FTS_CREATE_SQL)
         self.conn.commit()
 
     def upsert_many(self, rows: Iterable[Dict[str, Any]]) -> int:
@@ -112,8 +127,8 @@ class FTSWriter:
         # Insert many
         cur.executemany(
             """
-            INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -125,6 +140,7 @@ class FTSWriter:
                     int(r.get("chunk_start", 0) or 0),
                     int(r.get("chunk_end", 0) or 0),
                     int(r.get("mtime", 0) or 0),
+                    str(r.get("page_numbers", "") or ""),
                 )
                 for r in rows
             ],
@@ -183,8 +199,8 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
             cur.execute("DELETE FROM fts_chunks WHERE chunk_id = ?", (str(r.get("chunk_id")),))
             cur.execute(
                 """
-                INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r.get("text", ""),
@@ -195,6 +211,7 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     int(r.get("chunk_start", 0) or 0),
                     int(r.get("chunk_end", 0) or 0),
                     int(r.get("mtime", 0) or 0),
+                    str(r.get("page_numbers", "") or ""),
                 ),
             )
             count += 1
@@ -215,7 +232,7 @@ def search(db_path: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         # Order by bm25() ASC for best first
         cur.execute(
             """
-            SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, text,
+            SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers, text,
                    bm25(fts_chunks) AS bm25
             FROM fts_chunks
             WHERE fts_chunks MATCH ?
