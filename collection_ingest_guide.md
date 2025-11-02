@@ -9,12 +9,14 @@ This guide mirrors the successful `aerobic_treatment_kb` ingestion and shows how
 - Ensure services are available:
   - Qdrant: `docker compose up -d qdrant`
   - Ollama: `ollama serve` and `ollama pull snowflake-arctic-embed:xs`
+- Optional but recommended: set a Hugging Face cache for Docling layout models once per repo: `export HF_HOME="$PWD/.cache/hf"`.
 - Work from repo root so relative paths like `data/*.db` resolve. Create the folder if needed: `mkdir -p data`.
 
-## Page-Level Metadata
-- Every chunk written to Qdrant now carries a `page_numbers` list so downstream tools can cite the originating page(s).
-- The SQLite FTS index mirrors this in a new `page_numbers` column; rebuild older FTS databases with `--fts-rebuild` once to pick up the schema change.
-- For non-PDF formats (for example, Markdown notes) the page list defaults to empty because no page provenance is available.
+## Structured Metadata Snapshot
+- A triage pass labels each PDF page; light pages stay on MarkItDown while table/multi-column/scan pages route through Docling for heading/table/caption extraction.
+- Chunks in Qdrant now include pages, section breadcrumbs, element IDs, bounding boxes, source tool, table headers/units, and more. Thin-payload mode can drop `text` to keep the vector store governance-safe.
+- The SQLite FTS index stores the same metadata so lexical search and reranking can access provenance fields.
+- Lightweight knowledge-graph (`data/graph.db`) and summary (`data/summary.db`) stores are refreshed on every run; graph nodes link docs → sections → chunks → heuristic entities.
 
 ## Bulk Run Template (Linux/WSL)
 ```bash
@@ -31,6 +33,7 @@ This guide mirrors the successful `aerobic_treatment_kb` ingestion and shows how
   --ollama-keepalive 2h \
   --ollama-timeout 600 \
   --extractor auto \
+  --thin-payload \
   --embed-robust
 ```
 Replace the `--root`, `--qdrant-collection`, and `--fts-db` arguments for other topics (for example, point at `ro_kb` with `data/ro_kb_fts.db`).
@@ -50,6 +53,7 @@ Replace the `--root`, `--qdrant-collection`, and `--fts-db` arguments for other 
   --ollama-keepalive 2h `
   --ollama-timeout 600 `
   --extractor auto `
+  --thin-payload `
   --embed-robust
 ```
 
@@ -114,6 +118,11 @@ This drops and recreates `fts_chunks`, ensuring the lexical index matches the la
 ## Post-Run Validation
 - Check the terminal for `SUMMARY processed_docs=... processed_chunks=... errors=0`.
 - Confirm the collection exists: `curl http://localhost:6333/collections | jq '.result.collections[].name'`.
+- Inspect graph/summary stores if needed:
+  ```bash
+  sqlite3 data/graph.db 'SELECT type, COUNT(*) FROM nodes GROUP BY type'
+  sqlite3 data/summary.db 'SELECT COUNT(*) FROM summaries'
+  ```
 - Count vectors per document with the Python client (update the filename list as needed):
   ```bash
   ./.venv/bin/python - <<'PY'
@@ -150,6 +159,7 @@ This drops and recreates `fts_chunks`, ensuring the lexical index matches the la
   PY
   ```
 - Run spot queries with your retrieval tooling (for example, `python -m tools.sample_query --collection ix_db --query "anion resin regen"`).
+- Optionally run the CI-friendly evaluation harness: `./.venv/bin/python eval.py --gold eval/gold_sets/ix_db.jsonl --mode auto --fts-db data/ix_db_fts.db --min-ndcg 0.85 --min-recall 0.8 --max-latency 3000`.
 
 ## Recommended Next Steps
 1. Keep the single-document command handy for stubborn PDFs; it is safe to rerun because chunk IDs are deterministic.

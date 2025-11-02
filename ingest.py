@@ -8,10 +8,15 @@ import hashlib
 from typing import Any, Dict, List, Tuple
 import gc
 import re
+import json
 
 import requests
 import numpy as np
 from tqdm import tqdm
+
+from ingest_blocks import extract_document_blocks, chunk_blocks
+from graph_builder import update_graph
+from summary_index import upsert_summaries
 
 
 # Default skip patterns to avoid noisy/system files
@@ -134,17 +139,26 @@ def extract_with_fallback(extractor: str, p: pathlib.Path) -> Tuple[str, Dict[st
 
 
 # -------------------- Chunking --------------------
-def chunk(text: str, max_chars: int = 1800, overlap: int = 150) -> List[Tuple[int, int, str]]:
+def fallback_chunk(text: str, max_chars: int = 1800, overlap: int = 150) -> List[Dict[str, Any]]:
     if max_chars <= 0:
         raise ValueError("max_chars must be > 0")
     if overlap >= max_chars:
         overlap = max(0, max_chars // 4)
-    out = []
+    out: List[Dict[str, Any]] = []
     i, n = 0, len(text)
     step = max_chars - overlap
     while i < n:
         j = min(i + max_chars, n)
-        out.append((i, j, text[i:j]))
+        segment = text[i:j]
+        if segment.strip():
+            out.append(
+                {
+                    "start": i,
+                    "end": j,
+                    "text": segment,
+                    "meta": {"chunk_type": "paragraph", "heading_path": []},
+                }
+            )
         if j == n:
             break
         i += step
@@ -403,6 +417,7 @@ def main():
     ap.add_argument("--no-fts", action="store_true", help="Do not write to lexical FTS index")
     ap.add_argument("--fts-only", action="store_true", help="Only update lexical FTS; skip embeddings and Qdrant")
     ap.add_argument("--fts-rebuild", action="store_true", help="Drop and recreate FTS table before ingest")
+    ap.add_argument("--thin-payload", action="store_true", help="Store minimal payload in vector index (omit text)")
 
     # Incremental ingest
     ap.add_argument("--skip-existing", action="store_true", help="Skip files whose doc_id already exists in store")
@@ -410,6 +425,10 @@ def main():
     ap.add_argument("--delete-changed", action="store_true", help="Delete existing chunks for a doc_id before reingesting when changed")
 
     args = ap.parse_args()
+
+    if not args.thin_payload:
+        thin_env = os.getenv("THIN_VECTOR_PAYLOAD", "").strip().lower()
+        args.thin_payload = thin_env in {"1", "true", "yes"}
 
     root = pathlib.Path(args.root)
     if not root.is_dir():
@@ -514,8 +533,25 @@ def main():
                     continue
                 if args.min_words and alpha_word_count(text) < args.min_words:
                     continue
-                content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                triage_blocks, _ = extract_document_blocks(p, doc_id)
+                chunks, raw_text = chunk_blocks(
+                    triage_blocks,
+                    args.max_chars,
+                    overlap_sentences=max(1, args.overlap // 80 if args.overlap else 1),
+                )
+                if not raw_text.strip():
+                    raw_text = text
+                content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
                 mtime = int(p.stat().st_mtime)
+
+                try:
+                    update_graph(args.qdrant_collection, doc_id, path_str, chunks)
+                except Exception as gex:
+                    print(f"WARN: graph update failed for {p}: {gex}")
+                try:
+                    upsert_summaries(args.qdrant_collection, doc_id, chunks)
+                except Exception as sex:
+                    print(f"WARN: summary update failed for {p}: {sex}")
 
                 # Incremental changed-only check before doing embeddings
                 if args.changed_only and not args.fts_only:
@@ -528,53 +564,46 @@ def main():
                     if args.delete_changed:
                         qdrant_delete_by_doc_id(args.qdrant_collection, doc_id)
 
-                # Only now chunk (and embed if not fts-only)
-                pieces = chunk(text, args.max_chars, args.overlap)
-                page_spans = extraction_meta.get("page_spans") if extraction_meta else None
-
-                def pages_for_span(start: int, end: int) -> List[int]:
-                    if not page_spans:
-                        return []
-                    pages: List[int] = []
-                    for span in page_spans:
-                        span_start = span.get("start", 0)
-                        span_end = span.get("end", 0)
-                        page_num = span.get("page")
-                        if page_num is None:
-                            continue
-                        if span_end > start and span_start < end:
-                            if page_num not in pages:
-                                pages.append(page_num)
-                    return pages
-
-                # Precompute ids/payloads to use in both vector and FTS paths
-                ids, payloads = [], []
-                for (s, e, t) in [(s, e, t) for (s, e, t) in pieces]:
+                ids: List[str] = []
+                payloads: List[Dict[str, Any]] = []
+                for chunk in chunks:
+                    s = int(chunk.get("chunk_start", 0) or 0)
+                    e = int(chunk.get("chunk_end", 0) or 0)
                     chunk_uuid = uuid.uuid5(uuid.UUID(doc_id), f"{s}-{e}")
-                    page_numbers = pages_for_span(s, e)
                     ids.append(str(chunk_uuid))
-                    payloads.append({
+                    payload = {
                         "doc_id": doc_id,
                         "path": path_str,
                         "chunk_start": s,
                         "chunk_end": e,
-                        "text": t,
                         "filename": p.name,
                         "mtime": mtime,
                         "content_hash": content_hash,
-                        "page_numbers": page_numbers,
-                    })
+                        "page_numbers": chunk.get("pages", []),
+                        "section_path": chunk.get("section_path", []),
+                        "element_ids": chunk.get("element_ids", []),
+                        "bboxes": chunk.get("bboxes", []),
+                        "types": chunk.get("types", []),
+                        "source_tools": chunk.get("source_tools", []),
+                        "table_headers": chunk.get("headers", []),
+                        "table_units": chunk.get("units", []),
+                        "text": chunk.get("text", ""),
+                    }
+                    if args.thin_payload:
+                        payload["thin_payload"] = True
+                        payload.pop("text", None)
+                    payloads.append(payload)
 
                 # Vector upsert path
                 upserted_vecs = 0
                 if not args.fts_only:
                     if args.embed_robust:
-                        # Embed in windows and skip failures per-chunk
-                        n = len(pieces)
+                        n = len(chunks)
                         win = max(1, int(args.embed_window_size))
                         for start in range(0, n, win):
                             end = min(start + win, n)
-                            texts_w = [t for (_, _, t) in pieces[start:end]]
+                            subset = chunks[start:end]
+                            texts_w = [c.get("text", "") for c in subset]
                             vecs_w = embed_texts_robust(
                                 args.ollama_url,
                                 args.ollama_model,
@@ -597,7 +626,7 @@ def main():
                         vecs = embed_texts(
                             args.ollama_url,
                             args.ollama_model,
-                            [t for (_, _, t) in pieces],
+                            [c.get("text", "") for c in chunks],
                             batch_size=args.batch_size,
                             timeout=args.ollama_timeout,
                             normalize=(args.metric == "cosine"),
@@ -612,9 +641,20 @@ def main():
                 # Also upsert into local FTS index (lexical)
                 if not args.no_fts and fts_writer is not None:
                     try:
+                        fts_writer.delete_doc(doc_id)
                         rows = []
-                        for i, (s, e, t) in enumerate(pieces):
-                            page_numbers = pages_for_span(s, e)
+                        for i, chunk in enumerate(chunks):
+                            s = int(chunk.get("chunk_start", 0) or 0)
+                            e = int(chunk.get("chunk_end", 0) or 0)
+                            t = chunk.get("text", "")
+                            pages = chunk.get("pages", [])
+                            section_path = chunk.get("section_path", [])
+                            element_ids = chunk.get("element_ids", [])
+                            bboxes = chunk.get("bboxes", [])
+                            types = chunk.get("types", [])
+                            source_tools = chunk.get("source_tools", [])
+                            table_headers = chunk.get("headers", [])
+                            table_units = chunk.get("units", [])
                             rows.append({
                                 "text": t,
                                 "chunk_id": ids[i],
@@ -624,7 +664,15 @@ def main():
                                 "chunk_start": s,
                                 "chunk_end": e,
                                 "mtime": mtime,
-                                "page_numbers": ",".join(str(n) for n in page_numbers) if page_numbers else "",
+                                "page_numbers": ",".join(str(n) for n in pages) if pages else "",
+                                "pages": json.dumps(pages, ensure_ascii=False),
+                                "section_path": json.dumps(section_path, ensure_ascii=False) if section_path else "",
+                                "element_ids": json.dumps(element_ids, ensure_ascii=False) if element_ids else "",
+                                "bboxes": json.dumps(bboxes, ensure_ascii=False) if bboxes else "",
+                                "types": json.dumps(types, ensure_ascii=False) if types else "",
+                                "source_tools": json.dumps(source_tools, ensure_ascii=False) if source_tools else "",
+                                "table_headers": json.dumps(table_headers, ensure_ascii=False) if table_headers else "",
+                                "table_units": json.dumps(table_units, ensure_ascii=False) if table_units else "",
                             })
                         fts_writer.upsert_many(rows)
                     except Exception as fex:

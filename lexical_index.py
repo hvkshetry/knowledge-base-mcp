@@ -3,6 +3,32 @@ import sqlite3
 import time
 from typing import Iterable, Dict, Any, List, Optional
 
+ALIASES = {
+    "MBR": ["membrane bioreactor"],
+    "MLSS": ["mixed liquor suspended solids"],
+    "SBR": ["sequencing batch reactor"],
+    "BOD": ["biochemical oxygen demand"],
+    "COD": ["chemical oxygen demand"],
+    "P&ID": ["piping and instrumentation diagram", "PID"],
+    "PLC": ["programmable logic controller"],
+    "DAF": ["dissolved air flotation"],
+    "RO": ["reverse osmosis"],
+}
+
+
+def expand_query(query: str) -> str:
+    expanded = [query]
+    lower_q = query.lower()
+    for key, synonyms in ALIASES.items():
+        key_lower = key.lower()
+        if key_lower in lower_q or any(syn.lower() in lower_q for syn in synonyms):
+            terms = [key] + synonyms
+            clause = " OR ".join(f"\"{term}\"" for term in terms)
+            expanded.append(f"({clause})")
+    if len(expanded) == 1:
+        return query
+    return " OR ".join(expanded)
+
 
 FTS_CREATE_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
@@ -15,6 +41,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
     chunk_end UNINDEXED,
     mtime UNINDEXED,
     page_numbers UNINDEXED,
+    pages UNINDEXED,
+    section_path UNINDEXED,
+    element_ids UNINDEXED,
+    bboxes UNINDEXED,
+    types UNINDEXED,
+    source_tools UNINDEXED,
+    table_headers UNINDEXED,
+    table_units UNINDEXED,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 """
@@ -24,25 +58,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'")
     exists = cur.fetchone() is not None
     if exists:
-        cur = conn.execute("PRAGMA table_info(fts_chunks)")
-        columns = [row[1] for row in cur.fetchall()]
-        if "page_numbers" not in columns:
-            cur = conn.execute(
-                "SELECT text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime FROM fts_chunks"
-            )
-            existing_rows = cur.fetchall()
-            conn.execute("DROP TABLE IF EXISTS fts_chunks")
-            conn.execute(FTS_CREATE_SQL)
-            if existing_rows:
-                conn.executemany(
-                    """
-                    INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')
-                    """,
-                    existing_rows,
-                )
-            conn.commit()
-            return
+        conn.execute("DROP TABLE IF EXISTS fts_chunks")
     conn.execute(FTS_CREATE_SQL)
     conn.commit()
 
@@ -127,8 +143,13 @@ class FTSWriter:
         # Insert many
         cur.executemany(
             """
-            INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO fts_chunks (
+                text, chunk_id, doc_id, path, filename,
+                chunk_start, chunk_end, mtime, page_numbers,
+                pages, section_path, element_ids, bboxes,
+                types, source_tools, table_headers, table_units
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -141,12 +162,27 @@ class FTSWriter:
                     int(r.get("chunk_end", 0) or 0),
                     int(r.get("mtime", 0) or 0),
                     str(r.get("page_numbers", "") or ""),
+                    str(r.get("pages", "") or ""),
+                    str(r.get("section_path", "") or ""),
+                    str(r.get("element_ids", "") or ""),
+                    str(r.get("bboxes", "") or ""),
+                    str(r.get("types", "") or ""),
+                    str(r.get("source_tools", "") or ""),
+                    str(r.get("table_headers", "") or ""),
+                    str(r.get("table_units", "") or ""),
                 )
                 for r in rows
             ],
         )
         self.conn.commit()
         return len(rows)
+
+    def delete_doc(self, doc_id: str) -> None:
+        if not doc_id:
+            return
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (str(doc_id),))
+        self.conn.commit()
 
     def close(self) -> None:
         if self.conn is not None:
@@ -199,8 +235,13 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
             cur.execute("DELETE FROM fts_chunks WHERE chunk_id = ?", (str(r.get("chunk_id")),))
             cur.execute(
                 """
-                INSERT INTO fts_chunks (text, chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO fts_chunks (
+                    text, chunk_id, doc_id, path, filename,
+                    chunk_start, chunk_end, mtime, page_numbers,
+                    pages, section_path, element_ids, bboxes,
+                    types, source_tools, table_headers, table_units
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r.get("text", ""),
@@ -212,11 +253,33 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     int(r.get("chunk_end", 0) or 0),
                     int(r.get("mtime", 0) or 0),
                     str(r.get("page_numbers", "") or ""),
+                    str(r.get("pages", "") or ""),
+                    str(r.get("section_path", "") or ""),
+                    str(r.get("element_ids", "") or ""),
+                    str(r.get("bboxes", "") or ""),
+                    str(r.get("types", "") or ""),
+                    str(r.get("source_tools", "") or ""),
+                    str(r.get("table_headers", "") or ""),
+                    str(r.get("table_units", "") or ""),
                 ),
             )
             count += 1
         conn.commit()
         return count
+    finally:
+        conn.close()
+
+
+def delete_doc(db_path: str, doc_id: str) -> None:
+    """Remove all FTS rows for a given doc_id."""
+    if not doc_id:
+        return
+    ensure_fts(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (str(doc_id),))
+        conn.commit()
     finally:
         conn.close()
 
@@ -229,18 +292,48 @@ def search(db_path: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        fts_query = expand_query(query)
         # Order by bm25() ASC for best first
         cur.execute(
             """
-            SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers, text,
+            SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers,
+                   pages, section_path, element_ids, bboxes, types, source_tools,
+                   table_headers, table_units,
+                   text,
                    bm25(fts_chunks) AS bm25
             FROM fts_chunks
             WHERE fts_chunks MATCH ?
             ORDER BY bm25 LIMIT ?
             """,
-            (query, int(limit)),
+            (fts_query, int(limit)),
         )
         rows = cur.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fetch_texts_by_chunk_ids(db_path: str, chunk_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetch text and metadata for chunk_ids from FTS."""
+    ids = [str(cid) for cid in chunk_ids if cid]
+    if not ids or not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in ids)
+        cur.execute(
+            f"""
+            SELECT chunk_id, text, doc_id, path, filename, chunk_start, chunk_end, page_numbers, mtime,
+                   pages, section_path, element_ids, bboxes, types, source_tools,
+                   table_headers, table_units
+            FROM fts_chunks
+            WHERE chunk_id IN ({placeholders})
+            """,
+            ids,
+        )
+        rows = cur.fetchall()
+        return {str(r["chunk_id"]): dict(r) for r in rows}
     finally:
         conn.close()

@@ -71,6 +71,8 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 - **Search Dispatcher**: Routes requests to appropriate search mode
 - **Result Processor**: Formats and enriches results
 - **Neighbor Expander**: Retrieves adjacent chunks for context
+- **Document Store**: Hydrates thin payloads and enforces ACLs before exposing text to clients
+- **Observability Hooks**: Outputs JSON logs with hashed subject IDs, stage timings, and result metadata
 
 **Responsibilities**:
 - Handle MCP protocol communication
@@ -78,40 +80,49 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 - Execute search strategies
 - Aggregate and format results
 
-### 2. Ingestion Pipeline (ingest.py)
+### 2. Ingestion Pipeline (ingest.py + ingest_blocks.py)
 
 **Stages**:
-1. **Discovery**: Walk directory tree, filter files
-2. **Extraction**: Convert documents to plain text
-3. **Chunking**: Split text into overlapping segments
-4. **Embedding**: Generate vector representations
-5. **Storage**: Persist to Qdrant and SQLite FTS
+1. **Discovery** – Walk directory tree, filter files.
+2. **Triage** – PyMuPDF inspects each PDF page for tables, multi-column layouts, scans, and figure cues.
+3. **Extraction** – Light pages use MarkItDown; heavy pages route through Docling (with per-page caching and timeout safeguards).
+4. **Chunking** – Structured blocks (headings, paragraphs, table rows, captions) carry section breadcrumbs, element IDs, bounding boxes, and provenance.
+5. **Graph & Summaries** – Ingest writes a lightweight content graph and RAPTOR-style summaries keyed by section path.
+6. **Embedding & Storage** – Generate embeddings, write to Qdrant (vector), SQLite FTS (BM25), and persist graph/summary rows.
 
 **Key Features**:
-- Incremental ingestion with change detection
-- Multi-format document support
-- Parallel processing
-- Robust error handling
-- Batch memory management
+- Incremental ingest with change detection and deterministic UUIDs.
+- Page-level routing keeps most documents fast on MarkItDown, reserving Docling for complex layouts.
+- Cache-aware per-page extraction drastically reduces re-ingest cost.
+- Governance-friendly “thin payload” option omits raw text from Qdrant; snippets are hydrated via the document store.
 
 ### 3. Vector Store (Qdrant)
 
 **Purpose**: Store and search dense vector embeddings
 
-**Schema**:
+**Schema** (selected fields):
 ```python
 {
-    "id": str,                # UUID4 chunk identifier
-    "vector": List[float],    # Embedding (384-dim for snowflake:xs)
+    "id": str,
+    "vector": List[float],
     "payload": {
-        "doc_id": str,        # UUID5 from file URI
-        "path": str,          # Absolute POSIX path
-        "chunk_start": int,   # Character offset
-        "chunk_end": int,     # Character offset
-        "text": str,          # Chunk content
-        "filename": str,      # File basename
-        "mtime": int,         # File modification timestamp
-        "content_hash": str   # SHA256 of full document text
+        "doc_id": str,
+        "path": str,
+        "chunk_start": int,
+        "chunk_end": int,
+        "filename": str,
+        "mtime": int,
+        "content_hash": str,
+        "pages": List[int],
+        "section_path": List[str],
+        "element_ids": List[str],
+        "bboxes": List[List[float]],
+        "types": List[str],
+        "source_tools": List[str],
+        "table_headers": List[List[str]],
+        "table_units": List[Dict[str, str]],
+        # optional when thin payload disabled
+        "text": str,
     }
 }
 ```
@@ -124,17 +135,26 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 
 **Purpose**: Traditional keyword search with BM25 ranking
 
-**Schema**:
+**Schema** (simplified):
 ```sql
 CREATE VIRTUAL TABLE fts_chunks USING fts5(
-    text,                    -- Full-text indexed
-    chunk_id UNINDEXED,      -- Chunk UUID
-    doc_id UNINDEXED,        -- Document UUID
-    path UNINDEXED,          -- File path
-    filename UNINDEXED,      -- File basename
-    chunk_start UNINDEXED,   -- Character offset
-    chunk_end UNINDEXED,     -- Character offset
-    mtime UNINDEXED,         -- Modification time
+    text,
+    chunk_id UNINDEXED,
+    doc_id UNINDEXED,
+    path UNINDEXED,
+    filename UNINDEXED,
+    chunk_start UNINDEXED,
+    chunk_end UNINDEXED,
+    mtime UNINDEXED,
+    page_numbers UNINDEXED,
+    pages UNINDEXED,
+    section_path UNINDEXED,
+    element_ids UNINDEXED,
+    bboxes UNINDEXED,
+    types UNINDEXED,
+    source_tools UNINDEXED,
+    table_headers UNINDEXED,
+    table_units UNINDEXED,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 ```
@@ -158,6 +178,13 @@ CREATE VIRTUAL TABLE fts_chunks USING fts5(
 - Process multiple chunks in single request
 - Reduces overhead
 - Configurable batch size
+
+### 6. Knowledge Graph & Summaries
+
+- **Graph (SQLite)** – `nodes` table stores docs/sections/chunks/entities; `edges` captures `contains` and heuristic `mentions` relationships. Enables `graph_{slug}` MCP tool and future multi-hop reasoning.
+- **Summary Index (SQLite)** – Stores RAPTOR-style section synopses plus the `element_ids` that contributed; used by `summary_{slug}` for fast high-level responses.
+
+Both stores are lightweight (few MB) and regenerate on every ingest alongside Qdrant/FTS updates.
 
 ### 6. Reranking Service (TEI)
 
@@ -370,6 +397,28 @@ cursor.executemany(
 
 **Complexity**: O(log N) for both searches + O(retrieve_k log retrieve_k) for sorting
 
+### Sparse Search Mode
+
+Skips embedding entirely, relying on BM25 with domain alias expansion.
+
+```
+1. Execute SQLite FTS search (retrieve_k rows)
+2. Normalize BM25 scores and apply time decay
+3. Return top_k rows (neighbor expansion optional)
+```
+
+Used directly when `mode="sparse"` and as a fallback when dense retrieval underperforms.
+
+### Auto Planner & Self-Critique
+
+Auto mode adds light orchestration around the base routes:
+
+1. Heuristic planner picks an initial route (`semantic`, `hybrid`, `rerank`, or `sparse`).
+2. If the best rerank score < `ANSWERABILITY_THRESHOLD`, a HyDE (Hypothetical Document Embeddings) pass runs.
+3. If results still look lexically weak, a sparse retry executes before the server abstains.
+
+Retrieval logs include stage-level timings (`embed_ms`, `qdrant_ms`, `fts_ms`, `rerank_ms`, `hyde_ms`) for observability and CI gating.
+
 ## Algorithms
 
 ### Reciprocal Rank Fusion (RRF)
@@ -407,6 +456,16 @@ Winner: Document A (better combined ranking)
 - Robust to outliers
 - Fair to all rankers
 - Simple and effective
+
+### Weighted Score Blending
+
+Post-rerank, the system normalizes available signals (BM25, dense score, rerank score) into [0,1] and blends them with configurable weights before applying time decay:
+
+```
+combined = decay × (w_bm25·norm_bm25 + w_dense·norm_dense + w_rerank·norm_rerank) / (w_bm25 + w_dense + w_rerank)
+```
+
+Default weights favor rerank > dense > BM25, but operators can adjust via `MIX_W_BM25`, `MIX_W_DENSE`, and `MIX_W_RERANK`.
 
 **Alternative Considered**: Linear combination of scores
 - Requires score normalization

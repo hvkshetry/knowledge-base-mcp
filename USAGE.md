@@ -41,7 +41,10 @@ python ingest.py \
   --max-walk-depth 10                 # Directory traversal depth
 
   # Extraction
-  --extractor auto                    # auto | markitdown | docling
+  --extractor auto                    # Primary extractor for text fallback
+  --thin-payload                      # Store metadata-only payloads in Qdrant
+  --graph-db data/graph.db            # Override graph storage (optional)
+  --summary-db data/summary.db        # Override summary storage (optional)
 
   # Chunking
   --chunk-size 1800                   # Characters per chunk
@@ -69,43 +72,12 @@ python ingest.py \
   --max-docs-per-run 100              # Batch processing limit
 ```
 
-### Extraction Modes
+### Extraction & Triage
 
-#### Auto Mode (Recommended)
-Automatically selects the best extractor for each file type.
-
-```bash
-python ingest.py --root docs/ --collection kb --extractor auto
-```
-
-- **PDFs**: Tries PyMuPDF → MarkItDown → Docling (if previous fails)
-- **Office docs** (.docx, .xlsx, .pptx): MarkItDown
-- **HTML, CSV**: MarkItDown
-- **Images in PDFs**: Docling with OCR
-
-#### MarkItDown Mode
-Fast extraction for most document types.
-
-```bash
-python ingest.py --root docs/ --collection kb --extractor markitdown
-```
-
-**Pros**: Fast, handles many formats
-**Cons**: Basic PDF extraction, no OCR
-
-**Best for**: Office documents, HTML, clean PDFs
-
-#### Docling Mode
-High-fidelity PDF processing with OCR and layout preservation.
-
-```bash
-python ingest.py --root docs/ --collection kb --extractor docling
-```
-
-**Pros**: Excellent PDF handling, OCR for scanned documents, layout-aware
-**Cons**: Slower (10-20x), higher memory usage
-
-**Best for**: Technical PDFs with diagrams, scanned documents, complex layouts
+- **Page-level triage is automatic**. Each PDF page is scored for tables, multi-column layouts, or scans. Light pages stay on MarkItDown; heavy pages route through Docling for table/figure-aware blocks with bounding boxes and captions.
+- **Docling caching**. Page-level extraction artifacts are cached under `.ingest_cache/` so re-ingests reuse prior work. Set `CACHE_DIR` if you want a different location.
+- **Fallback extractor (`--extractor`)** still matters for non-PDF formats and for Docling failures—it controls the initial text extraction used for hashing and as a safety net.
+- **Hugging Face cache (`HF_HOME`)** should point to a writable directory so Docling can download its layout models.
 
 ### Incremental Ingestion Patterns
 
@@ -216,136 +188,59 @@ python ingest.py \
 
 ## Search Modes
 
-The MCP server provides three search modes with different trade-offs.
+### Semantic Search (`mode="semantic"`)
 
-### Semantic Search
+**Method**: Pure vector similarity using dense embeddings.
 
-**Method**: Pure vector similarity using dense embeddings
+**Use Cases**: Conceptual queries, exploratory research, related-idea discovery.
 
-**Use Cases**:
-- Conceptual queries without specific keywords
-- Finding related content
-- Exploratory research
+**Pros**: High recall, finds semantically similar passages even without shared keywords.
 
-**Example**:
-```json
-{
-  "query": "How do microorganisms break down organic matter?",
-  "mode": "semantic",
-  "top_k": 8
-}
-```
+**Cons**: May miss exact term matches.
 
-Will find content about biological degradation, even if it uses terms like "biodegradation," "microbial metabolism," or "decomposition."
+### Rerank Search (`mode="rerank"`, default)
 
-**Parameters**:
-- `retrieve_k`: Initial vector search results (default: 24)
-- `top_k`: Final results returned (default: 8)
+**Method**: Dense retrieval followed by TEI cross-encoder reranking.
 
-**Pros**: Great recall, finds conceptually similar content
-**Cons**: May miss exact keyword matches, can return loosely related results
+**Pros**: Strong precision with moderate latency; ideal general-purpose mode.
 
-### Rerank Search (Default)
+**Cons**: Recall limited to the dense candidate pool.
 
-**Method**: Vector retrieval + cross-encoder reranking
+### Hybrid Search (`mode="hybrid"`)
 
-**Use Cases**:
-- Most general-purpose searches
-- Balance of speed and accuracy
-- When you need better precision than pure semantic search
+**Method**: Reciprocal Rank Fusion between dense and BM25, then rerank.
 
-**Example**:
-```json
-{
-  "query": "stainless steel corrosion resistance",
-  "mode": "rerank",
-  "retrieve_k": 24,
-  "return_k": 12,
-  "top_k": 5
-}
-```
+**Pros**: Strongest balance of recall + precision for technical queries; handles part numbers, abbreviations, and concepts.
 
-**Parameters**:
-- `retrieve_k`: Initial vector retrieval size (default: 24)
-- `return_k`: Results to rerank (default: 8)
-- `top_k`: Final results after reranking (default: 8)
+**Cons**: Slowest (dense + BM25 + rerank).
 
-**How it works**:
-1. Retrieve `retrieve_k` results via vector search
-2. Take top `return_k` results
-3. Rerank with cross-encoder (query-document interaction)
-4. Return top `top_k`
+### Sparse Search (`mode="sparse"`)
 
-**Pros**: Better precision than semantic, fast
-**Cons**: Limited to vector search recall
+**Method**: BM25 with domain alias expansion; no dense retrieval.
 
-### Hybrid Search
+**Pros**: Fast, perfect for short keyword/ID searches or as a fallback when dense misses.
 
-**Method**: RRF fusion of vector + BM25 lexical search + reranking
+**Cons**: No semantic understanding.
 
-**Use Cases**:
-- Complex queries with both conceptual and specific terms
-- Technical searches with jargon or model numbers
-- Highest quality results (at cost of speed)
+### Auto Planner (`mode="auto"`)
 
-**Example**:
-```json
-{
-  "query": "FilmTec BW30-400 membrane cleaning pH 11.5",
-  "mode": "hybrid",
-  "retrieve_k": 48,
-  "return_k": 16,
-  "top_k": 8
-}
-```
+The default MCP mode. Heuristics pick a route based on query shape:
 
-Combines:
-- **Semantic**: Understands "membrane cleaning" concept
-- **Lexical**: Exact match on "BW30-400", "pH 11.5"
-- **Reranking**: Selects best overall results
+1. Dense or hybrid retrieval runs first.
+2. If the top result underperforms, the planner triggers a HyDE (hypothetical passage) rerun and, if needed, a sparse retry before abstaining.
 
-**Parameters**:
-- `retrieve_k`: Results from EACH ranker (vector + BM25) (default: 24)
-- `return_k`: Fused results to rerank (default: 8)
-- `top_k`: Final results (default: 8)
-
-**Pros**: Best result quality, combines semantic + keyword matching
-**Cons**: Slowest (~2x rerank mode), requires FTS database
-
-### Search Mode Comparison
-
-| Mode | Speed | Recall | Precision | Best For |
-|------|-------|--------|-----------|----------|
-| **Semantic** | Fast | High | Medium | Exploratory, conceptual queries |
-| **Rerank** | Medium | Medium | High | General-purpose, most queries |
-| **Hybrid** | Slow | Highest | Highest | Complex technical queries |
+| Query Type | Suggested Mode |
+|------------|----------------|
+| Short keyword / part number | `sparse` or `auto` |
+| Conceptual (“how does…”) | `semantic` or `auto` |
+| Detailed question | `rerank` or `auto` |
+| Technical spec with IDs + prose | `hybrid` or `auto` |
 
 ### Parameter Tuning Examples
 
-#### Quick Search (Speed Priority)
-```json
-{
-  "mode": "rerank",
-  "retrieve_k": 12,
-  "return_k": 8,
-  "top_k": 5
-}
-```
-
-#### Comprehensive Search (Quality Priority)
-```json
-{
-  "mode": "hybrid",
-  "retrieve_k": 48,
-  "return_k": 16,
-  "top_k": 10
-}
-```
-
-#### High Precision (Few Very Relevant Results)
-```json
-{
-  "mode": "hybrid",
+- **Quick search:** `mode=rerank`, `retrieve_k=12`, `return_k=8`, `top_k=5`.
+- **High-recall technical search:** `mode=hybrid`, `retrieve_k=48`, `return_k=16`, `top_k=10`.
+- **Sparse fallback:** `mode=sparse`, `retrieve_k=32`, `top_k=8` for terse part numbers.
   "retrieve_k": 32,
   "return_k": 12,
   "top_k": 3
@@ -441,6 +336,13 @@ data/
 
 ## Advanced Features
 
+### Structurally-Aware Ingestion
+
+- Per-page triage automatically routes heavy PDF pages (tables, multi-column, scans) to Docling. Tune sensitivity via `ROUTE_HEAVY_FRACTION`, `SMALL_DOC_DOCLING`, and `MULTICOL_GAP_FACTOR`.
+- `DOCLING_TIMEOUT` guards against pathological pages; timed-out pages fall back to MarkItDown output.
+- Page artifacts are cached under `.ingest_cache/` (override with `CACHE_DIR`).
+- Set `HF_HOME` to a writable cache directory so Docling’s layout models download once.
+
 ### Neighbor Context Expansion
 
 Automatically includes adjacent chunks for better context.
@@ -526,6 +428,36 @@ RERANK_MAX_ITEMS=16    # Max number of items to rerank
 - Increase `RERANK_MAX_ITEMS` with powerful hardware
 - Decrease both for faster searches
 
+### Graph & Summary Indices
+
+Two lightweight stores are built during ingest:
+
+- `GRAPH_DB_PATH` – documents, sections, chunks, and heuristic entity nodes linked by `contains`/`mentions` edges. Use `graph_{slug}` to explore.
+- `SUMMARY_DB_PATH` – RAPTOR-style section synopses with element IDs. Use `summary_{slug}` to retrieve.
+
+### MCP Utility Tools
+
+- `open_{slug}`: fetch a specific chunk by `chunk_id`/`element_id`, optionally slicing text.
+- `neighbors_{slug}`: pull BM25 neighbors around a chunk for more context.
+- `summary_{slug}`: retrieve stored section summaries + citations.
+- `graph_{slug}`: inspect the neighborhood in the knowledge graph.
+
+All tools hydrate snippets through the ACL-enforcing document store.
+
+### Evaluation Guardrails
+
+Run gold-set evaluations locally or in CI:
+
+```bash
+python eval.py \
+  --gold eval/gold_sets/my_kb.jsonl \
+  --mode auto \
+  --fts-db data/my_kb_fts.db \
+  --min-ndcg 0.85 --min-recall 0.80 --max-latency 3000
+```
+
+`eval.py` exits non-zero when any threshold fails, making it easy to wire into CI/CD pipelines.
+
 ### RRF Configuration
 
 Tune Reciprocal Rank Fusion for hybrid search:
@@ -559,7 +491,7 @@ python ingest.py \
   --collection kb \
   --embed-batch-size 64 \      # Larger batches
   --workers 8 \                 # More parallel workers
-  --extractor markitdown        # Skip Docling
+  --extractor markitdown        # Keep fallback fast; triage will still escalate complex pages
 ```
 
 **Speed**: 10-15 pages/second
@@ -571,7 +503,7 @@ python ingest.py \
   --collection kb \
   --embed-batch-size 16 \       # Smaller batches (more stable)
   --workers 2 \                  # Fewer workers
-  --extractor docling           # Best PDF extraction
+  --extractor docling           # Force Docling even for light pages
 ```
 
 **Speed**: 2-5 pages/second

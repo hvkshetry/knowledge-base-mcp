@@ -223,6 +223,8 @@ This installs:
 
 Installation may take 5-10 minutes due to large packages like `torch` and `transformers`.
 
+> 💡 **Docling cache**: Set `HF_HOME` to a writable directory (for example `export HF_HOME="$PWD/.cache/hf"`) before your first ingest so Docling can cache its layout models once.
+
 ### Step 6: Create Configuration Files
 
 ```bash

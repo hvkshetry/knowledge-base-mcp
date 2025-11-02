@@ -39,6 +39,8 @@ __pycache__/
 # Document conversion cache
 Markitdown/
 markitdown_cache/
+.ingest_cache/
+.cache/
 
 # Distribution / packaging
 build/

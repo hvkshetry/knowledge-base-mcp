@@ -4,13 +4,15 @@ A production-grade **Model Context Protocol (MCP)** server that provides hybrid 
 
 ## 🌟 Features
 
-- **Zero-Cost Embeddings**: Uses local Ollama for unlimited document embeddings - no per-document charges
-- **Zero-Cost Reranking**: Local TEI cross-encoder reranking - no per-query charges
-- **Hybrid Search**: Combines dense vector embeddings (semantic) with BM25 lexical search using Reciprocal Rank Fusion (RRF)
-- **Multi-Collection Support**: Organize documents into separate knowledge bases with dedicated search tools
-- **Incremental Ingestion**: Smart update detection only reprocesses changed documents
-- **Page-Level Provenance**: Chunk payloads carry originating page numbers so UI layers can surface precise citations
-- **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, and Codex CLI
+- **Zero-Cost Embeddings & Reranking**: Ollama-powered embeddings and a local TEI cross-encoder keep every document and query free of per-token fees.
+- **Structure-Aware Ingestion**: A triage pass keeps most pages on MarkItDown while routing complex layouts through Docling for table/figure-aware blocks, including bboxes, section breadcrumbs, and element IDs.
+- **Hybrid Retrieval Planner**: Auto mode chooses among dense, hybrid, sparse, and rerank routes, with adaptive retries (HyDE + sparse) when confidence drops.
+- **Multi-Collection Support**: Organize documents into separate knowledge bases with dedicated MCP tools.
+- **Incremental & Cached Ingestion**: Smart update detection only reprocesses changed documents, and per-page extraction is cached to accelerate re-ingests.
+- **Graph & Summaries**: Every ingest builds a lightweight content graph and hierarchical summaries so agents can explore relationships beyond the local chunk.
+- **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface page numbers, section paths, element IDs, table metadata, and original tool provenance.
+- **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
+- **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
 
 ## 🏗️ Architecture
 
@@ -48,7 +50,7 @@ A production-grade **Model Context Protocol (MCP)** server that provides hybrid 
 
 **Processing Pipeline**:
 ```
-Documents → Extract → Chunk → Embed → [Qdrant + SQLite FTS] → Search → Rerank → Results
+Documents → Triage → Extract (MarkItDown/Docling) → Chunk → Graph & Summaries → Embed → [Qdrant + SQLite FTS] → Planner → Search → Rerank → Self-Critique → Results
 ```
 
 ## 📋 Use Cases
@@ -67,6 +69,7 @@ Documents → Extract → Chunk → Embed → [Qdrant + SQLite FTS] → Search �
 - Docker Desktop (for Qdrant + TEI reranker)
 - Ollama (for embeddings)
 - Python 3.9+
+- Optional but recommended: set `HF_HOME` to a writable folder (e.g., `export HF_HOME="$PWD/.cache/hf"`) so Docling can cache layout models when triage routes a page to structured extraction.
 
 ### Installation
 
@@ -131,6 +134,15 @@ python validate_search.py \
   --mode hybrid
 ```
 
+8. **Optionally run the evaluation harness** (fails CI if thresholds are missed):
+```bash
+python eval.py \
+  --gold eval/gold_sets/my_docs.jsonl \
+  --mode auto \
+  --fts-db data/my_docs_fts.db \
+  --min-ndcg 0.85 --min-recall 0.80 --max-latency 3000
+```
+
 See [INSTALLATION.md](INSTALLATION.md) for detailed setup instructions.
 
 ## 🔍 Search Modes
@@ -156,17 +168,29 @@ Combines vector search + BM25 lexical search using RRF, then reranks.
 
 **Example**: "stainless steel 316L corrosion in chloride environments" benefits from both semantic understanding and exact term matching
 
+### Sparse Search (`mode="sparse"`)
+Runs alias-aware BM25 only, useful for short keyword queries or as a fallback when semantic routes miss exact terminology.
+
+### Auto Planner (`mode="auto"`)
+Default. Heuristics pick among semantic, hybrid, rerank, and sparse routes. If the top result scores poorly, the planner triggers a HyDE retry and an optional sparse re-query to recover lexical matches before abstaining.
+
+### Additional MCP Tools
+
+- `open_{slug}` – fetch a chunk by `chunk_id` or `element_id`, optionally slicing by char offsets.
+- `neighbors_{slug}` – pull FTS neighbors around a chunk for more context.
+- `summary_{slug}` – retrieve lightweight section summaries (RAPTOR-style) built during ingest.
+- `graph_{slug}` – inspect the lightweight graph (doc → section → chunk → entity) generated from structured metadata.
+
 ## 📊 Search Parameters
 
-```python
-{
-  "query": str,           # Search query text
-  "mode": str,            # "semantic" | "rerank" | "hybrid" (default: "rerank")
-  "top_k": int,           # Final results to return (1-100, default: 8)
-  "retrieve_k": int,      # Initial retrieval size (1-256, default: 24)
-  "return_k": int         # Post-rerank results (1-retrieve_k, default: 8)
-}
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `query` | — | Search query text |
+| `mode` | `rerank` | `semantic`, `rerank`, `hybrid`, `sparse`, or `auto` |
+| `top_k` | `8` | Final results returned (1–100) |
+| `retrieve_k` | `24` | Initial candidate pool (1–256) |
+| `return_k` | `8` | Post-rerank results (`≤ retrieve_k`) |
+| `neighbor_chunks` | env `NEIGHBOR_CHUNKS` | Additional context stitched onto reranked hits |
 
 ### Parameter Tuning Guide
 
@@ -177,6 +201,20 @@ Combines vector search + BM25 lexical search using RRF, then reranks.
 | **High precision** | 24 | 12 | 5 | hybrid |
 | **Exploratory** | 32 | 12 | 8 | semantic |
 
+### Configuration knobs
+
+Set via environment variables (or CLI flags when available):
+
+| Environment variable | Purpose |
+|----------------------|---------|
+| `MIX_W_BM25`, `MIX_W_DENSE`, `MIX_W_RERANK` | Adjust blend between lexical, dense, and rerank signals. |
+| `ROUTE_HEAVY_FRACTION`, `SMALL_DOC_DOCLING` | Control when the triage step escalates an entire document to Docling. |
+| `DOCLING_TIMEOUT` | Seconds to wait for Docling to finish processing a page (default 45). |
+| `HF_HOME` | Hugging Face cache directory used by Docling models (default `.cache/hf`). |
+| `GRAPH_DB_PATH`, `SUMMARY_DB_PATH` | Override lightweight graph and summary storage locations. |
+| `ANSWERABILITY_THRESHOLD` | Minimum rerank score before HyDE + sparse retries run. |
+| `ROUTE_HEAVY_FRACTION`, `MULTICOL_GAP_FACTOR`, `TABLE_LINE_THRESHOLD` | Tune triage sensitivity for heavy tables/multi-column PDF layouts. |
+
 ## 📚 Usage
 
 See [USAGE.md](USAGE.md) for comprehensive documentation including:
@@ -185,6 +223,8 @@ See [USAGE.md](USAGE.md) for comprehensive documentation including:
 - Advanced search features (neighbor expansion, time decay)
 - Incremental ingestion patterns
 - Performance tuning
+
+For upcoming improvements, check [ROADMAP.md](ROADMAP.md).
 
 ## 🏛️ Architecture Details
 
