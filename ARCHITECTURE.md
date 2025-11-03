@@ -87,7 +87,7 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 2. **Triage** – PyMuPDF inspects each PDF page for tables, multi-column layouts, scans, and figure cues.
 3. **Extraction** – Light pages use MarkItDown; heavy pages route through Docling (with per-page caching and timeout safeguards).
 4. **Chunking** – Structured blocks (headings, paragraphs, table rows, captions) carry section breadcrumbs, element IDs, bounding boxes, and provenance.
-5. **Graph & Summaries** – Ingest writes a lightweight content graph and RAPTOR-style summaries keyed by section path.
+5. **Graph & Summaries** – Ingest writes a lightweight content graph (entity → chunk edges). Summary generation is optional; run the summary tooling if you need `kb.summary` to return content.
 6. **Embedding & Storage** – Generate embeddings, write to Qdrant (vector), SQLite FTS (BM25), and persist graph/summary rows.
 
 **Key Features**:
@@ -95,6 +95,31 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 - Page-level routing keeps most documents fast on MarkItDown, reserving Docling for complex layouts.
 - Cache-aware per-page extraction drastically reduces re-ingest cost.
 - Governance-friendly “thin payload” option omits raw text from Qdrant; snippets are hydrated via the document store.
+
+#### Client Orchestration & Provenance
+
+Plans stored under `data/ingest_plans/<doc_id>.plan.json` now include a `client_orchestration` stanza so the MCP client can log every high-level decision alongside the server’s deterministic hash:
+
+```json
+{
+  "plan_hash": "75fe2827…",
+  "client_orchestration": {
+    "client_id": "claude-code-v1.2",
+    "client_model": "claude-sonnet-4",
+    "decisions": [
+      {
+        "timestamp": "2025-11-03T10:30:00Z",
+        "step": "summary_generation",
+        "summary_sha": "sha256:…",
+        "model": "claude-sonnet-4",
+        "prompt_sha": "def456"
+      }
+    ]
+  }
+}
+```
+
+Tools such as `ingest.generate_summary`, `ingest.upsert`, and `kb.generate_hyde` populate this log automatically; clients can add their own entries (e.g., triage overrides) by appending decisions before kicking off a batch upsert.
 
 ### 3. Vector Store (Qdrant)
 
@@ -181,8 +206,8 @@ CREATE VIRTUAL TABLE fts_chunks USING fts5(
 
 ### 6. Knowledge Graph & Summaries
 
-- **Graph (SQLite)** – `nodes` table stores docs/sections/chunks/entities; `edges` captures `contains` and heuristic `mentions` relationships. Enables `graph_{slug}` MCP tool and future multi-hop reasoning.
-- **Summary Index (SQLite)** – Stores RAPTOR-style section synopses plus the `element_ids` that contributed; used by `summary_{slug}` for fast high-level responses.
+- **Graph (SQLite)** – `nodes` table stores docs/sections/chunks/entities; `edges` capture `contains` and heuristic `mentions` relationships. Enables the `kb.graph` MCP tool today (entity → chunk pivots) and lays groundwork for richer reasoning.
+- **Summary Index (SQLite)** – Stores RAPTOR-style section synopses plus the `element_ids` that contributed; populate this index via the summary build step if you want `kb.summary` to return content.
 
 Both stores are lightweight (few MB) and regenerate on every ingest alongside Qdrant/FTS updates.
 

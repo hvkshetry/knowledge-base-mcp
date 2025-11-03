@@ -97,6 +97,53 @@ The MCP server exposes deterministic ingestion tools that mirror the CLI pipelin
 | `ingest.assess_quality(doc_id)` | Inspect chunk counts, table-row coverage, metadata status, and run canary queries. | quality metrics, plan hash, canary results |
 | `ingest.enhance(doc_id, op)` | Apply bounded fixes (add synonyms, link cross-references, adjust table pages). | mutation summary |
 
+### MCP Upsert Workflow
+
+Once artifacts look good you can push them straight through the vector + lexical pipeline without leaving MCP:
+
+| Tool | Purpose | Key Params |
+| ---- | ------- | ----------- |
+| `ingest.upsert(doc_id, chunks_artifact)` | Embed chunks and upsert into Qdrant + FTS. | `thin_payload`, `skip_vectors`, `update_graph`, `update_summary` |
+| `ingest.upsert_batch(upserts, parallel=4)` | Upsert multiple documents concurrently. | `upserts=[{doc_id, chunks_artifact, metadata_artifact}]` |
+| `ingest.corpus_upsert(root_path, collection, dry_run=True)` | Re-ingest a directory of source files end-to-end (analyze → extract → validate → chunk → upsert). | `extractor`, `chunk_profile`, `extensions`, `thin_payload` |
+
+These tools reuse the same deterministic plan artifacts, so CLI and MCP runs stay in sync. Set `dry_run=True` on `ingest.corpus_upsert` to sanity-check the pipeline before committing.
+
+### Extraction Validation
+
+`ingest.validate_extraction(artifact_ref, rules)` inspects the blocks artifact produced by `ingest.extract_with_strategy` and reports potential wiring issues before you embed anything. Example rules:
+
+```json
+{
+  "min_blocks": 20,
+  "min_text_chars": 4000,
+  "expect_tables": true
+}
+```
+
+The tool returns basic stats (`block_count`, `table_blocks`, `text_chars`, `page_count`) plus an issues list that the client can use to trigger a Docling override or a re-triage pass.
+
+### Semantic Summaries
+
+Agents can store high-quality section summaries with full provenance via `ingest.generate_summary`:
+
+```json
+{
+  "doc_id": "...",
+  "collection": "daf_kb",
+  "section_path": ["Chapter 2", "Equipment"],
+  "summary_text": "Dissolved air flotation (DAF) plants rely on...",
+  "element_ids": ["para_210_11"],
+  "summary_metadata": {
+    "model": "claude-sonnet-4",
+    "prompt_sha": "sha256:...",
+    "temperature": 0.0
+  }
+}
+```
+
+Summaries are stored in `summary.db` and surfaced through `kb.summary` with the recorded metadata for auditability.
+
 ### Guardrails
 
 - `INGEST_MODEL_VERSION` / `INGEST_PROMPT_SHA` annotate every plan and artifact (defaults: `structured_ingest_v1`, `sha_deterministic_chunking_v1`).
@@ -287,6 +334,21 @@ The default MCP mode. Heuristics pick a route based on query shape:
   "top_k": 3
 }
 ```
+
+### HyDE Tools
+
+Use `kb.generate_hyde` when you want to craft a hypothetical answer with additional context before retrying search. The tool accepts optional `context`, `temperature`, and `max_length` arguments and returns the generated hypothesis along with the prompt hash for provenance. Example:
+
+```json
+{
+  "query": "How is recycle flow pressurised in DAF systems?",
+  "context": "Top results mention air saturation tanks and recycle pumps.",
+  "temperature": 0.1,
+  "max_length": 600
+}
+```
+
+Pair this with `ingest.generate_summary` and `ingest.upsert` to build closed-loop retrieval plans that log every client decision in the ingest plan via `client_orchestration`.
 
 ## Multi-Collection Setup
 

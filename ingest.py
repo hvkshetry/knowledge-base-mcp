@@ -19,6 +19,24 @@ from graph_builder import update_graph
 from summary_index import upsert_summaries
 from metadata_schema import generate_metadata
 from sparse_expansion import SparseExpander
+from ingest_core import (
+    DEFAULT_FTS_DB,
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_URL,
+    DEFAULT_QDRANT_API_KEY,
+    DEFAULT_QDRANT_METRIC,
+    DEFAULT_QDRANT_URL,
+    INGEST_MODEL_VERSION,
+    INGEST_PROMPT_SHA,
+    MAX_METADATA_BYTES,
+    embed_texts,
+    embed_texts_robust,
+    ensure_qdrant_collection,
+    get_qdrant_client,
+    qdrant_any_by_filter,
+    qdrant_delete_by_doc_id,
+    upsert_qdrant,
+)
 
 
 # Default skip patterns to avoid noisy/system files
@@ -36,9 +54,6 @@ DEFAULT_SKIP_PATTERNS = [
 ]
 
 PLAN_DIR = pathlib.Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
-INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
-INGEST_PROMPT_SHA = os.getenv("INGEST_PROMPT_SHA", "sha_deterministic_chunking_v1")
-MAX_METADATA_BYTES = int(os.getenv("MAX_METADATA_BYTES", "8192"))
 
 
 def file_uri(p: pathlib.Path) -> str:
@@ -97,6 +112,16 @@ def compute_plan_hash(payload: Dict[str, Any]) -> str:
         ensure_ascii=False,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def get_embedding_dim(ollama_url: str, model: str) -> int:
+    try:
+        vecs = embed_texts(ollama_url, model, ["probe"], batch_size=1, normalize=False)
+        if not vecs:
+            raise RuntimeError("empty embedding response")
+        return len(vecs[0])
+    except Exception as exc:
+        raise SystemExit(f"Failed to probe Ollama at {ollama_url} for model {model}: {exc}")
 
 
 def select_chunk_profile(blocks: List[Any]) -> str:
@@ -246,210 +271,6 @@ def fallback_chunk(text: str, max_chars: int = 1800, overlap: int = 150) -> List
     return out
 
 
-# -------------------- Embeddings (Ollama) --------------------
-def l2_normalize(mat: List[List[float]]) -> List[List[float]]:
-    arr = np.array(mat, dtype="float32")
-    n = np.linalg.norm(arr, axis=1, keepdims=True)
-    n[n == 0] = 1.0
-    return (arr / n).tolist()
-
-def embed_texts(ollama_url: str, model: str, texts: List[str], batch_size: int = 32, timeout: int = 120,
-                normalize: bool = True, parallel: int = 1, num_threads: int = 8, keep_alive: str = "1h",
-                force_per_item: bool = False) -> List[List[float]]:
-    """Embed texts via Ollama.
-
-    By default, prefers batch endpoint /api/embed. If force_per_item is True,
-    uses per-item /api/embeddings instead (optionally with parallel workers).
-    """
-    embeddings: List[List[float]] = []
-    headers = {"content-type": "application/json"}
-    def embed_via_per_item(batch: List[str]) -> List[List[float]]:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        per_item: List[List[float]] = [None] * len(batch)
-        def do_one(idx_text):
-            idx, t = idx_text
-            r2 = requests.post(
-                f"{ollama_url}/api/embeddings",
-                json={"model": model, "prompt": t, "keep_alive": keep_alive, "options": {"num_thread": num_threads}},
-                timeout=timeout,
-                headers=headers,
-            )
-            r2.raise_for_status()
-            vec = r2.json().get("embedding")
-            if vec is None:
-                raise RuntimeError("Missing 'embedding' in /api/embeddings response")
-            return idx, vec
-        if parallel > 1:
-            with ThreadPoolExecutor(max_workers=parallel) as ex:
-                futures = [ex.submit(do_one, (j, t)) for j, t in enumerate(batch)]
-                for fut in as_completed(futures):
-                    j, vec = fut.result()
-                    per_item[j] = vec
-        else:
-            for j, t in enumerate(batch):
-                _, vec = do_one((j, t))
-                per_item[j] = vec
-        return per_item
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        for attempt in range(3):
-            try:
-                if not force_per_item:
-                    # Try batch endpoint first
-                    r = requests.post(
-                        f"{ollama_url}/api/embed",
-                        json={"model": model, "input": batch, "keep_alive": keep_alive, "options": {"num_thread": num_threads}},
-                        timeout=timeout,
-                        headers=headers,
-                    )
-                    if r.status_code == 404:
-                        raise requests.HTTPError("/api/embed not found", response=r)
-                    r.raise_for_status()
-                    data = r.json()
-                    batch_emb = data.get("embeddings") or []
-                    if normalize:
-                        batch_emb = l2_normalize(batch_emb)
-                    embeddings.extend(batch_emb)
-                    break
-                # Force per-item endpoint
-                per_item = embed_via_per_item(batch)
-                if normalize:
-                    per_item = l2_normalize(per_item)
-                embeddings.extend(per_item)
-                break
-            except Exception as e:
-                # Fallback to per-item /api/embeddings if batch endpoint missing
-                if not force_per_item and isinstance(e, requests.HTTPError) and getattr(e, 'response', None) is not None and e.response.status_code == 404:
-                    try:
-                        per_item = embed_via_per_item(batch)
-                        if normalize:
-                            per_item = l2_normalize(per_item)
-                        embeddings.extend(per_item)
-                        break
-                    except Exception:
-                        if attempt == 2:
-                            raise
-                        time.sleep(1.5 * (attempt + 1))
-                else:
-                    if attempt == 2:
-                        raise
-                    time.sleep(1.5 * (attempt + 1))
-    return embeddings
-
-
-def embed_texts_robust(
-    ollama_url: str,
-    model: str,
-    texts: List[str],
-    timeout: int = 120,
-    normalize: bool = True,
-    num_threads: int = 8,
-    keep_alive: str = "1h",
-    max_retries: int = 2,
-) -> List[List[float]]:
-    """Embed texts one-by-one with per-item retries; returns list equal in length to texts with None for failures."""
-    headers = {"content-type": "application/json"}
-    out: List[List[float]] = [None] * len(texts)
-    for i, t in enumerate(texts):
-        for attempt in range(max_retries + 1):
-            try:
-                r = requests.post(
-                    f"{ollama_url}/api/embeddings",
-                    json={"model": model, "prompt": t, "keep_alive": keep_alive, "options": {"num_thread": num_threads}},
-                    timeout=timeout,
-                    headers=headers,
-                )
-                r.raise_for_status()
-                vec = r.json().get("embedding")
-                if vec is None:
-                    raise RuntimeError("Missing 'embedding' in /api/embeddings response")
-                if normalize:
-                    vec = l2_normalize([vec])[0]
-                out[i] = vec
-                break
-            except Exception:
-                if attempt == max_retries:
-                    out[i] = None
-                else:
-                    time.sleep(1.0 * (attempt + 1))
-                continue
-    return out
-
-
-def get_embedding_dim(ollama_url: str, model: str) -> int:
-    try:
-        vec = embed_texts(ollama_url, model, ["sanity"], batch_size=1, normalize=False)[0]
-        return len(vec)
-    except Exception as ex:
-        raise SystemExit(f"Failed to probe Ollama at {ollama_url} for model {model}: {ex}")
-
-
-# -------------------- Qdrant --------------------
-_QDRANT_CLIENT = None
-_QDRANT_TIMEOUT = None
-
-
-def qdrant_distance(metric: str):
-    from qdrant_client import models
-    return {
-        "cosine": models.Distance.COSINE,
-        "dot": models.Distance.DOT,
-        "euclid": models.Distance.EUCLID,
-    }[metric]
-
-
-def ensure_qdrant_collection(url: str, api_key: str, name: str, size: int, metric: str):
-    from qdrant_client import QdrantClient, models
-    global _QDRANT_CLIENT, _QDRANT_TIMEOUT
-    if _QDRANT_CLIENT is None:
-        client_kwargs = {"url": url, "api_key": api_key}
-        if _QDRANT_TIMEOUT is not None:
-            client_kwargs["timeout"] = _QDRANT_TIMEOUT
-        _QDRANT_CLIENT = QdrantClient(**client_kwargs)
-    dist = qdrant_distance(metric)
-    if not _QDRANT_CLIENT.collection_exists(collection_name=name):
-        _QDRANT_CLIENT.create_collection(
-            collection_name=name,
-            vectors_config=models.VectorParams(size=size, distance=dist),
-        )
-    else:
-        info = _QDRANT_CLIENT.get_collection(collection_name=name)
-        cfg = info.config.params.vectors
-        current_size = getattr(cfg, "size", None)
-        current_dist = getattr(cfg, "distance", None)
-        if current_size != size or current_dist != dist:
-            raise SystemExit(
-                f"Existing collection '{name}' has size={current_size}, distance={current_dist}; expected size={size}, distance={dist}."
-                " Delete or recreate the collection manually before re-running ingest."
-            )
-
-
-def upsert_qdrant(collection: str, vectors: List[List[float]], payloads: List[dict], ids: List[str]):
-    from qdrant_client import models
-    points = [models.PointStruct(id=i, vector=v, payload=p)
-              for i, v, p in zip(ids, vectors, payloads)]
-    _QDRANT_CLIENT.upsert(collection_name=collection, points=points)
-
-
-def qdrant_any_by_filter(collection: str, must: List[dict]) -> bool:
-    from qdrant_client import models
-    conds = []
-    for c in must:
-        key, val = c["key"], c["value"]
-        conds.append(models.FieldCondition(key=key, match=models.MatchValue(value=val)))
-    flt = models.Filter(must=conds)
-    points, _ = _QDRANT_CLIENT.scroll(collection_name=collection, scroll_filter=flt, limit=1, with_payload=False, with_vectors=False)
-    return bool(points)
-
-
-def qdrant_delete_by_doc_id(collection: str, doc_id: str):
-    from qdrant_client import models
-    flt = models.Filter(must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))])
-    _QDRANT_CLIENT.delete(collection_name=collection, points_selector=models.FilterSelector(filter=flt))
-
-
-# -------------------- Main --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True, help="directory with source documents")
@@ -527,9 +348,6 @@ def main():
     except Exception:
         pass
 
-    global _QDRANT_TIMEOUT
-    _QDRANT_TIMEOUT = args.qdrant_timeout
-
     include_exts = {e.strip().lower() for e in args.ext.split(',') if e.strip()} if args.ext else None
     skip_patterns = list(DEFAULT_SKIP_PATTERNS)
     if args.skip:
@@ -537,9 +355,10 @@ def main():
     include_patterns = [s.strip() for s in args.include.split(',') if s.strip()] if args.include else []
 
     # Initialize Qdrant collection if we are doing vector ingest
+    qdrant_client = get_qdrant_client(args.qdrant_url, args.qdrant_api_key, timeout=args.qdrant_timeout)
     if not args.fts_only:
         embedding_dim = get_embedding_dim(args.ollama_url, args.ollama_model)
-        ensure_qdrant_collection(args.qdrant_url, args.qdrant_api_key, args.qdrant_collection, embedding_dim, args.metric)
+        ensure_qdrant_collection(qdrant_client, args.qdrant_collection, embedding_dim, args.metric)
 
     files = []
     root_parts = root.resolve().parts
@@ -622,7 +441,7 @@ def main():
 
                 # Fast skip: if skipping existing docs, check before extraction
                 if args.skip_existing:
-                    if qdrant_any_by_filter(args.qdrant_collection, [{"key": "doc_id", "value": doc_id}]):
+                    if qdrant_any_by_filter(qdrant_client, args.qdrant_collection, [{"key": "doc_id", "value": doc_id}]):
                         continue
 
                 # Extract early and apply content filters before heavy work
@@ -670,6 +489,8 @@ def main():
                     "model_version": INGEST_MODEL_VERSION,
                     "prompt_sha": INGEST_PROMPT_SHA,
                 }
+                if existing_plan and isinstance(existing_plan.get("client_orchestration"), dict):
+                    plan_payload["client_orchestration"] = existing_plan["client_orchestration"]
                 doc_metadata, metadata_rejects = generate_metadata(raw_text, chunks)
                 metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
                 if doc_metadata and metadata_bytes > MAX_METADATA_BYTES:
@@ -710,13 +531,14 @@ def main():
                 # Incremental changed-only check before doing embeddings
                 if args.changed_only and not args.fts_only:
                     same_hash = qdrant_any_by_filter(
+                        qdrant_client,
                         args.qdrant_collection,
                         [{"key": "doc_id", "value": doc_id}, {"key": "content_hash", "value": content_hash}],
                     )
                     if same_hash:
                         continue
                     if args.delete_changed:
-                        qdrant_delete_by_doc_id(args.qdrant_collection, doc_id)
+                        qdrant_delete_by_doc_id(qdrant_client, args.qdrant_collection, doc_id)
 
                 ids: List[str] = []
                 payloads: List[Dict[str, Any]] = []
@@ -781,7 +603,7 @@ def main():
                                 sel_ids = [ids[start + i] for i in ok_indices]
                                 sel_payloads = [payloads[start + i] for i in ok_indices]
                                 sel_vecs = [vecs_w[i] for i in ok_indices]
-                                upsert_qdrant(args.qdrant_collection, sel_vecs, sel_payloads, sel_ids)
+                                upsert_qdrant(qdrant_client, args.qdrant_collection, sel_vecs, sel_payloads, sel_ids)
                                 upserted_vecs += len(sel_ids)
                     else:
                         vecs = embed_texts(
@@ -796,7 +618,7 @@ def main():
                             keep_alive=args.ollama_keepalive,
                             force_per_item=args.ollama_per_item,
                         )
-                        upsert_qdrant(args.qdrant_collection, vecs, payloads, ids)
+                        upsert_qdrant(qdrant_client, args.qdrant_collection, vecs, payloads, ids)
                         upserted_vecs = len(ids)
 
                 # Also upsert into local FTS index (lexical)

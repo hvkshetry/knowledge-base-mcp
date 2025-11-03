@@ -20,7 +20,7 @@ from graph_builder import (
     list_entities as graph_list_entities,
     neighbors as graph_neighbors,
 )
-from summary_index import query_summaries
+from summary_index import query_summaries, upsert_summary_entry
 from lexical_index import ALIASES, fetch_texts_by_chunk_ids
 from sparse_expansion import SparseExpander
 from ingest_blocks import (
@@ -31,6 +31,8 @@ from ingest_blocks import (
     _deserialize_blocks,
 )
 from metadata_schema import generate_metadata
+from ingest_core import upsert_document_artifacts
+from datetime import datetime
 
 
 def _env_float(name: str, default: float) -> float:
@@ -55,6 +57,7 @@ OLLAMA_LLM = os.getenv("OLLAMA_LLM", os.getenv("OLLAMA_MODEL_GENERATE", "llama3:
 TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://localhost:8087")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_METRIC = os.getenv("QDRANT_METRIC", "cosine")
 COLBERT_URL = os.getenv("COLBERT_URL")
 COLBERT_TIMEOUT = int(os.getenv("COLBERT_TIMEOUT", "60"))
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "data/fts.db")
@@ -64,6 +67,13 @@ SPARSE_EXPANDER = SparseExpander(os.getenv("SPARSE_EXPANDER", "none"))
 SPARSE_QUERY_TOP_K = int(os.getenv("SPARSE_QUERY_TOP_K", "48"))
 HAVE_SPARSE_SPLADE = SPARSE_EXPANDER.enabled
 HAVE_COLBERT = bool(COLBERT_URL)
+INGEST_EMBED_BATCH = int(os.getenv("INGEST_EMBED_BATCH", "32"))
+INGEST_EMBED_TIMEOUT = int(os.getenv("INGEST_EMBED_TIMEOUT", "120"))
+INGEST_EMBED_PARALLEL = int(os.getenv("INGEST_EMBED_PARALLEL", "1"))
+INGEST_EMBED_THREADS = int(os.getenv("INGEST_EMBED_THREADS", "8"))
+INGEST_EMBED_KEEPALIVE = os.getenv("INGEST_EMBED_KEEPALIVE", "1h")
+INGEST_EMBED_FORCE_PER_ITEM = _env_flag("INGEST_EMBED_FORCE_PER_ITEM", default=False)
+INGEST_EMBED_ROBUST = _env_flag("INGEST_EMBED_ROBUST", default=False)
 
 # JSON like: {"kb":{"collection":"snowflake_kb","title":"Company KB"}}
 # Backcompat: allow STELLA_SCOPES if NOMIC_KB_SCOPES not set
@@ -833,6 +843,11 @@ def _ensure_plan_defaults(plan_data: Dict[str, Any]) -> None:
         plan_data["metadata_calls"] = int(calls)
     except Exception:
         plan_data["metadata_calls"] = 0
+    client_section = plan_data.setdefault("client_orchestration", {})
+    if not isinstance(client_section, dict):
+        client_section = {}
+        plan_data["client_orchestration"] = client_section
+    client_section.setdefault("decisions", [])
 
 
 def _is_table_row(types: Any) -> bool:
@@ -849,6 +864,93 @@ def _ensure_score_bucket(row: Dict[str, Any]) -> Dict[str, float]:
         scores = {}
         row["scores"] = scores
     return scores
+
+
+async def _perform_upsert(
+    doc_id: str,
+    collection_name: str,
+    chunks_artifact: Path,
+    *,
+    metadata_artifact: Optional[Path] = None,
+    thin_payload: Optional[bool] = None,
+    skip_vectors: bool = False,
+    update_graph_links: bool = True,
+    update_summary_index: bool = True,
+    fts_recreate: bool = False,
+) -> Dict[str, Any]:
+    metadata_arg: Optional[str] = metadata_artifact.as_posix() if metadata_artifact else None
+    try:
+        result = await asyncio.to_thread(
+            upsert_document_artifacts,
+            doc_id,
+            collection_name,
+            chunks_artifact.as_posix(),
+            metadata_artifact=metadata_arg,
+            ollama_url=OLLAMA_URL,
+            ollama_model=OLLAMA_MODEL,
+            embed_batch_size=INGEST_EMBED_BATCH,
+            embed_timeout=INGEST_EMBED_TIMEOUT,
+            embed_parallel=INGEST_EMBED_PARALLEL,
+            embed_threads=INGEST_EMBED_THREADS,
+            embed_keepalive=INGEST_EMBED_KEEPALIVE,
+            embed_force_per_item=INGEST_EMBED_FORCE_PER_ITEM,
+            embed_robust=INGEST_EMBED_ROBUST,
+            qdrant_client=qdr,
+            qdrant_metric=QDRANT_METRIC,
+            fts_db_path=FTS_DB_PATH,
+            fts_recreate=fts_recreate,
+            thin_payload=thin_payload,
+            update_graph_links=update_graph_links,
+            update_summary_index=update_summary_index,
+            skip_vectors=skip_vectors,
+            sparse_expander=SPARSE_EXPANDER if HAVE_SPARSE_SPLADE else None,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("ingest.upsert failed for %s", doc_id)
+        return {"error": "upsert_failed", "detail": str(exc)}
+
+    plan = _load_plan(doc_id)
+    if plan:
+        result.setdefault("plan_hash", plan.get("plan_hash"))
+        result.setdefault("model_version", plan.get("model_version"))
+        result.setdefault("prompt_sha", plan.get("prompt_sha"))
+    result.setdefault("status", "ok")
+    return result
+
+
+def _record_client_decisions(
+    doc_id: str,
+    decisions: Optional[List[Dict[str, Any]]] = None,
+    client_meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not doc_id:
+        return
+    if not decisions and not client_meta:
+        return
+    plan = _load_plan(doc_id)
+    if not isinstance(plan, dict):
+        plan = {"doc_id": doc_id}
+    orchestr = plan.setdefault("client_orchestration", {})
+    if not isinstance(orchestr, dict):
+        orchestr = {}
+        plan["client_orchestration"] = orchestr
+    if client_meta:
+        client_id = client_meta.get("client_id")
+        client_model = client_meta.get("client_model")
+        if client_id:
+            orchestr["client_id"] = client_id
+        if client_model:
+            orchestr["client_model"] = client_model
+    entries = orchestr.setdefault("decisions", [])
+    if decisions:
+        for decision in decisions:
+            if isinstance(decision, dict):
+                entry = dict(decision)
+            else:
+                entry = {"detail": str(decision)}
+            entry.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+            entries.append(entry)
+    _save_plan(doc_id, plan)
 
 
 @mcp.tool(name="ingest.analyze_document", title="Ingest: Analyze Document")
@@ -952,6 +1054,66 @@ async def ingest_extract(ctx: Context, path: str, plan: Optional[Dict[str, Any]]
         "block_count": len(serialized_blocks),
         "artifact": artifact_path.as_posix(),
         "plan_hash": plan_hash,
+    }
+
+
+@mcp.tool(name="ingest.validate_extraction", title="Ingest: Validate Extraction")
+async def ingest_validate_extraction(
+    ctx: Context,
+    artifact_ref: str,
+    rules: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not artifact_ref:
+        return {"error": "missing_artifact"}
+    artifact_path = Path(artifact_ref).expanduser()
+    data = _read_json(artifact_path)
+    if not data:
+        return {"error": "artifact_not_found", "detail": f"no artifact at {artifact_path.as_posix()}"}
+
+    blocks = data.get("blocks") or []
+    rule_set = rules or {}
+
+    block_count = len(blocks)
+    table_blocks = sum(1 for block in blocks if str(block.get("type")).lower() in {"table", "table_row"})
+    heading_blocks = sum(1 for block in blocks if str(block.get("type")).lower() == "heading")
+    text_chars = sum(len(str(block.get("text") or "")) for block in blocks)
+    pages = {block.get("page") for block in blocks if block.get("page") is not None}
+
+    issues: List[str] = []
+    min_blocks = int(rule_set.get("min_blocks") or 0)
+    if min_blocks and block_count < min_blocks:
+        issues.append(f"min_blocks:{block_count}<{min_blocks}")
+    min_text_chars = int(rule_set.get("min_text_chars") or 0)
+    if min_text_chars and text_chars < min_text_chars:
+        issues.append(f"min_text_chars:{text_chars}<{min_text_chars}")
+    min_pages = int(rule_set.get("min_pages") or 0)
+    if min_pages and len(pages) < min_pages:
+        issues.append(f"min_pages:{len(pages)}<{min_pages}")
+    if rule_set.get("expect_tables") and table_blocks == 0:
+        issues.append("expect_tables:true but no table blocks detected")
+    if rule_set.get("expect_headings") and heading_blocks == 0:
+        issues.append("expect_headings:true but no heading blocks detected")
+
+    stats = {
+        "block_count": block_count,
+        "table_blocks": table_blocks,
+        "heading_blocks": heading_blocks,
+        "text_chars": text_chars,
+        "page_count": len(pages),
+        "plan_hash": data.get("plan_hash"),
+        "doc_id": data.get("doc_id"),
+    }
+
+    _audit("ingest_validate_extraction", {
+        "artifact": artifact_path.as_posix(),
+        "stats": stats,
+        "issues": issues,
+    })
+
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "stats": stats,
     }
 
 
@@ -1231,6 +1393,447 @@ async def ingest_enhance(ctx: Context, doc_id: str, op: str, args: Optional[Dict
     }
 
 
+@mcp.tool(name="ingest.upsert", title="Ingest: Upsert Document")
+async def ingest_upsert_tool(
+    ctx: Context,
+    doc_id: str,
+    collection: Optional[str] = None,
+    chunks_artifact: Optional[str] = None,
+    metadata_artifact: Optional[str] = None,
+    thin_payload: Optional[bool] = None,
+    skip_vectors: bool = False,
+    update_graph: bool = True,
+    update_summary: bool = True,
+    fts_rebuild: bool = False,
+    client_id: Optional[str] = None,
+    client_model: Optional[str] = None,
+    client_decisions: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    chunk_path = Path(chunks_artifact).expanduser() if chunks_artifact else _chunks_artifact_path(doc_id)
+    if not chunk_path.exists():
+        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
+    meta_path = Path(metadata_artifact).expanduser() if metadata_artifact else None
+    if meta_path and not meta_path.exists():
+        return {"error": "metadata_not_found", "detail": f"no metadata artifact at {meta_path.as_posix()}"}
+
+    plan = _load_plan(doc_id)
+    plan_collection = plan.get("collection") if isinstance(plan, dict) else None
+    resolved_collection = collection or plan_collection
+    if resolved_collection and resolved_collection in SCOPES:
+        resolved_collection = SCOPES[resolved_collection].get("collection") or resolved_collection
+    if not resolved_collection:
+        return {"error": "missing_collection", "detail": "Provide 'collection' or ensure plan includes collection"}
+
+    if client_decisions is not None and not isinstance(client_decisions, list):
+        return {"error": "invalid_client_decisions", "detail": "client_decisions must be a list of objects"}
+
+    decisions_payload = []
+    if client_decisions:
+        for entry in client_decisions:
+            if isinstance(entry, dict):
+                decisions_payload.append(entry)
+            else:
+                decisions_payload.append({"detail": str(entry)})
+
+    result = await _perform_upsert(
+        doc_id,
+        resolved_collection,
+        chunk_path,
+        metadata_artifact=meta_path,
+        thin_payload=thin_payload,
+        skip_vectors=skip_vectors,
+        update_graph_links=update_graph,
+        update_summary_index=update_summary,
+        fts_recreate=fts_rebuild,
+    )
+
+    _record_client_decisions(
+        doc_id,
+        decisions=decisions_payload,
+        client_meta={"client_id": client_id, "client_model": client_model},
+    )
+
+    if result.get("status") == "ok" and isinstance(plan, dict):
+        if plan.get("collection") != resolved_collection:
+            plan["collection"] = resolved_collection
+            _save_plan(doc_id, plan)
+        audit_payload = {
+            "doc_id": doc_id,
+            "collection": resolved_collection,
+            "chunks_upserted": result.get("chunks_upserted"),
+            "qdrant_points": result.get("qdrant_points"),
+            "fts_rows": result.get("fts_rows"),
+        }
+        if client_id or client_model:
+            audit_payload["client"] = {"client_id": client_id, "client_model": client_model}
+        _audit("ingest_upsert", audit_payload)
+    return result
+
+
+@mcp.tool(name="ingest.upsert_batch", title="Ingest: Batch Upsert")
+async def ingest_upsert_batch(
+    ctx: Context,
+    upserts: List[Dict[str, Any]],
+    collection: Optional[str] = None,
+    parallel: int = 4,
+    thin_payload: Optional[bool] = None,
+    skip_vectors: bool = False,
+    update_graph: bool = True,
+    update_summary: bool = True,
+    fts_rebuild: bool = False,
+    client_id: Optional[str] = None,
+    client_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not isinstance(upserts, list) or not upserts:
+        return {"error": "empty_specs"}
+    max_workers = max(1, int(parallel))
+    sem = asyncio.Semaphore(max_workers)
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    successes = 0
+    start = time.perf_counter()
+
+    async def run_one(spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        async with sem:
+            spec_doc_id = spec.get("doc_id")
+            if not spec_doc_id:
+                return "", {"error": "missing_doc_id"}
+            spec_collection = spec.get("collection") or collection
+            chunk_path = spec.get("chunks_artifact") or _chunks_artifact_path(spec_doc_id).as_posix()
+            meta_path = spec.get("metadata_artifact")
+            result = await ingest_upsert_tool(
+                ctx,
+                spec_doc_id,
+                collection=spec_collection,
+                chunks_artifact=chunk_path,
+                metadata_artifact=meta_path,
+                thin_payload=spec.get("thin_payload", thin_payload),
+                skip_vectors=spec.get("skip_vectors", skip_vectors),
+                update_graph=spec.get("update_graph", update_graph),
+                update_summary=spec.get("update_summary", update_summary),
+                fts_rebuild=spec.get("fts_rebuild", fts_rebuild),
+                client_id=spec.get("client_id", client_id),
+                client_model=spec.get("client_model", client_model),
+                client_decisions=spec.get("client_decisions"),
+            )
+            return spec_doc_id, result
+
+    tasks = [asyncio.create_task(run_one(spec)) for spec in upserts]
+    for task in asyncio.as_completed(tasks):
+        doc_id_val, outcome = await task
+        if outcome.get("status") == "ok":
+            successes += 1
+        else:
+            failures.append({"doc_id": doc_id_val, "error": outcome})
+        outcome.setdefault("doc_id", doc_id_val)
+        results.append(outcome)
+
+    elapsed = time.perf_counter() - start
+    return {
+        "status": "ok",
+        "total_docs": len(upserts),
+        "successful": successes,
+        "failed": len(failures),
+        "failures": failures,
+        "results": results,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
+@mcp.tool(name="ingest.generate_summary", title="Ingest: Store Summary")
+async def ingest_generate_summary_tool(
+    ctx: Context,
+    doc_id: str,
+    summary_text: str,
+    section_path: Optional[List[str]] = None,
+    collection: Optional[str] = None,
+    element_ids: Optional[List[str]] = None,
+    summary_metadata: Optional[Dict[str, Any]] = None,
+    client_id: Optional[str] = None,
+    client_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        return {"error": "empty_summary"}
+    summary_clean = summary_text.strip()
+    if len(summary_clean) > 1200:
+        return {"error": "summary_too_long", "detail": "Summary must be <= 1200 characters"}
+
+    plan = _load_plan(doc_id)
+    try:
+        _, collection_name, _ = _resolve_scope(collection)
+    except Exception:
+        plan_collection = plan.get("collection") if isinstance(plan, dict) else None
+        if plan_collection and plan_collection in SCOPES:
+            collection_name = SCOPES[plan_collection]["collection"]
+        else:
+            collection_name = plan_collection
+    if not collection_name:
+        return {"error": "missing_collection", "detail": "Provide 'collection' or ensure plan includes collection"}
+
+    if isinstance(plan, dict):
+        if plan.get("collection") != collection_name:
+            plan["collection"] = collection_name
+            _save_plan(doc_id, plan)
+
+    section = section_path or []
+    if not isinstance(section, list):
+        return {"error": "invalid_section_path", "detail": "section_path must be a list of strings"}
+    section = [str(part) for part in section]
+    elements = element_ids or []
+    if element_ids is not None:
+        if not isinstance(element_ids, list):
+            return {"error": "invalid_element_ids", "detail": "element_ids must be a list"}
+        elements = [str(e) for e in element_ids]
+
+    metadata = summary_metadata.copy() if isinstance(summary_metadata, dict) else {}
+    metadata.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+    if client_id:
+        metadata.setdefault("client_id", client_id)
+    if client_model:
+        metadata.setdefault("client_model", client_model)
+
+    await asyncio.to_thread(
+        upsert_summary_entry,
+        collection_name,
+        doc_id,
+        section,
+        summary_clean,
+        elements,
+        metadata,
+    )
+
+    decision_entry = {
+        "step": "summary_generation",
+        "section_path": section,
+        "summary_sha": hashlib.sha256(summary_clean.encode("utf-8")).hexdigest(),
+    }
+    if metadata:
+        decision_entry["metadata"] = metadata
+    _record_client_decisions(
+        doc_id,
+        decisions=[decision_entry],
+        client_meta={"client_id": client_id, "client_model": client_model},
+    )
+
+    audit_payload = {
+        "doc_id": doc_id,
+        "collection": collection_name,
+        "section_path": section,
+    }
+    if client_id or client_model:
+        audit_payload["client"] = {"client_id": client_id, "client_model": client_model}
+    _audit("ingest_generate_summary", audit_payload)
+
+    return {
+        "status": "ok",
+        "doc_id": doc_id,
+        "collection": collection_name,
+        "section_path": section,
+        "element_ids": elements,
+        "metadata": metadata,
+    }
+
+
+@mcp.tool(name="ingest.corpus_upsert", title="Ingest: Corpus Upsert")
+async def ingest_corpus_upsert(
+    ctx: Context,
+    root_path: str,
+    collection: Optional[str] = None,
+    extractor: str = "auto",
+    chunk_profile: str = "auto",
+    max_chars: int = 1800,
+    overlap_sentences: int = 1,
+    dry_run: bool = False,
+    thin_payload: Optional[bool] = None,
+    skip_vectors: bool = False,
+    update_graph: bool = True,
+    update_summary: bool = True,
+    fts_rebuild: bool = False,
+    extensions: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not root_path:
+        return {"error": "missing_root"}
+    root = Path(root_path).expanduser()
+    if not root.is_dir():
+        return {"error": "invalid_root", "detail": f"directory not found: {root.as_posix()}"}
+
+    try:
+        _, collection_name, _ = _resolve_scope(collection)
+    except Exception as exc:
+        return {"error": "invalid_collection", "detail": str(exc)}
+
+    extractor_normalized = (extractor or "auto").lower()
+    profile_normalized = (chunk_profile or "auto").lower()
+    max_chars = max(200, int(max_chars))
+    overlap_sentences = max(0, int(overlap_sentences))
+
+    if extensions:
+        ext_set = {ext.strip().lower() for ext in extensions.split(",") if ext.strip()}
+    else:
+        ext_set = {".pdf", ".docx", ".txt"}
+
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if ext_set and path.suffix.lower() not in ext_set:
+            continue
+        files.append(path)
+
+    if not files:
+        return {"status": "ok", "collection": collection_name, "processed": 0, "progress": [], "dry_run": dry_run}
+
+    progress_log: List[Dict[str, Any]] = []
+    processed = 0
+    failures = 0
+    rebuild_flag = bool(fts_rebuild)
+    start = time.perf_counter()
+
+    for file_path in files:
+        path_str = file_path.as_posix()
+        try:
+            analyze = await ingest_analyze(ctx, path_str)
+            if analyze.get("error"):
+                progress_log.append({
+                    "path": path_str,
+                    "status": "error",
+                    "error": analyze,
+                })
+                failures += 1
+                continue
+            doc_id = analyze.get("doc_id")
+            if not doc_id:
+                progress_log.append({
+                    "path": path_str,
+                    "status": "error",
+                    "error": {"detail": "doc_id missing after analyze"},
+                })
+                failures += 1
+                continue
+
+            plan = _load_plan(doc_id)
+            if isinstance(plan, dict):
+                plan["collection"] = collection_name
+                triage = plan.get("triage")
+                if extractor_normalized in {"markitdown", "docling"} and isinstance(triage, dict):
+                    for page in triage.get("pages", []):
+                        if isinstance(page, dict):
+                            page["route"] = extractor_normalized
+                _save_plan(doc_id, plan)
+            _record_client_decisions(
+                doc_id,
+                decisions=None,
+                client_meta={"client_id": client_id, "client_model": client_model},
+            )
+
+            extract = await ingest_extract(ctx, path_str, plan=plan or {})
+            if extract.get("error"):
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "error",
+                    "error": extract,
+                })
+                failures += 1
+                continue
+
+            chunk = await ingest_chunk(
+                ctx,
+                extract.get("artifact"),
+                profile=profile_normalized,
+                max_chars=max_chars,
+                overlap_sentences=overlap_sentences,
+            )
+            if chunk.get("error"):
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "error",
+                    "error": chunk,
+                })
+                failures += 1
+                continue
+            chunk_artifact = chunk.get("artifact")
+
+            metadata_result = await ingest_generate_metadata(ctx, doc_id, chunk_artifact)
+            if metadata_result.get("error"):
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "warning",
+                    "warning": metadata_result,
+                })
+
+            if dry_run:
+                processed += 1
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "dry_run",
+                    "plan_hash": chunk.get("plan_hash"),
+                    "chunk_count": chunk.get("chunk_count"),
+                })
+                continue
+
+            upsert_result = await _perform_upsert(
+                doc_id,
+                collection_name,
+                Path(chunk_artifact),
+                thin_payload=thin_payload,
+                skip_vectors=skip_vectors,
+                update_graph_links=update_graph,
+                update_summary_index=update_summary,
+                fts_recreate=rebuild_flag,
+            )
+            rebuild_flag = False  # Only rebuild once if requested
+            if upsert_result.get("status") != "ok":
+                failures += 1
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "error",
+                    "error": upsert_result,
+                })
+                continue
+
+            processed += 1
+            progress_log.append({
+                "path": path_str,
+                "doc_id": doc_id,
+                "status": "ok",
+                "plan_hash": upsert_result.get("plan_hash"),
+                "chunks_upserted": upsert_result.get("chunks_upserted"),
+                "qdrant_points": upsert_result.get("qdrant_points"),
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("corpus upsert failed for %s", path_str)
+            failures += 1
+            progress_log.append({
+                "path": path_str,
+                "status": "error",
+                "error": {"detail": str(exc)},
+            })
+
+    elapsed = time.perf_counter() - start
+    return {
+        "status": "ok",
+        "collection": collection_name,
+        "root": root.as_posix(),
+        "total_files": len(files),
+        "processed": processed,
+        "failed": failures,
+        "dry_run": dry_run,
+        "progress": progress_log,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
 async def _fetch_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not chunk_ids:
         return {}
@@ -1458,18 +2061,37 @@ def _should_retry_sparse(query: str, rows: List[Dict[str, Any]]) -> bool:
     return False
 
 
-async def hyde(query: str) -> str:
+async def hyde(
+    query: str,
+    *,
+    context: Optional[str] = None,
+    temperature: float = 0.2,
+    max_length: int = 900,
+) -> Dict[str, Any]:
     """Generate a short hypothetical answer paragraph for HyDE retrieval."""
-    prompt = (
-        "Write a concise factual paragraph (5-7 sentences) that could answer the question:\n"
-        f"{query}\n\n"
-        "Stay grounded in typical engineering knowledge; avoid speculation."
+    max_length = max(100, min(int(max_length), 2000))
+    temperature = max(0.0, min(float(temperature), 0.8))
+
+    prompt_parts = [
+        "You are preparing a hypothetical passage for retrieval augmentation.",
+    ]
+    if context:
+        prompt_parts.append("Context:\n" + context.strip())
+    prompt_parts.append(
+        "Task: Write a concise factual paragraph (5-7 sentences) that could answer the question below while staying grounded in real-world engineering knowledge."
     )
+    prompt_parts.append("Question:\n" + query.strip())
+    prompt = "\n\n".join(prompt_parts)
+
     try:
         def _do_request():
             r = requests.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_LLM, "prompt": prompt, "options": {"temperature": 0.2}},
+                json={
+                    "model": OLLAMA_LLM,
+                    "prompt": prompt,
+                    "options": {"temperature": temperature},
+                },
                 timeout=60,
             )
             r.raise_for_status()
@@ -1477,10 +2099,24 @@ async def hyde(query: str) -> str:
             return data.get("response", "")
 
         response = await asyncio.to_thread(_do_request)
-        return (response or "").strip()[:900]
+        hypothesis = (response or "").strip()[:max_length]
+        return {
+            "hypothesis": hypothesis,
+            "prompt": prompt,
+            "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "temperature": temperature,
+            "model": OLLAMA_LLM,
+        }
     except Exception as exc:
         logger.debug("HyDE generation failed: %s", exc)
-        return ""
+        return {
+            "hypothesis": "",
+            "prompt": prompt,
+            "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "temperature": temperature,
+            "model": OLLAMA_LLM,
+            "error": str(exc),
+        }
 
 
 async def _run_semantic(
@@ -2660,7 +3296,8 @@ async def kb_hint(
 async def kb_hyde(ctx: Context, query: str) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
-    hypothesis = await hyde(query)
+    hyde_output = await hyde(query)
+    hypothesis = hyde_output.get("hypothesis", "")
     status = "ok" if hypothesis else "unavailable"
     info = None
     if not hypothesis:
@@ -2676,13 +3313,53 @@ async def kb_hyde(ctx: Context, query: str) -> Dict[str, Any]:
     result = {
         "query": query,
         "hypothesis": hypothesis,
-        "model_version": INGEST_MODEL_VERSION,
-        "prompt_sha": INGEST_PROMPT_SHA,
+        "prompt": hyde_output.get("prompt"),
+        "prompt_sha": hyde_output.get("prompt_sha"),
+        "temperature": hyde_output.get("temperature"),
+        "model": hyde_output.get("model"),
         "status": status,
     }
     if info:
         result["info"] = info
     return result
+
+
+@mcp.tool(name="kb.generate_hyde", title="KB: Generate HyDE")
+async def kb_generate_hyde(
+    ctx: Context,
+    query: str,
+    context: Optional[str] = None,
+    temperature: float = 0.2,
+    max_length: int = 900,
+    client_id: Optional[str] = None,
+    client_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    hyde_output = await hyde(query, context=context, temperature=temperature, max_length=max_length)
+    hypothesis = hyde_output.get("hypothesis", "")
+
+    _audit("hyde_generate", {
+        "query": query,
+        "context": context[:2000] if context else None,
+        "prompt_sha": hyde_output.get("prompt_sha"),
+        "client": {"client_id": client_id, "client_model": client_model} if (client_id or client_model) else None,
+    })
+
+    return {
+        "query": query,
+        "context": context,
+        "hypothesis": hypothesis,
+        "prompt": hyde_output.get("prompt"),
+        "prompt_sha": hyde_output.get("prompt_sha"),
+        "temperature": hyde_output.get("temperature"),
+        "model": hyde_output.get("model"),
+        "metadata": {
+            "client_id": client_id,
+            "client_model": client_model,
+            "context_sha": hashlib.sha256(context.encode("utf-8")).hexdigest() if context else None,
+        },
+    }
 
 @mcp.tool(name="kb.table", title="KB: Table Lookup")
 async def kb_table(
@@ -3121,9 +3798,9 @@ async def kb_search(
             row["route"] = route
 
     best = _best_score(rows)
-    hyde_used = False
     if ANSWERABILITY_THRESHOLD > 0.0 and best < ANSWERABILITY_THRESHOLD:
-        hypo = await hyde(query)
+        hypo_data = await hyde(query)
+        hypo = hypo_data.get("hypothesis")
         if hypo:
             hyde_start = time.perf_counter()
             try:
@@ -3152,7 +3829,13 @@ async def kb_search(
                         row["route"] = "semantic"
                 hyde_best = _best_score(hyde_rows)
                 if hyde_best >= ANSWERABILITY_THRESHOLD:
-                    hyde_rows.insert(0, {"note": "HyDE retry satisfied threshold", "base_route": route})
+                    hyde_rows.insert(0, {
+                        "note": "HyDE retry satisfied threshold",
+                        "base_route": route,
+                        "hyde_prompt_sha": hypo_data.get("prompt_sha"),
+                        "hyde_model": hypo_data.get("model"),
+                        "hyde_temperature": hypo_data.get("temperature"),
+                    })
                     return finalize(hyde_rows, "semantic", hyde_used=True)
         return finalize([
             {
