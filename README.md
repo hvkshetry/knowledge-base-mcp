@@ -1,18 +1,28 @@
 # Semantic Search MCP Server
 
-A production-grade **Model Context Protocol (MCP)** server that provides hybrid semantic search over private document collections using local, open-source tools. **Zero-cost embeddings and reranking** - no per-document or per-query charges beyond your Claude subscription.
+A production-grade **Model Context Protocol (MCP)** server that puts a state-of-the-art MCP client (Claude Desktop/Code/Codex CLI) in the loop for both retrieval and ingestion. Agents plan with atomic MCP tools—deciding the extractor, chunker, reranker route, HyDE retries, graph hops, and metadata budget calls—while the server guarantees determinism, provenance, and thin-index security. Everything runs on local, open-source components, so embeddings and reranking stay **zero-cost** beyond your Claude subscription.
 
 ## 🌟 Features
 
 - **Zero-Cost Embeddings & Reranking**: Ollama-powered embeddings and a local TEI cross-encoder keep every document and query free of per-token fees.
 - **Structure-Aware Ingestion**: A triage pass keeps most pages on MarkItDown while routing complex layouts through Docling for table/figure-aware blocks, including bboxes, section breadcrumbs, and element IDs.
-- **Hybrid Retrieval Planner**: Auto mode chooses among dense, hybrid, sparse, and rerank routes, with adaptive retries (HyDE + sparse) when confidence drops.
+- **Agent-Directed Hybrid Retrieval**: Auto mode chooses among dense, hybrid, sparse, and rerank routes, with adaptive retries (HyDE + sparse) when confidence drops—while MCP tools expose every primitive so the client can override the plan when needed.
 - **Multi-Collection Support**: Organize documents into separate knowledge bases with dedicated MCP tools.
 - **Incremental & Cached Ingestion**: Smart update detection only reprocesses changed documents, and per-page extraction is cached to accelerate re-ingests.
-- **Graph & Summaries**: Every ingest builds a lightweight content graph and hierarchical summaries so agents can explore relationships beyond the local chunk.
+- **Graph & Summaries**: Every ingest builds a lightweight content graph and hierarchical summaries so agents can explore relationships beyond the local chunk or ask for entity linkouts.
 - **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface page numbers, section paths, element IDs, table metadata, and original tool provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
+
+## 🤖 MCP-First Architecture
+
+Conventional RAG systems hide retrieval behind a monolithic API. This server embraces the MCP client as a planner:
+
+- **Ingestion as a Toolchain** – `ingest.analyze_document` triages each page (MarkItDown vs Docling) so the client can approve or tweak the plan; `ingest.chunk_with_guidance` switches between enumerated chunkers (`heading_based`, `procedure_block`, `table_row`); `ingest.generate_metadata` enforces byte budgets and prompt hashes. Every step returns artifacts and plan hashes for replayable ingestion.
+- **Retrieval as Composable Primitives** – `kb.sparse`, `kb.dense`, `kb.hybrid`, `kb.rerank`, `kb.hyde`, `kb.hint`, `kb.table_lookup`, `kb.entities`, `kb.linkouts`, `kb.batch`, `kb.quality`, `kb.promote/demote`—each primitive is callable so the MCP client can branch, retry, or fuse strategies mid-conversation.
+- **Self-Critique with Insight** – Results surface full score vectors (`bm25`, `dense`, `rrf`, `rerank`, `prior`, `decay`) and `why` annotations (matched aliases, headers, table clues), letting the agent reason about confidence before presenting an answer.
+
+Because Claude (or any MCP client) stays in the driver seat, you get agentic retrieval and deterministic ingestion without surrendering provenance or security.
 
 ## 🏗️ Architecture
 

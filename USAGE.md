@@ -5,9 +5,11 @@ Comprehensive guide for ingesting documents and searching your knowledge base.
 ## Table of Contents
 
 - [Document Ingestion](#document-ingestion)
+- [MCP Ingestion Workflow](#mcp-ingestion-workflow)
 - [Search Modes](#search-modes)
 - [Multi-Collection Setup](#multi-collection-setup)
 - [Advanced Features](#advanced-features)
+- [Operational Acceptance Checks](#operational-acceptance-checks)
 - [Performance Tuning](#performance-tuning)
 - [Best Practices](#best-practices)
 
@@ -78,6 +80,35 @@ python ingest.py \
 - **Docling caching**. Page-level extraction artifacts are cached under `.ingest_cache/` so re-ingests reuse prior work. Set `CACHE_DIR` if you want a different location.
 - **Fallback extractor (`--extractor`)** still matters for non-PDF formats and for Docling failures—it controls the initial text extraction used for hashing and as a safety net.
 - **Hugging Face cache (`HF_HOME`)** should point to a writable directory so Docling can download its layout models.
+
+## MCP Ingestion Workflow
+
+The MCP server exposes deterministic ingestion tools that mirror the CLI pipeline while producing auditable artifacts. Each call writes JSON under `data/ingest_artifacts/<doc_id>/` and keeps the canonical plan in `data/ingest_plans/<doc_id>.plan.json`.
+
+| Tool | Purpose | Key Outputs |
+| ---- | ------- | ----------- |
+| `ingest.analyze_document(path)` | Run triage to decide Docling vs. MarkItDown per page and seed a plan hash. | plan, route counts |
+| `ingest.extract_with_strategy(path, plan)` | Extract structural blocks using the stored or provided plan override. | blocks artifact path |
+| `ingest.chunk_with_guidance(artifact_ref, profile)` | Apply a deterministic chunker (`auto`, `heading_based`, `procedure_block`, `table_row`, `fixed_window`). | chunk artifact, sample chunk previews |
+| `ingest.generate_metadata(doc_id)` | Produce bounded metadata (<=320-char summary, <=8 concepts, typed entities) with guardrails. | doc metadata, metadata bytes/calls |
+| `ingest.assess_quality(doc_id)` | Inspect chunk counts, table-row coverage, metadata status, and warnings. | quality metrics, plan hash |
+| `ingest.enhance(doc_id, op)` | Reserved for future safe adjustments (currently returns `not_implemented`). | — |
+
+### Guardrails
+
+- `INGEST_MODEL_VERSION` / `INGEST_PROMPT_SHA` annotate every plan and artifact (defaults: `structured_ingest_v1`, `sha_deterministic_chunking_v1`).
+- `MAX_METADATA_BYTES` (default `8192`) rejects metadata that exceeds the byte budget and reports `metadata_bytes_exceeded`.
+- `MAX_METADATA_CALLS_PER_DOC` (default `2`) prevents unbounded metadata regeneration; exceeding it yields `metadata_budget_exceeded`.
+
+### Typical Flow
+
+1. `ingest.analyze_document` to review triage routes.
+2. `ingest.extract_with_strategy` to cache structural blocks.
+3. `ingest.chunk_with_guidance` (`profile="auto"` for most docs, `"table_row"` for tabular-heavy content).
+4. `ingest.generate_metadata` to attach deterministic metadata (fast-fails if size/call limits are hit).
+5. `ingest.assess_quality` to verify chunk density, table coverage, and metadata status before calling the CLI ingest or a custom upsert routine.
+
+Artifacts are plain JSON, so CI can diff plans, inspect `plan_hash` stability, or replay the same strategy across environments.
 
 ### Incremental Ingestion Patterns
 
@@ -432,15 +463,21 @@ RERANK_MAX_ITEMS=16    # Max number of items to rerank
 
 Two lightweight stores are built during ingest:
 
-- `GRAPH_DB_PATH` – documents, sections, chunks, and heuristic entity nodes linked by `contains`/`mentions` edges. Use `graph_{slug}` to explore.
+- `GRAPH_DB_PATH` – documents, sections, chunks, and heuristic entity nodes linked by `contains`/`mentions` edges. Use `entities_{slug}` to browse by type, `linkouts_{slug}` to jump straight to supporting chunks, and `graph_{slug}` for raw neighbor walks.
 - `SUMMARY_DB_PATH` – RAPTOR-style section synopses with element IDs. Use `summary_{slug}` to retrieve.
+
+**Entity tips**
+- Table rows add parameter nodes automatically; `linkouts_*` returns the chunk ids so you can follow up with `open_*`.
+- Frequent co-occurrences between entities are stored as `co_occurs` edges, giving agent planners a cheap signal for likely relationships (e.g., equipment ↔ operating parameter).
 
 ### MCP Utility Tools
 
 - `open_{slug}`: fetch a specific chunk by `chunk_id`/`element_id`, optionally slicing text.
 - `neighbors_{slug}`: pull BM25 neighbors around a chunk for more context.
 - `summary_{slug}`: retrieve stored section summaries + citations.
-- `graph_{slug}`: inspect the neighborhood in the knowledge graph.
+- `entities_{slug}`: list graph entities for the collection, filterable by `type` and substring.
+- `linkouts_{slug}`: enumerate chunks/sections that reference an entity node (pair with `open_*`).
+- `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
 
 All tools hydrate snippets through the ACL-enforcing document store.
 
@@ -479,6 +516,50 @@ score(doc) = Σ [1 / (K + rank_i(doc))]
 - If vector search dominates: Decrease K
 - If lexical search dominates: Increase K
 - Default (60) works well for most cases
+
+## Operational Acceptance Checks
+
+### Stage 0 – Provenance & Thin Payload
+
+1. **Backfill provenance into FTS**
+   ```bash
+   python scripts/backfill_fts_from_qdrant.py \
+     --collection daf_kb \
+     --fts-db data/daf_kb_fts.db
+   ```
+   Confirm `page_numbers`, `section_path`, `element_ids`, `table_headers`, and `table_units` survive a rebuild:
+   ```bash
+   sqlite3 data/daf_kb_fts.db 'SELECT doc_id, page_numbers, section_path, types, element_ids FROM fts_chunks LIMIT 3;'
+   ```
+2. **Toggle thin payload mode**
+   ```bash
+   THIN_PAYLOAD=true python ingest.py \
+     --root ./daf_kb \
+     --collection daf_kb \
+     --fts-only
+   ```
+   Inspect a Qdrant point (via the UI or the API) to confirm payloads only carry provenance while `open_{slug}` still dereferences text.
+
+### Stage 1 – Deterministic Ingestion Plans
+
+1. **Plan replay**
+   ```bash
+   python -m fastmcp.client call ingest.analyze_document path=/abs/path/to/file.pdf
+   python -m fastmcp.client call ingest.extract_with_strategy path=/abs/path/to/file.pdf plan=@last.json
+   python -m fastmcp.client call ingest.chunk_with_guidance artifact_ref=@blocks.json profile=auto
+   ```
+   Re-run the sequence—`plan_hash`, chunk previews, and `data/ingest_plans/<doc>.plan.json` should be identical.
+2. **Table indexing sanity check**
+   ```bash
+   python -m fastmcp.client call table_daf_kb query="design MLSS" limit=3
+   ```
+   Rows return `type="table_row"` with headers/units. Follow up with `open_daf_kb` to fetch the exact span.
+3. **Metadata budget + quality**
+   ```bash
+   python -m fastmcp.client call ingest.generate_metadata doc_id=<uuid>
+   python -m fastmcp.client call ingest.assess_quality doc_id=<uuid>
+   ```
+   `metadata_calls`, `plan_hash`, and any `metadata_rejects` are persisted under `data/ingest_plans/` for auditing.
 
 ## Performance Tuning
 
@@ -684,6 +765,12 @@ python ingest.py \
 # Search (semantic for exploratory research)
 # Use MCP client with mode="semantic"
 ```
+
+## Security & Governance
+
+- `ALLOWED_DOC_ROOTS` (path list separated by `:`) restricts dereferencing to known directories. Retrieval tools such as `open_*` and `neighbors_*` refuse snippets outside these roots.
+- `AUDIT_LOG_PATH` writes JSONL audit entries for every retrieval event (`search`, `open`, `neighbors`, `table_lookup`, etc.) with hashed subject identifiers and telemetry for downstream monitoring.
+- Enabling `THIN_PAYLOAD` strips raw text from vector payloads; snippets are rehydrated from the FTS database after ACL checks so sensitive content is only materialized when explicitly requested.
 
 ## Next Steps
 

@@ -5,6 +5,8 @@ import asyncio
 import time
 import re
 import hashlib
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -13,8 +15,21 @@ from qdrant_client import QdrantClient
 import sqlite3
 
 from document_store import DocumentStore, get_subjects_from_context
-from graph_builder import neighbors as graph_neighbors
+from graph_builder import (
+    entity_linkouts as graph_entity_linkouts,
+    list_entities as graph_list_entities,
+    neighbors as graph_neighbors,
+)
 from summary_index import query_summaries
+from lexical_index import ALIASES
+from ingest_blocks import (
+    triage_pdf,
+    extract_document_blocks,
+    chunk_blocks,
+    _serialize_blocks,
+    _deserialize_blocks,
+)
+from metadata_schema import generate_metadata
 
 
 def _env_float(name: str, default: float) -> float:
@@ -22,6 +37,15 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except Exception:
         return default
+
+
+def _env_flag(name: str, *, fallback: Optional[str] = None, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None and fallback:
+        raw = os.getenv(fallback)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes"}
 
 # ---- Env & config -----------------------------------------------------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -46,6 +70,15 @@ logger = logging.getLogger("kb-mcp")
 qdr = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 mcp = FastMCP(name="knowledge-base", version="1.0.0", instructions="Vector search with Qdrant + Ollama embeddings and TEI reranker")
 doc_store = DocumentStore(FTS_DB_PATH)
+
+ARTIFACT_DIR = Path(os.getenv("INGEST_ARTIFACT_DIR", "data/ingest_artifacts"))
+PLAN_DIR = Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
+INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
+INGEST_PROMPT_SHA = os.getenv("INGEST_PROMPT_SHA", "sha_deterministic_chunking_v1")
+MAX_METADATA_BYTES = int(os.getenv("MAX_METADATA_BYTES", "8192"))
+MAX_METADATA_CALLS_PER_DOC = int(os.getenv("MAX_METADATA_CALLS_PER_DOC", "2"))
+
+SESSION_PRIORS: Dict[str, Dict[str, float]] = {}
 
 
 def _lookup_chunk_by_element(element_id: str) -> Optional[str]:
@@ -80,6 +113,9 @@ DECAY_STRENGTH = float(os.getenv("DECAY_STRENGTH", "0.0"))
 MIX_W_BM25 = _env_float("MIX_W_BM25", 0.2)
 MIX_W_DENSE = _env_float("MIX_W_DENSE", 0.3)
 MIX_W_RERANK = _env_float("MIX_W_RERANK", 0.5)
+THIN_PAYLOAD_ENABLED = _env_flag("THIN_PAYLOAD", fallback="THIN_VECTOR_PAYLOAD")
+AUR_AUDIT_PATH = Path(os.getenv("AUDIT_LOG_PATH", "logs/audit.log"))
+ALLOWED_ROOTS = [Path(p).resolve() for p in os.getenv("ALLOWED_DOC_ROOTS", "").split(os.pathsep) if p.strip()]
 
 
 def l2norm(vec: List[float]) -> List[float]:
@@ -238,6 +274,638 @@ def _coerce_json(value: Any) -> Any:
     return value
 
 
+WHY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+WHY_MAX_MATCHES = 6
+
+
+def _score_breakdown(
+    *,
+    bm25: Optional[float],
+    dense: Optional[float],
+    rrf: Optional[float],
+    rerank: Optional[float],
+    decay: Optional[float],
+    final: Optional[float],
+) -> Dict[str, Optional[float]]:
+    return {
+        "bm25": bm25,
+        "dense": dense,
+        "rrf": rrf,
+        "rerank": rerank,
+        "decay": decay,
+        "final": final,
+    }
+
+
+def _build_why_annotations(query: str, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not query or not isinstance(row, dict):
+        return []
+    annotations: List[Dict[str, Any]] = []
+    try:
+        terms = {tok.lower() for tok in WHY_TOKEN_RE.findall(query)}
+    except Exception:
+        terms = set()
+    text = ""
+    try:
+        text = str(row.get("text") or "").lower()
+    except Exception:
+        text = ""
+    if terms and text:
+        matches = sorted({tok for tok in terms if tok and tok in text})[:WHY_MAX_MATCHES]
+        if matches:
+            annotations.append({"matched_terms": matches})
+    section_path = row.get("section_path")
+    if isinstance(section_path, list) and section_path and terms:
+        hits = [seg for seg in section_path if isinstance(seg, str) and any(tok in seg.lower() for tok in terms)]
+        if hits:
+            annotations.append({"section_path_hits": hits})
+    types = row.get("types") or []
+    if isinstance(types, list) and any(isinstance(t, str) and "table" in t.lower() for t in types):
+        element_ids = row.get("element_ids")
+        note: Dict[str, Any] = {"table": True}
+        if isinstance(element_ids, list) and element_ids:
+            note["element_id"] = element_ids[0]
+        annotations.append(note)
+    return annotations
+
+
+def _annotate_rows(rows: List[Dict[str, Any]], query: str) -> None:
+    if not query:
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("error"):
+            continue
+        row["why"] = _build_why_annotations(query, row)
+
+
+def _ensure_dir(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
+
+
+def _file_uri(path: Path) -> str:
+    return path.resolve().as_uri()
+
+
+def _doc_id_for_path(path: Path) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, _file_uri(path)))
+
+
+def _is_allowed_path(path: Optional[str]) -> bool:
+    if not ALLOWED_ROOTS:
+        return True
+    if not path:
+        return False
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return False
+    for root in ALLOWED_ROOTS:
+        try:
+            if resolved == root or resolved.is_relative_to(root):
+                return True
+        except AttributeError:
+            try:
+                resolved.relative_to(root)
+                return True
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
+
+
+def _session_key(subjects: List[str]) -> str:
+    if not subjects:
+        return "*"
+    return "|".join(sorted(subjects))
+
+
+def _update_session_prior(subjects: List[str], doc_id: str, delta: float) -> float:
+    key = _session_key(subjects)
+    priors = SESSION_PRIORS.setdefault(key, {})
+    doc_id = str(doc_id)
+    current = priors.get(doc_id, 0.0) + float(delta)
+    current = max(-0.9, min(4.0, current))
+    if abs(current) < 1e-6:
+        priors.pop(doc_id, None)
+    else:
+        priors[doc_id] = current
+    return max(0.1, 1.0 + current)
+
+
+def _prior_multiplier(doc_id: Optional[str], subjects: List[str], boosts: Optional[Dict[str, float]] = None) -> float:
+    multiplier = 1.0
+    if doc_id:
+        doc_id = str(doc_id)
+        key = _session_key(subjects)
+        prior_delta = SESSION_PRIORS.get(key, {}).get(doc_id, 0.0)
+        multiplier *= max(0.1, 1.0 + prior_delta)
+        if boosts:
+            boost_val = boosts.get(doc_id)
+            if boost_val is not None:
+                try:
+                    multiplier *= max(0.0, float(boost_val))
+                except Exception:
+                    pass
+    return multiplier
+
+
+def _parse_scope_boosts(scope: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    boosts: Dict[str, float] = {}
+    if not isinstance(scope, dict):
+        return boosts
+    for doc_id, val in (scope.get("boost") or {}).items():
+        try:
+            boosts[str(doc_id)] = max(0.0, float(val))
+        except Exception:
+            continue
+    for doc_id, val in (scope.get("demote") or {}).items():
+        try:
+            boosts[str(doc_id)] = max(0.0, float(val))
+        except Exception:
+            continue
+    return boosts
+
+
+def _sanitize_triage_for_plan(triage: Dict[str, Any]) -> Dict[str, Any]:
+    pages_out: List[Dict[str, Any]] = []
+    for entry in (triage or {}).get("pages", []):
+        if not isinstance(entry, dict):
+            continue
+        page = entry.get("page")
+        try:
+            page_int = int(page)
+        except Exception:
+            page_int = None
+        pages_out.append(
+            {
+                "page": page_int,
+                "route": entry.get("route"),
+                "text_chars": entry.get("text_chars"),
+                "images": entry.get("images"),
+                "vector_lines": entry.get("vector_lines"),
+                "multicolumn_score": entry.get("multicolumn_score"),
+                "has_table_token": entry.get("has_table_token"),
+                "has_figure_token": entry.get("has_figure_token"),
+            }
+        )
+    return {"pages": pages_out}
+
+
+def _compute_plan_hash(payload: Dict[str, Any]) -> str:
+    material = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _plan_file_path(doc_id: str) -> Path:
+    _ensure_dir(PLAN_DIR)
+    return PLAN_DIR / f"{doc_id}.plan.json"
+
+
+def _load_plan(doc_id: str) -> Dict[str, Any]:
+    path = _plan_file_path(doc_id)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_plan(doc_id: str, data: Dict[str, Any]) -> None:
+    path = _plan_file_path(doc_id)
+    _write_json(path, data)
+
+
+def _artifact_dir(doc_id: str) -> Path:
+    directory = ARTIFACT_DIR / doc_id
+    _ensure_dir(directory)
+    return directory
+
+
+def _blocks_artifact_path(doc_id: str) -> Path:
+    return _artifact_dir(doc_id) / "blocks.json"
+
+
+def _chunks_artifact_path(doc_id: str) -> Path:
+    return _artifact_dir(doc_id) / "chunks.json"
+
+
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    _ensure_dir(path.parent)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _audit(event: str, payload: Dict[str, Any]) -> None:
+    if not event:
+        return
+    try:
+        _ensure_dir(AUR_AUDIT_PATH.parent)
+        record = {
+            "event": event,
+            "ts": time.time(),
+            **payload,
+        }
+        with AUR_AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("audit_log_failed", exc_info=True)
+
+
+def _audit_subjects(subjects: List[str]) -> List[str]:
+    return [hashlib.sha1(s.encode("utf-8")).hexdigest() for s in subjects if s]
+
+
+def _select_chunk_profile(blocks: List[Any]) -> str:
+    if not blocks:
+        return "fixed_window"
+    table_rows = sum(1 for b in blocks if getattr(b, "type", "") == "table_row")
+    if table_rows:
+        return "table_row"
+    step_like = 0
+    for b in blocks:
+        btype = getattr(b, "type", "")
+        text = (getattr(b, "text", "") or "").strip()
+        if btype == "list" and text:
+            step_like += 1
+        elif re.match(r"^\d+(?:\.\d+)*\s", text):
+            step_like += 1
+    if step_like and step_like >= max(3, len(blocks) // 4):
+        return "procedure_block"
+    return "heading_based"
+
+
+def _summarize_chunks(chunks: List[Dict[str, Any]], limit: int = 8) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks[:limit]):
+        text = chunk.get("text") or ""
+        summaries.append(
+            {
+                "index": idx,
+                "pages": chunk.get("pages"),
+                "types": chunk.get("types"),
+                "length": len(text),
+                "preview": text[:280],
+            }
+        )
+    return summaries
+
+
+def _ensure_plan_defaults(plan_data: Dict[str, Any]) -> None:
+    plan_data.setdefault("model_version", INGEST_MODEL_VERSION)
+    plan_data.setdefault("prompt_sha", INGEST_PROMPT_SHA)
+    calls = plan_data.get("metadata_calls")
+    try:
+        plan_data["metadata_calls"] = int(calls)
+    except Exception:
+        plan_data["metadata_calls"] = 0
+
+
+def _is_table_row(types: Any) -> bool:
+    if isinstance(types, list):
+        return any(str(t).lower() == "table_row" for t in types)
+    if isinstance(types, str):
+        return "table_row" in types.lower()
+    return False
+
+
+def _ensure_score_bucket(row: Dict[str, Any]) -> Dict[str, float]:
+    scores = row.get("scores")
+    if not isinstance(scores, dict):
+        scores = {}
+        row["scores"] = scores
+    return scores
+
+
+@mcp.tool(name="ingest.analyze_document", title="Ingest: Analyze Document")
+async def ingest_analyze(ctx: Context, path: str) -> Dict[str, Any]:
+    if not path:
+        return {"error": "missing_path"}
+    path_obj = Path(path).expanduser()
+    if not path_obj.is_file():
+        return {"error": "not_found", "detail": f"file not found: {path_obj.as_posix()}"}
+    try:
+        triage = await asyncio.to_thread(triage_pdf, path_obj)
+    except Exception as exc:
+        return {"error": "triage_failed", "detail": str(exc)}
+
+    doc_id = _doc_id_for_path(path_obj)
+    sanitized = _sanitize_triage_for_plan(triage)
+
+    plan_data = _load_plan(doc_id)
+    plan_data.update({
+        "doc_id": doc_id,
+        "path": path_obj.as_posix(),
+        "triage": sanitized,
+    })
+    _ensure_plan_defaults(plan_data)
+    plan_data.setdefault("chunk_profile", plan_data.get("chunk_profile") or "auto")
+    plan_data.setdefault("chunk_params", plan_data.get("chunk_params") or {})
+    plan_hash = _compute_plan_hash(plan_data)
+    plan_data["plan_hash"] = plan_hash
+    _save_plan(doc_id, plan_data)
+
+    route_counts: Dict[str, int] = {}
+    for page in sanitized.get("pages", []):
+        route = page.get("route") or "markitdown"
+        route_counts[route] = route_counts.get(route, 0) + 1
+
+    return {
+        "doc_id": doc_id,
+        "plan": plan_data,
+        "plan_hash": plan_hash,
+        "page_count": len(sanitized.get("pages", [])),
+        "route_counts": route_counts,
+    }
+
+
+@mcp.tool(name="ingest.extract_with_strategy", title="Ingest: Extract Blocks")
+async def ingest_extract(ctx: Context, path: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    plan = plan or {}
+    if not path:
+        return {"error": "missing_path"}
+    path_obj = Path(path).expanduser()
+    if not path_obj.is_file():
+        return {"error": "not_found", "detail": f"file not found: {path_obj.as_posix()}"}
+
+    doc_id_expected = plan.get("doc_id")
+    doc_id = doc_id_expected or _doc_id_for_path(path_obj)
+    if doc_id_expected and doc_id_expected != doc_id:
+        return {"error": "doc_id_mismatch", "detail": f"plan doc_id {doc_id_expected} does not match computed {doc_id}"}
+
+    plan_override = plan.get("triage")
+    try:
+        blocks, triage_info = await asyncio.to_thread(extract_document_blocks, path_obj, doc_id, plan_override)
+    except TypeError:
+        blocks, triage_info = await asyncio.to_thread(extract_document_blocks, path_obj, doc_id)
+    except Exception as exc:
+        return {"error": "extraction_failed", "detail": str(exc)}
+
+    sanitized = _sanitize_triage_for_plan(triage_info)
+    serialized_blocks = _serialize_blocks(blocks)
+
+    artifact_path = _blocks_artifact_path(doc_id)
+    artifact_payload = {
+        "doc_id": doc_id,
+        "path": path_obj.as_posix(),
+        "triage": sanitized,
+        "blocks": serialized_blocks,
+        "block_count": len(serialized_blocks),
+    }
+
+    plan_data = _load_plan(doc_id)
+    plan_data.update({
+        "doc_id": doc_id,
+        "path": path_obj.as_posix(),
+        "triage": sanitized,
+    })
+    if plan.get("chunk_profile"):
+        plan_data["chunk_profile"] = plan.get("chunk_profile")
+    if isinstance(plan.get("chunk_params"), dict):
+        plan_data["chunk_params"] = plan.get("chunk_params")
+    _ensure_plan_defaults(plan_data)
+    plan_data.setdefault("chunk_profile", plan_data.get("chunk_profile") or "auto")
+    plan_data.setdefault("chunk_params", plan_data.get("chunk_params") or {})
+    plan_hash = _compute_plan_hash(plan_data)
+    plan_data["plan_hash"] = plan_hash
+    _save_plan(doc_id, plan_data)
+
+    artifact_payload["plan_hash"] = plan_hash
+    _write_json(artifact_path, artifact_payload)
+
+    return {
+        "doc_id": doc_id,
+        "block_count": len(serialized_blocks),
+        "artifact": artifact_path.as_posix(),
+        "plan_hash": plan_hash,
+    }
+
+
+@mcp.tool(name="ingest.chunk_with_guidance", title="Ingest: Chunk Blocks")
+async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", max_chars: int = 1800, overlap_sentences: int = 1) -> Dict[str, Any]:
+    if not artifacts_ref:
+        return {"error": "missing_artifact"}
+    artifact_path = Path(artifacts_ref).expanduser()
+    data = _read_json(artifact_path)
+    if not data:
+        return {"error": "artifact_not_found", "detail": f"no artifact at {artifact_path.as_posix()}"}
+
+    doc_id = data.get("doc_id")
+    if not doc_id:
+        return {"error": "missing_doc_id", "detail": "artifact missing doc_id"}
+
+    blocks_serialized = data.get("blocks") or []
+    blocks = _deserialize_blocks(blocks_serialized)
+
+    requested_profile = (profile or "auto").lower()
+    if requested_profile not in {"auto", "fixed_window", "heading_based", "procedure_block", "table_row"}:
+        requested_profile = "auto"
+    selected_profile = _select_chunk_profile(blocks) if requested_profile == "auto" else requested_profile
+
+    max_chars = max(200, int(max_chars))
+    overlap_sentences_val = max(0, int(overlap_sentences))
+    try:
+        chunks, raw_text = await asyncio.to_thread(
+            chunk_blocks,
+            blocks,
+            max_chars,
+            overlap_sentences_val,
+            selected_profile,
+        )
+    except Exception as exc:
+        return {"error": "chunk_failed", "detail": str(exc)}
+
+    content_hash = hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
+
+    plan_data = _load_plan(doc_id)
+    if not plan_data.get("triage") and data.get("triage"):
+        plan_data["triage"] = data.get("triage")
+    plan_data.update(
+        {
+            "doc_id": doc_id,
+            "path": data.get("path"),
+            "chunk_profile": selected_profile,
+            "chunk_params": {
+                "max_chars": max_chars,
+                "overlap_sentences": overlap_sentences_val,
+            },
+            "content_hash": content_hash,
+        }
+    )
+    _ensure_plan_defaults(plan_data)
+
+    chunk_artifact_path = _chunks_artifact_path(doc_id)
+    chunk_payload = {
+        "doc_id": doc_id,
+        "path": data.get("path"),
+        "triage": data.get("triage"),
+        "chunk_profile": selected_profile,
+        "chunk_params": {
+            "max_chars": max_chars,
+            "overlap_sentences": overlap_sentences_val,
+        },
+        "chunks": chunks,
+        "chunk_count": len(chunks),
+        "raw_text": raw_text,
+        "content_hash": content_hash,
+        "doc_metadata": plan_data.get("doc_metadata"),
+        "model_version": plan_data.get("model_version"),
+        "prompt_sha": plan_data.get("prompt_sha"),
+        "metadata_calls": plan_data.get("metadata_calls", 0),
+    }
+
+    plan_hash = _compute_plan_hash(plan_data)
+    plan_data["plan_hash"] = plan_hash
+    chunk_payload["plan_hash"] = plan_hash
+
+    _save_plan(doc_id, plan_data)
+    _write_json(chunk_artifact_path, chunk_payload)
+
+    return {
+        "doc_id": doc_id,
+        "chunk_count": len(chunks),
+        "chunk_profile": selected_profile,
+        "plan_hash": plan_hash,
+        "artifact": chunk_artifact_path.as_posix(),
+        "sample_chunks": _summarize_chunks(chunks),
+    }
+
+
+@mcp.tool(name="ingest.generate_metadata", title="Ingest: Generate Metadata")
+async def ingest_generate_metadata(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None, policy: str = "strict_v1") -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    chunk_path = Path(artifact_ref).expanduser() if artifact_ref else _chunks_artifact_path(doc_id)
+    data = _read_json(chunk_path)
+    if not data:
+        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
+
+    raw_text = data.get("raw_text") or ""
+    chunks = data.get("chunks") or []
+    metadata, rejects = generate_metadata(raw_text, chunks)
+    metadata_bytes = len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")) if metadata else 0
+
+    plan_data = _load_plan(doc_id)
+    plan_data.setdefault("doc_id", doc_id)
+    _ensure_plan_defaults(plan_data)
+    calls_used = plan_data.get("metadata_calls", 0)
+    if MAX_METADATA_CALLS_PER_DOC >= 0 and calls_used >= MAX_METADATA_CALLS_PER_DOC:
+        return {
+            "doc_id": doc_id,
+            "error": "metadata_budget_exceeded",
+            "detail": f"metadata calls {calls_used} exceeded limit {MAX_METADATA_CALLS_PER_DOC}",
+            "plan_hash": plan_data.get("plan_hash"),
+        }
+    if metadata:
+        if metadata_bytes > MAX_METADATA_BYTES:
+            rejects.append(f"metadata_bytes_exceeded:{metadata_bytes}>{MAX_METADATA_BYTES}")
+            metadata = {}
+        else:
+            plan_data["doc_metadata"] = metadata
+            data["doc_metadata"] = metadata
+
+    plan_data["metadata_calls"] = calls_used + 1
+    plan_hash = _compute_plan_hash(plan_data)
+    plan_data["plan_hash"] = plan_hash
+    data["plan_hash"] = plan_hash
+    data["model_version"] = plan_data.get("model_version")
+    data["prompt_sha"] = plan_data.get("prompt_sha")
+    data["metadata_calls"] = plan_data.get("metadata_calls")
+
+    _save_plan(doc_id, plan_data)
+    _write_json(chunk_path, data)
+
+    return {
+        "doc_id": doc_id,
+        "doc_metadata": metadata,
+        "rejects": rejects,
+        "plan_hash": plan_hash,
+        "metadata_bytes": metadata_bytes,
+        "metadata_calls": plan_data.get("metadata_calls", 0),
+    }
+
+
+@mcp.tool(name="ingest.assess_quality", title="Ingest: Assess Quality")
+async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    chunk_path = Path(artifact_ref).expanduser() if artifact_ref else _chunks_artifact_path(doc_id)
+    data = _read_json(chunk_path)
+    if not data:
+        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
+
+    chunks = data.get("chunks") or []
+    chunk_count = len(chunks)
+    table_rows = sum(1 for chunk in chunks if "table_row" in (chunk.get("types") or []))
+    total_len = sum(len(chunk.get("text") or "") for chunk in chunks)
+    avg_len = total_len / chunk_count if chunk_count else 0.0
+    pages_covered: set = set()
+    for chunk in chunks:
+        for page in chunk.get("pages") or []:
+            pages_covered.add(page)
+
+    metadata_available = bool(data.get("doc_metadata"))
+    plan_hash = data.get("plan_hash") or _load_plan(doc_id).get("plan_hash")
+    model_version = data.get("model_version") or _load_plan(doc_id).get("model_version")
+    prompt_sha = data.get("prompt_sha") or _load_plan(doc_id).get("prompt_sha")
+    metadata_calls = data.get("metadata_calls") or _load_plan(doc_id).get("metadata_calls")
+    try:
+        metadata_calls = int(metadata_calls)
+    except Exception:
+        metadata_calls = 0
+    doc_metadata = data.get("doc_metadata")
+    metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
+
+    warnings: List[str] = []
+    if chunk_count == 0:
+        warnings.append("no_chunks")
+    if not metadata_available:
+        warnings.append("no_metadata")
+
+    return {
+        "doc_id": doc_id,
+        "chunk_count": chunk_count,
+        "table_row_chunks": table_rows,
+        "avg_chunk_chars": round(avg_len, 2),
+        "page_coverage": len(pages_covered),
+        "has_metadata": metadata_available,
+        "plan_hash": plan_hash,
+        "model_version": model_version,
+        "prompt_sha": prompt_sha,
+        "metadata_calls": metadata_calls,
+        "metadata_bytes": metadata_bytes,
+        "warnings": warnings,
+    }
+
+
+@mcp.tool(name="ingest.enhance", title="Ingest: Enhance Artifacts")
+async def ingest_enhance(ctx: Context, doc_id: str, op: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    supported_ops = {"add_synonyms", "link_crossrefs", "fix_table_pages"}
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    if op not in supported_ops:
+        return {"error": "unsupported_operation", "supported_ops": sorted(supported_ops)}
+    return {
+        "doc_id": doc_id,
+        "operation": op,
+        "status": "not_implemented",
+    }
+
+
 async def _fetch_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not chunk_ids:
         return {}
@@ -276,7 +944,7 @@ async def _hydrate_qdrant_hits(hits) -> None:
             payload["page_numbers"] = _parse_page_numbers(info.get("page_numbers"))
         if "mtime" not in payload and info.get("mtime") is not None:
             payload["mtime"] = info.get("mtime")
-        for key in ("pages", "section_path", "element_ids", "bboxes", "types", "source_tools", "table_headers", "table_units"):
+        for key in ("pages", "section_path", "element_ids", "bboxes", "types", "source_tools", "table_headers", "table_units", "chunk_profile", "plan_hash", "model_version", "prompt_sha", "doc_metadata"):
             if payload.get(key) in (None, "", []):
                 value = info.get(key)
                 if isinstance(value, list):
@@ -340,6 +1008,12 @@ async def _ensure_row_texts(
         if isinstance(tu, str) and tu:
             try:
                 row["table_units"] = json.loads(tu)
+            except Exception:
+                pass
+        dm = row.get("doc_metadata")
+        if isinstance(dm, str) and dm:
+            try:
+                row["doc_metadata"] = json.loads(dm)
             except Exception:
                 pass
 
@@ -411,9 +1085,12 @@ async def plan_route(query: str) -> Dict[str, Any]:
     return {"route": "hybrid", "k": 24}
 
 
-def _needs_sparse_retry(query: str, rows: List[Dict[str, Any]]) -> bool:
+def _should_retry_sparse(query: str, rows: List[Dict[str, Any]]) -> bool:
     if not rows:
         return True
+    best = _best_score(rows)
+    if best >= max(ANSWERABILITY_THRESHOLD, 0.35):
+        return False
     tokens = [tok.lower() for tok in re.findall(r"[A-Za-z0-9]{4,}", query)]
     if not tokens:
         return False
@@ -421,8 +1098,13 @@ def _needs_sparse_retry(query: str, rows: List[Dict[str, Any]]) -> bool:
     if not top:
         return True
     text = (top.get("text") or "").lower()
-    hits = sum(1 for tok in tokens if tok in text)
-    return (hits / len(tokens)) < 0.3
+    coverage = sum(1 for tok in tokens if tok in text) / max(len(tokens), 1)
+    if coverage < 0.25:
+        return True
+    types = top.get("types") or []
+    if not _is_table_row(types) and coverage < 0.4 and best < 0.2:
+        return True
+    return False
 
 
 async def hyde(query: str) -> str:
@@ -458,6 +1140,7 @@ async def _run_semantic(
     return_k: int,
     subjects: List[str],
     timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     limit = max(top_k, return_k)
     try:
@@ -477,9 +1160,15 @@ async def _run_semantic(
     rows: List[Dict[str, Any]] = []
     for h in hits[:return_k]:
         pl = h.payload or {}
+        dense_score = getattr(h, "score", 0.0)
+        decay = _decay_factor(pl.get("mtime"))
+        prior_mult = _prior_multiplier(pl.get("doc_id"), subjects, boosts)
+        final_score = dense_score * prior_mult
         row = {
-            "score": getattr(h, "score", 0.0),
-            "dense_score": getattr(h, "score", 0.0),
+            "score": final_score,
+            "final_score": final_score,
+            "dense_score": dense_score,
+            "decay_factor": decay,
             "id": str(getattr(h, "id", "")),
             "chunk_id": str(getattr(h, "id", "")),
             "doc_id": pl.get("doc_id"),
@@ -495,9 +1184,24 @@ async def _run_semantic(
             "source_tools": pl.get("source_tools"),
             "table_headers": pl.get("table_headers"),
             "table_units": pl.get("table_units"),
+            "chunk_profile": pl.get("chunk_profile"),
+            "plan_hash": pl.get("plan_hash"),
+            "model_version": pl.get("model_version"),
+            "prompt_sha": pl.get("prompt_sha"),
+            "doc_metadata": pl.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=None,
+                dense=dense_score,
+                rrf=None,
+                rerank=None,
+                decay=decay,
+                final=final_score,
+            ),
         }
+        _ensure_score_bucket(row)["prior"] = prior_mult
         rows.append(row)
     await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
     return rows
 
 
@@ -509,6 +1213,7 @@ async def _run_sparse(
     top_k: int,
     subjects: List[str],
     timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     start = time.perf_counter()
@@ -519,6 +1224,7 @@ async def _run_sparse(
     rows: List[Dict[str, Any]] = []
     for item in lexical_hits[:return_k]:
         bm = item.get("bm25")
+        decay = _decay_factor(item.get("mtime"))
         score = _combined_score(
             bm25=bm,
             dense=None,
@@ -526,12 +1232,15 @@ async def _run_sparse(
             bm_stats=bm_stats,
             dense_stats=None,
             rerank_stats=None,
-            decay=_decay_factor(item.get("mtime")),
+            decay=decay,
         )
+        prior_mult = _prior_multiplier(item.get("doc_id"), subjects, boosts)
+        score *= prior_mult
         rows.append({
             "score": score,
             "final_score": score,
             "bm25_score": bm,
+            "decay_factor": decay,
             "id": item.get("chunk_id"),
             "chunk_id": item.get("chunk_id"),
             "doc_id": item.get("doc_id"),
@@ -547,8 +1256,23 @@ async def _run_sparse(
             "source_tools": item.get("source_tools"),
             "table_headers": item.get("table_headers"),
             "table_units": item.get("table_units"),
+            "chunk_profile": item.get("chunk_profile"),
+            "plan_hash": item.get("plan_hash"),
+            "model_version": item.get("model_version"),
+            "prompt_sha": item.get("prompt_sha"),
+            "doc_metadata": item.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=bm,
+                dense=None,
+                rrf=None,
+                rerank=None,
+                decay=decay,
+                final=score,
+            ),
         })
+        _ensure_score_bucket(rows[-1])["prior"] = prior_mult
     await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
     return rows
 
 
@@ -561,6 +1285,7 @@ async def _run_rerank(
     top_k: int,
     subjects: List[str],
     timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     try:
@@ -600,9 +1325,13 @@ async def _run_rerank(
         fallback_rows: List[Dict[str, Any]] = []
         for h in hits[: top_k]:
             pl = h.payload or {}
+            dense_val = getattr(h, "score", 0.0)
+            decay = _decay_factor(pl.get("mtime"))
             fallback_rows.append({
-                "score": getattr(h, "score", 0.0),
-                "dense_score": getattr(h, "score", 0.0),
+                "score": dense_val,
+                "final_score": dense_val,
+                "dense_score": dense_val,
+                "decay_factor": decay,
                 "id": str(getattr(h, "id", "")),
                 "chunk_id": str(getattr(h, "id", "")),
                 "doc_id": pl.get("doc_id"),
@@ -618,8 +1347,22 @@ async def _run_rerank(
                 "source_tools": pl.get("source_tools"),
                 "table_headers": pl.get("table_headers"),
                 "table_units": pl.get("table_units"),
+                "chunk_profile": pl.get("chunk_profile"),
+                "plan_hash": pl.get("plan_hash"),
+                "model_version": pl.get("model_version"),
+                "prompt_sha": pl.get("prompt_sha"),
+                "doc_metadata": pl.get("doc_metadata"),
+                "scores": _score_breakdown(
+                    bm25=None,
+                    dense=dense_val,
+                    rrf=None,
+                    rerank=None,
+                    decay=decay,
+                    final=dense_val,
+                ),
             })
         await _ensure_row_texts(fallback_rows, collection, subjects)
+        _annotate_rows(fallback_rows, query)
         return fallback_rows
 
     dense_values = [getattr(h, "score", 0.0) for h in hits]
@@ -627,10 +1370,15 @@ async def _run_rerank(
     rerank_values = list(rerank_scores.values())
     rerank_stats = (min(rerank_values), max(rerank_values)) if rerank_values else None
     scored = []
+    decay_map: Dict[int, float] = {}
+    prior_map: Dict[int, float] = {}
+    prior_map: Dict[int, float] = {}
+    prior_map: Dict[int, float] = {}
     for o in order:
         idx = o.get("index", 0)
         base = float(o.get("score", 0.0) or 0.0)
         payload = hits[idx].payload or {}
+        decay = _decay_factor(payload.get("mtime"))
         final = _combined_score(
             bm25=None,
             dense=getattr(hits[idx], "score", 0.0),
@@ -638,9 +1386,13 @@ async def _run_rerank(
             bm_stats=None,
             dense_stats=dense_stats,
             rerank_stats=rerank_stats,
-            decay=_decay_factor(payload.get("mtime")),
+            decay=decay,
         )
+        prior_mult = _prior_multiplier(payload.get("doc_id"), subjects, boosts)
+        final *= prior_mult
         scored.append((final, idx))
+        decay_map[int(idx)] = decay
+        prior_map[int(idx)] = prior_mult
     scored.sort(key=lambda t: t[0], reverse=True)
     final_scores = {idx: score for score, idx in scored}
 
@@ -648,11 +1400,15 @@ async def _run_rerank(
     for _, idx in scored[:return_k]:
         hit = hits[idx]
         payload = hit.payload or {}
+        dense_val = getattr(hit, "score", 0.0)
+        decay = decay_map.get(int(idx))
+        prior_mult = prior_map.get(int(idx), 1.0)
         row = {
             "score": final_scores.get(idx, 0.0),
             "final_score": final_scores.get(idx, 0.0),
             "rerank_score": rerank_scores.get(idx, 0.0),
-            "dense_score": getattr(hit, "score", 0.0),
+            "dense_score": dense_val,
+            "decay_factor": decay,
             "id": str(getattr(hit, "id", "")),
             "chunk_id": str(getattr(hit, "id", "")),
             "doc_id": payload.get("doc_id"),
@@ -668,7 +1424,21 @@ async def _run_rerank(
             "source_tools": payload.get("source_tools"),
             "table_headers": payload.get("table_headers"),
             "table_units": payload.get("table_units"),
+            "chunk_profile": payload.get("chunk_profile"),
+            "plan_hash": payload.get("plan_hash"),
+            "model_version": payload.get("model_version"),
+            "prompt_sha": payload.get("prompt_sha"),
+            "doc_metadata": payload.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=None,
+                dense=dense_val,
+                rrf=None,
+                rerank=rerank_scores.get(idx, 0.0),
+                decay=decay,
+                final=final_scores.get(idx, 0.0),
+            ),
         }
+        _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
             neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
             if neigh:
@@ -680,6 +1450,7 @@ async def _run_rerank(
                 row["chunk_end"] = int(ordered[-1].get("chunk_end", row["chunk_end"]))
         rows.append(row)
     await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
     return rows
 
 
@@ -692,6 +1463,7 @@ async def _run_hybrid(
     top_k: int,
     subjects: List[str],
     timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     try:
@@ -715,6 +1487,7 @@ async def _run_hybrid(
     dense_list: List[Dict[str, Any]] = []
     for h in dense_hits:
         payload = h.payload or {}
+        prior_mult = _prior_multiplier(payload.get("doc_id"), subjects, boosts)
         dense_list.append({
             "chunk_id": str(getattr(h, "id", "")),
             "doc_id": payload.get("doc_id"),
@@ -733,6 +1506,7 @@ async def _run_hybrid(
             "source_tools": payload.get("source_tools"),
             "table_headers": payload.get("table_headers"),
             "table_units": payload.get("table_units"),
+            "_prior_mult": prior_mult,
         })
 
     fts_list: List[Dict[str, Any]] = list(lexical_hits)
@@ -761,11 +1535,19 @@ async def _run_hybrid(
         logger.warning("Rerank failed, falling back to fused order: %s", exc)
         fallback_rows: List[Dict[str, Any]] = []
         for x in fused[: top_k]:
+            decay = _decay_factor(x.get("mtime"))
+            prior_mult = x.get("_prior_mult")
+            if prior_mult is None:
+                prior_mult = _prior_multiplier(x.get("doc_id"), subjects, boosts)
+            base_rrf = x.get("_rrf_score") or 0.0
+            final = base_rrf * prior_mult
             fallback_rows.append({
-                "score": x.get("_rrf_score"),
+                "score": final,
+                "final_score": final,
                 "rrf_score": x.get("_rrf_score"),
                 "bm25_score": x.get("bm25"),
                 "dense_score": x.get("dense_score"),
+                "decay_factor": decay,
                 "id": x.get("chunk_id"),
                 "chunk_id": x.get("chunk_id"),
                 "doc_id": x.get("doc_id"),
@@ -781,8 +1563,23 @@ async def _run_hybrid(
                 "source_tools": x.get("source_tools"),
                 "table_headers": x.get("table_headers"),
                 "table_units": x.get("table_units"),
+                "chunk_profile": x.get("chunk_profile"),
+                "plan_hash": x.get("plan_hash"),
+                "model_version": x.get("model_version"),
+                "prompt_sha": x.get("prompt_sha"),
+                "doc_metadata": x.get("doc_metadata"),
+                "scores": _score_breakdown(
+                    bm25=x.get("bm25"),
+                    dense=x.get("dense_score"),
+                    rrf=x.get("_rrf_score"),
+                    rerank=None,
+                    decay=decay,
+                    final=final,
+                ),
             })
+            _ensure_score_bucket(fallback_rows[-1])["prior"] = prior_mult
         await _ensure_row_texts(fallback_rows, collection, subjects)
+        _annotate_rows(fallback_rows, query)
         return fallback_rows
 
     bm_values = [x.get("bm25") for x in fused if x.get("bm25") is not None]
@@ -792,10 +1589,12 @@ async def _run_hybrid(
     rerank_values = list(rerank_scores.values())
     rerank_stats = (min(rerank_values), max(rerank_values)) if rerank_values else None
     scored = []
+    decay_map: Dict[int, float] = {}
     for o in order:
         idx = o.get("index", 0)
         base = float(o.get("score", 0.0) or 0.0)
         x = fused[idx]
+        decay = _decay_factor(x.get("mtime"))
         final = _combined_score(
             bm25=x.get("bm25"),
             dense=x.get("dense_score"),
@@ -803,15 +1602,23 @@ async def _run_hybrid(
             bm_stats=bm_stats,
             dense_stats=dense_stats,
             rerank_stats=rerank_stats,
-            decay=_decay_factor(x.get("mtime")),
+            decay=decay,
         )
+        prior_mult = x.get("_prior_mult")
+        if prior_mult is None:
+            prior_mult = _prior_multiplier(x.get("doc_id"), subjects, boosts)
+        final *= prior_mult
         scored.append((final, idx))
+        decay_map[int(idx)] = decay
+        prior_map[int(idx)] = prior_mult
     scored.sort(key=lambda t: t[0], reverse=True)
     final_scores = {idx: score for score, idx in scored}
 
     rows: List[Dict[str, Any]] = []
     for _, idx in scored[:return_k]:
         x = fused[idx]
+        decay = decay_map.get(int(idx))
+        prior_mult = prior_map.get(int(idx), 1.0)
         row = {
             "score": final_scores.get(idx, 0.0),
             "final_score": final_scores.get(idx, 0.0),
@@ -819,6 +1626,7 @@ async def _run_hybrid(
             "rrf_score": x.get("_rrf_score"),
             "bm25_score": x.get("bm25"),
             "dense_score": x.get("dense_score"),
+            "decay_factor": decay,
             "id": x.get("chunk_id"),
             "chunk_id": x.get("chunk_id"),
             "doc_id": x.get("doc_id"),
@@ -834,7 +1642,21 @@ async def _run_hybrid(
             "source_tools": x.get("source_tools"),
             "table_headers": x.get("table_headers"),
             "table_units": x.get("table_units"),
+            "chunk_profile": x.get("chunk_profile"),
+            "plan_hash": x.get("plan_hash"),
+            "model_version": x.get("model_version"),
+            "prompt_sha": x.get("prompt_sha"),
+            "doc_metadata": x.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=x.get("bm25"),
+                dense=x.get("dense_score"),
+                rrf=x.get("_rrf_score"),
+                rerank=rerank_scores.get(idx, 0.0),
+                decay=decay,
+                final=final_scores.get(idx, 0.0),
+            ),
         }
+        _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
             neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
             if neigh:
@@ -846,6 +1668,7 @@ async def _run_hybrid(
                 row["chunk_end"] = int(ordered[-1].get("chunk_end", row["chunk_end"]))
         rows.append(row)
     await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
     return rows
 
 
@@ -859,20 +1682,525 @@ async def _execute_search(
     top_k: int,
     subjects: List[str],
     timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     if route == "sparse":
-        return await _run_sparse(collection, query, retrieve_k, return_k, top_k, subjects, timings)
+        return await _run_sparse(collection, query, retrieve_k, return_k, top_k, subjects, timings, boosts)
     if route == "semantic":
-        return await _run_semantic(collection, query, query_vec, top_k, return_k, subjects, timings)
+        return await _run_semantic(collection, query, query_vec, top_k, return_k, subjects, timings, boosts)
     if route == "rerank":
-        return await _run_rerank(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings)
+        return await _run_rerank(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings, boosts)
     if route == "hybrid":
-        return await _run_hybrid(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings)
+        return await _run_hybrid(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings, boosts)
     return [{"error": f"invalid route '{route}'"}]
 
 
 # ---- Register search tools per scope ---------------------------------------
 def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> None:
+    sparse_tool_name = f"sparse_{slug}"
+    dense_tool_name = f"dense_{slug}"
+    hybrid_tool_name = f"hybrid_{slug}"
+    rerank_tool_name = f"rerank_{slug}"
+    batch_tool_name = f"batch_{slug}"
+    quality_tool_name = f"quality_{slug}"
+    sparse_title = f"{title or slug}: Sparse Search"
+    dense_title = f"{title or slug}: Dense Search"
+    hybrid_title = f"{title or slug}: Hybrid Search"
+    rerank_title = f"{title or slug}: Rerank Search"
+    batch_title = f"{title or slug}: Batch Search"
+    quality_title = f"{title or slug}: Inspect Hits"
+
+    @mcp.tool(name=sparse_tool_name, title=sparse_title)
+    async def sparse_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_sparse(
+            collection,
+            query,
+            retrieve_k,
+            return_k,
+            retrieve_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "sparse",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+
+    @mcp.tool(name=dense_tool_name, title=dense_title)
+    async def dense_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        query_vec = await embed_query(query)
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_semantic(
+            collection,
+            query,
+            query_vec,
+            retrieve_k,
+            return_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "semantic",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+
+    @mcp.tool(name=hybrid_tool_name, title=hybrid_title)
+    async def hybrid_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        top_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        top_k = max(return_k, min(int(top_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        query_vec = await embed_query(query)
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_hybrid(
+            collection,
+            query,
+            query_vec,
+            retrieve_k,
+            return_k,
+            top_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "hybrid",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+
+    @mcp.tool(name=rerank_tool_name, title=rerank_title)
+    async def rerank_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        top_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        retrieve_k = max(1, min(int(retrieve_k), RERANK_MAX_ITEMS))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        top_k = max(return_k, min(int(top_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        query_vec = await embed_query(query)
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_rerank(
+            collection,
+            query,
+            query_vec,
+            retrieve_k,
+            return_k,
+            top_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "rerank",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+
+    @mcp.tool(name=batch_tool_name, title=batch_title)
+    async def batch_tool(
+        ctx: Context,
+        queries: List[str],
+        routes: Optional[List[str]] = None,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+        scopes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(queries, list) or not queries:
+            return {"error": "missing_queries"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        if routes and len(routes) != len(queries):
+            return {"error": "routes_length_mismatch"}
+        use_routes = routes or ["auto"] * len(queries)
+        subjects = get_subjects_from_context(ctx)
+        results: List[Dict[str, Any]] = []
+        for idx, (query, route) in enumerate(zip(queries, use_routes)):
+            q = (query or "").strip()
+            if not q:
+                results.append({"index": idx, "query": query, "route": route, "error": "empty_query"})
+                continue
+            timings: Dict[str, float] = {}
+            route_norm = route.lower()
+            if route_norm not in {"sparse", "semantic", "rerank", "hybrid", "auto"}:
+                results.append({"index": idx, "query": query, "route": route, "error": "invalid_route"})
+                continue
+            boosts = None
+            if scopes and idx < len(scopes):
+                boosts = _parse_scope_boosts(scopes[idx])
+            elif scope:
+                boosts = _parse_scope_boosts(scope)
+            try:
+                query_vec = []
+                if route_norm in {"semantic", "rerank", "hybrid", "auto"}:
+                    query_vec = await embed_query(q)
+                rows = await _execute_search(
+                    route_norm,
+                    collection,
+                    q,
+                    query_vec,
+                    retrieve_k,
+                    return_k,
+                    max(return_k, retrieve_k),
+                    subjects,
+                    timings,
+                    boosts,
+                )
+                best = _best_score(rows)
+                result_entry = {
+                    "index": idx,
+                    "query": q,
+                    "route": route_norm,
+                    "rows": rows,
+                    "timings": {k: round(v, 3) for k, v in timings.items()},
+                    "best_score": best,
+                }
+                if boosts:
+                    result_entry["boosts"] = boosts
+                if best < ANSWERABILITY_THRESHOLD:
+                    result_entry.update({
+                        "abstain": True,
+                        "reason": "best_score_below_threshold",
+                        "threshold": ANSWERABILITY_THRESHOLD,
+                    })
+                results.append(result_entry)
+            except Exception as exc:
+                results.append({"index": idx, "query": q, "route": route_norm, "error": str(exc)})
+        return {"results": results}
+
+    @mcp.tool(name=quality_tool_name, title=quality_title)
+    async def quality_tool(
+        ctx: Context,
+        hits: List[Dict[str, Any]],
+        rules: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        rules = rules or {}
+        min_score = float(rules.get("min_score", ANSWERABILITY_THRESHOLD))
+        require_metadata = bool(rules.get("require_metadata", False))
+        require_plan_hash = bool(rules.get("require_plan_hash", False))
+        failures: List[str] = []
+        valid_hits = [hit for hit in hits if isinstance(hit, dict)] if hits else []
+        for idx, hit in enumerate(valid_hits):
+            score = hit.get("final_score")
+            if score is None:
+                score = hit.get("score")
+            try:
+                score_val = float(score)
+            except Exception:
+                score_val = 0.0
+            if score_val < min_score:
+                failures.append(f"hit_{idx}_score_below_min")
+            if require_metadata and not hit.get("doc_metadata"):
+                failures.append(f"hit_{idx}_missing_metadata")
+            if require_plan_hash and not hit.get("plan_hash"):
+                failures.append(f"hit_{idx}_missing_plan_hash")
+        passed = not failures
+        return {
+            "pass": passed,
+            "failures": failures,
+            "evaluated": len(valid_hits),
+            "rules": {
+                "min_score": min_score,
+                "require_metadata": require_metadata,
+                "require_plan_hash": require_plan_hash,
+            },
+        }
+
+    hint_tool_name = f"hint_{slug}"
+    hint_title = f"{title or slug}: Sparse Hints"
+
+    @mcp.tool(name=hint_tool_name, title=hint_title)
+    async def hint_tool(
+        ctx: Context,
+        term: Optional[str] = None,
+        terms: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        seeds: List[str] = []
+        if term:
+            seeds.append(str(term))
+        if isinstance(terms, list):
+            seeds.extend(str(t) for t in terms if t)
+        seeds = [s for s in map(str.strip, seeds) if s]
+        if not seeds:
+            return {"error": "missing_terms"}
+        expansions: Dict[str, List[str]] = {}
+        for seed in seeds:
+            upper = seed.upper()
+            matches: List[str] = []
+            alias_list = ALIASES.get(upper)
+            if alias_list:
+                matches.extend(alias_list)
+            for key, synonyms in ALIASES.items():
+                bucket = [key] + synonyms
+                if any(seed.lower() == entry.lower() for entry in bucket):
+                    matches.extend(bucket)
+            normalized = []
+            for candidate in matches:
+                if candidate.lower() != seed.lower() and candidate not in normalized:
+                    normalized.append(candidate)
+            expansions[seed] = normalized
+        _audit("hint", {
+            "slug": slug,
+            "terms": seeds,
+            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+        })
+        return {
+            "terms": seeds,
+            "expansions": expansions,
+            "alias_count": len(ALIASES),
+        }
+
+    hyde_tool_name = f"hyde_{slug}"
+    hyde_title = f"{title or slug}: HyDE Hint"
+
+    @mcp.tool(name=hyde_tool_name, title=hyde_title)
+    async def hyde_tool(ctx: Context, query: str) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        hypothesis = await hyde(query)
+        _audit("hyde_hint", {
+            "slug": slug,
+            "query": query,
+            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+        })
+        return {
+            "query": query,
+            "hypothesis": hypothesis,
+            "model_version": INGEST_MODEL_VERSION,
+            "prompt_sha": INGEST_PROMPT_SHA,
+        }
+
+    table_tool_name = f"table_{slug}"
+    table_title = f"{title or slug}: Table Lookup"
+
+    @mcp.tool(name=table_tool_name, title=table_title)
+    async def table_lookup(
+        ctx: Context,
+        query: str,
+        doc_id: Optional[str] = None,
+        limit: int = 10,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        limit = max(1, min(int(limit), 50))
+        fetch_limit = max(limit * 3, limit)
+        raw_hits = await asyncio.to_thread(_fts_search, query, fetch_limit)
+        filtered: List[Dict[str, Any]] = []
+        target_doc = str(doc_id) if doc_id else None
+        where = where or {}
+        for item in raw_hits:
+            if target_doc and str(item.get("doc_id")) != target_doc:
+                continue
+            if not _is_table_row(item.get("types")):
+                continue
+            text = (item.get("text") or "").lower()
+            ok = True
+            for key, val in where.items():
+                if key and str(key).lower() not in text:
+                    ok = False
+                    break
+                if val and str(val).lower() not in text:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            filtered.append(item)
+            if len(filtered) >= limit:
+                break
+        await _ensure_row_texts(filtered, collection, get_subjects_from_context(ctx))
+        for row in filtered:
+            row.setdefault("route", "table")
+        filtered = [row for row in filtered if _is_allowed_path(row.get("path"))]
+        _audit("table_lookup", {
+            "slug": slug,
+            "query": query,
+            "doc_id": doc_id,
+            "count": len(filtered),
+            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+        })
+        return {
+            "query": query,
+            "doc_id": doc_id,
+            "rows": filtered,
+            "limit": limit,
+        }
+
+    outline_tool_name = f"outline_{slug}"
+    outline_title = f"{title or slug}: Outline"
+
+    @mcp.tool(name=outline_tool_name, title=outline_title)
+    async def outline_tool(ctx: Context, doc_id: str) -> Dict[str, Any]:
+        if not doc_id:
+            return {"error": "missing_doc_id"}
+        conn = sqlite3.connect(FTS_DB_PATH)
+        try:
+            cur = conn.execute(
+                "SELECT text, section_path, pages, chunk_start, chunk_end FROM fts_chunks WHERE doc_id = ? AND types LIKE '%heading%' ORDER BY chunk_start",
+                (doc_id,),
+            )
+            outline: List[Dict[str, Any]] = []
+            for text, section_path, pages, chunk_start, chunk_end in cur.fetchall():
+                try:
+                    section = json.loads(section_path) if isinstance(section_path, str) else section_path
+                except Exception:
+                    section = section_path
+                pages_list = _parse_page_numbers(pages)
+                outline.append(
+                    {
+                        "heading": text,
+                        "section_path": section or [],
+                        "pages": pages_list,
+                        "chunk_start": chunk_start,
+                        "chunk_end": chunk_end,
+                    }
+                )
+        finally:
+            conn.close()
+        _audit("outline", {
+            "slug": slug,
+            "doc_id": doc_id,
+            "count": len(outline),
+            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+        })
+        return {"doc_id": doc_id, "outline": outline}
+
+    promote_tool_name = f"promote_{slug}"
+    demote_tool_name = f"demote_{slug}"
+    promote_title = f"{title or slug}: Promote Doc"
+    demote_title = f"{title or slug}: Demote Doc"
+
+    @mcp.tool(name=promote_tool_name, title=promote_title)
+    async def promote_tool(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
+        if not doc_id:
+            return {"error": "missing_doc_id"}
+        subjects = get_subjects_from_context(ctx)
+        multiplier = _update_session_prior(subjects, doc_id, abs(weight))
+        key = _session_key(subjects)
+        delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
+        _audit("promote", {
+            "slug": slug,
+            "doc_id": doc_id,
+            "delta": delta,
+            "subjects": _audit_subjects(subjects),
+        })
+        return {
+            "doc_id": doc_id,
+            "prior_delta": delta,
+            "multiplier": multiplier,
+        }
+
+    @mcp.tool(name=demote_tool_name, title=demote_title)
+    async def demote_tool(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
+        if not doc_id:
+            return {"error": "missing_doc_id"}
+        subjects = get_subjects_from_context(ctx)
+        multiplier = _update_session_prior(subjects, doc_id, -abs(weight))
+        key = _session_key(subjects)
+        delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
+        _audit("demote", {
+            "slug": slug,
+            "doc_id": doc_id,
+            "delta": delta,
+            "subjects": _audit_subjects(subjects),
+        })
+        return {
+            "doc_id": doc_id,
+            "prior_delta": delta,
+            "multiplier": multiplier,
+        }
+
     tool_name = f"search_{slug}"
     tool_title = f"{title or slug}: Search"
 
@@ -884,14 +2212,19 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
         top_k: int = 8,
         retrieve_k: int = 24,
         return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Vector search (semantic), vector+rerank, hybrid, or auto-planned retrieval."""
         start_time = time.perf_counter()
         timings: Dict[str, float] = {}
         route_retrieve_val = retrieve_k
+        boosts = _parse_scope_boosts(scope)
+
         def finalize(rows: List[Dict[str, Any]], route_name: str, hyde_used: bool = False) -> List[Dict[str, Any]]:
             duration_ms = (time.perf_counter() - start_time) * 1000.0
             clean_rows = [r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")]
+            best_score = _best_score(rows)
+            abstain_flag = ANSWERABILITY_THRESHOLD > 0.0 and best_score < ANSWERABILITY_THRESHOLD
             payload = {
                 "slug": slug,
                 "mode": mode,
@@ -900,10 +2233,11 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 "return_k": return_k,
                 "top_k": top_k,
                 "result_count": len(clean_rows),
-                "best_score": _best_score(rows),
+                "best_score": best_score,
                 "hyde_used": hyde_used,
                 "duration_ms": round(duration_ms, 3),
-                "abstain": any(isinstance(r, dict) and r.get("abstain") for r in rows),
+                "thin_payload": THIN_PAYLOAD_ENABLED,
+                "abstain": abstain_flag,
                 "timings": {k: round(v, 3) for k, v in timings.items()},
                 "subjects": [hashlib.sha1(s.encode("utf-8")).hexdigest() for s in subjects if s],
                 "results": [
@@ -916,6 +2250,15 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                     for row in clean_rows[:return_k]
                 ],
             }
+            if boosts:
+                payload["boosts"] = boosts
+            if abstain_flag:
+                payload.setdefault("reason", "best_score_below_threshold")
+                payload["threshold"] = ANSWERABILITY_THRESHOLD
+            try:
+                _audit("search", payload)
+            except Exception:
+                logger.debug("audit_log_failed", exc_info=True)
             try:
                 logger.info("search_metrics %s", json.dumps(payload))
             except Exception:
@@ -975,6 +2318,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             top_k=top_k,
             subjects=subjects,
             timings=timings,
+            boosts=boosts,
         )
 
         if rows and isinstance(rows[0], dict) and rows[0].get("error"):
@@ -1006,6 +2350,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                         top_k=top_k,
                         subjects=subjects,
                         timings=timings,
+                        boosts=boosts,
                     )
                     timings["hyde_ms"] = timings.get("hyde_ms", 0.0) + (time.perf_counter() - hyde_start) * 1000.0
                     if hyde_rows and isinstance(hyde_rows[0], dict) and hyde_rows[0].get("error"):
@@ -1022,7 +2367,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 route,
             )
 
-        if route != "sparse" and _needs_sparse_retry(query, rows):
+        if route != "sparse" and _should_retry_sparse(query, rows):
             sparse_rows = await _execute_search(
                 route="sparse",
                 collection=collection,
@@ -1033,6 +2378,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 top_k=top_k,
                 subjects=subjects,
                 timings=timings,
+                boosts=boosts,
             )
             if sparse_rows and not sparse_rows[0].get("error"):
                 for row in sparse_rows:
@@ -1059,6 +2405,16 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
         await _ensure_row_texts([row], collection, get_subjects_from_context(ctx))
         if not row.get("text"):
             return {"error": "not_found"}
+        if not _is_allowed_path(row.get("path")):
+            _audit("open_denied", {
+                "slug": slug,
+                "doc_id": row.get("doc_id"),
+                "chunk_id": target,
+                "reason": "path_not_allowed",
+                "path": row.get("path"),
+                "subjects": subjects_hash,
+            })
+            return {"error": "forbidden", "detail": "path not allowed"}
         text = row.get("text", "")
         if start is not None or end is not None:
             s = max(0, int(start or 0))
@@ -1066,6 +2422,13 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             row["text"] = text[s:e]
             row["slice"] = {"start": s, "end": e}
         row["chunk_id"] = target
+        subjects_hash = _audit_subjects(get_subjects_from_context(ctx))
+        _audit("open", {
+            "slug": slug,
+            "doc_id": row.get("doc_id"),
+            "chunk_id": target,
+            "subjects": subjects_hash,
+        })
         return row
 
 
@@ -1100,6 +2463,19 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 "element_ids": raw.get("element_ids"),
             })
         await _ensure_row_texts(rows, collection, subjects_local)
+        filtered = []
+        for row in rows:
+            if _is_allowed_path(row.get("path")):
+                filtered.append(row)
+        if len(filtered) != len(rows):
+            rows = filtered
+        subjects_hash = _audit_subjects(subjects_local)
+        _audit("neighbors", {
+            "slug": slug,
+            "chunk_id": chunk_id,
+            "count": len(rows),
+            "subjects": subjects_hash,
+        })
         return rows
 
 
@@ -1120,6 +2496,56 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             SUMMARY_DB_PATH,
         )
         return results or [{"info": "no_matches"}]
+
+    entities_tool_name = f"entities_{slug}"
+    entities_title = f"{title or slug}: Graph Entities"
+
+    @mcp.tool(name=entities_tool_name, title=entities_title)
+    async def entities_tool(
+        ctx: Context,
+        types: Optional[List[str]] = None,
+        match: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        type_filter: List[str] = []
+        if isinstance(types, list):
+            type_filter = [str(t).strip() for t in types if t]
+        data = await asyncio.to_thread(
+            graph_list_entities,
+            collection,
+            type_filter or None,
+            (match or "").strip() or None,
+            max(1, int(limit)),
+            GRAPH_DB_PATH,
+        )
+        return {
+            "collection": collection,
+            "types": type_filter,
+            "match": (match or "").strip() or None,
+            "entities": data,
+        }
+
+    linkouts_tool_name = f"linkouts_{slug}"
+    linkouts_title = f"{title or slug}: Entity Mentions"
+
+    @mcp.tool(name=linkouts_tool_name, title=linkouts_title)
+    async def linkouts_tool(
+        ctx: Context,
+        entity_id: str,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        entity_id = (entity_id or "").strip()
+        if not entity_id:
+            return {"error": "missing_entity_id"}
+        data = await asyncio.to_thread(
+            graph_entity_linkouts,
+            entity_id,
+            max(1, int(limit)),
+            GRAPH_DB_PATH,
+        )
+        if not data.get("entity"):
+            return {"error": "not_found"}
+        return data
 
 
     @mcp.tool(name=f"graph_{slug}", title=f"{title or slug}: Graph Neighbors")

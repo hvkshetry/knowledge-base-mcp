@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import csv
 import json
 import math
 import os
@@ -41,7 +42,7 @@ async def run_search(
     retrieve_k: int,
     return_k: int,
     server,
-) -> Tuple[List[Dict[str, Any]], str, bool, float]:
+) -> Tuple[List[Dict[str, Any]], str, bool, float, Dict[str, float], bool]:
     query = record["query"]
     collection = record.get("collection")
     if not collection:
@@ -69,6 +70,7 @@ async def run_search(
     route_retrieve = max(return_k, min(route_retrieve, 256))
     start = time.perf_counter()
     timings: Dict[str, float] = {}
+    timings: Dict[str, float] = {}
     rows = await server._execute_search(
         route=route,
         collection=collection,
@@ -82,6 +84,7 @@ async def run_search(
     )
     duration_ms = (time.perf_counter() - start) * 1000.0
     hyde_used = False
+    abstained = any(isinstance(r, dict) and r.get("abstain") for r in rows)
     best = server._best_score(rows)
     if server.ANSWERABILITY_THRESHOLD > 0.0 and best < server.ANSWERABILITY_THRESHOLD:
         hypo = await server.hyde(query)
@@ -107,7 +110,8 @@ async def run_search(
                     hyde_rows.insert(0, {"note": "HyDE retry satisfied threshold", "base_route": route})
                     rows = hyde_rows
                     hyde_used = True
-    return rows, route, hyde_used, duration_ms
+                    abstained = any(isinstance(r, dict) and r.get("abstain") for r in rows)
+    return rows, route, hyde_used, duration_ms, timings, abstained
 
 
 def evaluate(record: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -161,6 +165,10 @@ async def main() -> None:
     parser.add_argument("--min-ndcg", type=float, default=0.0, help="Fail if avg nDCG falls below this value")
     parser.add_argument("--min-recall", type=float, default=0.0, help="Fail if avg recall falls below this value")
     parser.add_argument("--max-latency", type=float, default=0.0, help="Fail if avg duration exceeds this value (ms)")
+    parser.add_argument("--max-abstain-ratio", type=float, default=1.0, help="Fail if abstain ratio exceeds this value (0-1)")
+    parser.add_argument("--output-json", help="Write aggregate metrics to this JSON file")
+    parser.add_argument("--output-csv", help="Write per-query metrics to this CSV file")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-query stdout logging")
     args = parser.parse_args()
 
     if args.fts_db:
@@ -180,8 +188,11 @@ async def main() -> None:
         "hyde_used": 0,
         "abstain": 0,
     }
+    stage_totals: Dict[str, float] = {}
+    stage_counts: Dict[str, int] = {}
+    per_query: List[Dict[str, Any]] = []
     for record in records:
-        rows, route, hyde_used, duration_ms = await run_search(
+        rows, route, hyde_used, duration_ms, timings, abstained = await run_search(
             record,
             args.mode,
             args.top_k,
@@ -191,7 +202,7 @@ async def main() -> None:
         )
         totals["queries"] += 1
         totals["duration_ms"] += duration_ms
-        if any(isinstance(r, dict) and r.get("abstain") for r in rows):
+        if abstained:
             totals["abstain"] += 1
         if hyde_used:
             totals["hyde_used"] += 1
@@ -199,15 +210,30 @@ async def main() -> None:
         totals["recall"] += metrics["recall"]
         totals["ndcg"] += metrics["ndcg"]
         totals["mrr"] += metrics["mrr"]
-        print(f"Query: {record['query']}\n  Mode={args.mode} Route={route} HydeUsed={hyde_used} Duration={duration_ms:.1f}ms")
-        print(f"  Recall={metrics['recall']:.2f} nDCG={metrics['ndcg']:.2f} MRR={metrics['mrr']:.2f}")
-        top_row = next((r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")), None)
-        if top_row:
-            snippet = (top_row.get("text") or "").replace("\n", " ")
-            print(f"  Top result: {top_row.get('path')} [{top_row.get('chunk_start')},{top_row.get('chunk_end')}] -> {snippet[:160]}")
-        else:
-            print("  No results returned.")
-        print()
+        for stage, value in timings.items():
+            stage_totals[stage] = stage_totals.get(stage, 0.0) + value
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        per_query.append({
+            "query": record["query"],
+            "route": route,
+            "hyde_used": hyde_used,
+            "abstained": abstained,
+            "duration_ms": duration_ms,
+            **{f"timing_{k}": v for k, v in timings.items()},
+            "recall": metrics["recall"],
+            "ndcg": metrics["ndcg"],
+            "mrr": metrics["mrr"],
+        })
+        if not args.quiet:
+            print(f"Query: {record['query']}\n  Mode={args.mode} Route={route} HydeUsed={hyde_used} Duration={duration_ms:.1f}ms Abstained={abstained}")
+            print(f"  Recall={metrics['recall']:.2f} nDCG={metrics['ndcg']:.2f} MRR={metrics['mrr']:.2f}")
+            top_row = next((r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")), None)
+            if top_row:
+                snippet = (top_row.get("text") or "").replace("\n", " ")
+                print(f"  Top result: {top_row.get('path')} [{top_row.get('chunk_start')},{top_row.get('chunk_end')}] -> {snippet[:160]}")
+            else:
+                print("  No results returned.")
+            print()
 
     if totals["queries"]:
         q = totals["queries"]
@@ -215,14 +241,18 @@ async def main() -> None:
         avg_ndcg = totals["ndcg"] / q
         avg_mrr = totals["mrr"] / q
         avg_duration = totals["duration_ms"] / q
+        abstain_ratio = totals["abstain"] / q
         print("=== Aggregate ===")
         print(f"Queries: {q}")
         print(f"Avg Recall: {avg_recall:.3f}")
         print(f"Avg nDCG@{args.return_k}: {avg_ndcg:.3f}")
         print(f"Avg MRR: {avg_mrr:.3f}")
         print(f"Avg Duration: {avg_duration:.1f} ms")
+        stage_avg = {k: stage_totals[k] / stage_counts.get(k, q) for k in sorted(stage_totals)}
+        for k, v in stage_avg.items():
+            print(f"Avg {k}: {v:.1f} ms")
         print(f"HyDE Used: {totals['hyde_used']} / {q}")
-        print(f"Abstains: {totals['abstain']} / {q}")
+        print(f"Abstains: {totals['abstain']} / {q} ({abstain_ratio:.2%})")
         failure = False
         if args.min_ndcg and avg_ndcg < args.min_ndcg:
             print(f"FAIL: avg nDCG {avg_ndcg:.3f} < threshold {args.min_ndcg}", file=sys.stderr)
@@ -233,6 +263,39 @@ async def main() -> None:
         if args.max_latency and avg_duration > args.max_latency:
             print(f"FAIL: avg duration {avg_duration:.1f} ms > threshold {args.max_latency}", file=sys.stderr)
             failure = True
+        if args.max_abstain_ratio < 1.0 and abstain_ratio > args.max_abstain_ratio:
+            print(f"FAIL: abstain ratio {abstain_ratio:.3f} > threshold {args.max_abstain_ratio}", file=sys.stderr)
+            failure = True
+
+        summary = {
+            "queries": q,
+            "avg_recall": avg_recall,
+            "avg_ndcg": avg_ndcg,
+            "avg_mrr": avg_mrr,
+            "avg_duration_ms": avg_duration,
+            "hydefreq": totals["hyde_used"],
+            "abstain_count": totals["abstain"],
+            "abstain_ratio": abstain_ratio,
+            "stage_avg_ms": stage_avg,
+        }
+
+        if args.output_json:
+            payload = {
+                "summary": summary,
+                "details": per_query,
+            }
+            with open(args.output_json, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+        if args.output_csv:
+            stage_headers = sorted({k for entry in per_query for k in entry if k.startswith("timing_")})
+            fieldnames = ["query", "route", "hyde_used", "abstained", "duration_ms", "recall", "ndcg", "mrr"] + stage_headers
+            with open(args.output_csv, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                for entry in per_query:
+                    writer.writerow({k: entry.get(k, "") for k in fieldnames})
+
         if failure:
             sys.exit(1)
 

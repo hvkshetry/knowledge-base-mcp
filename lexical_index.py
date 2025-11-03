@@ -15,6 +15,30 @@ ALIASES = {
     "RO": ["reverse osmosis"],
 }
 
+FTS_EXPECTED_UNINDEXED = {
+    "chunk_id": "UNINDEXED",
+    "doc_id": "UNINDEXED",
+    "path": "UNINDEXED",
+    "filename": "UNINDEXED",
+    "chunk_start": "UNINDEXED",
+    "chunk_end": "UNINDEXED",
+    "mtime": "UNINDEXED",
+    "page_numbers": "UNINDEXED",
+    "pages": "UNINDEXED",
+    "section_path": "UNINDEXED",
+    "element_ids": "UNINDEXED",
+    "bboxes": "UNINDEXED",
+    "types": "UNINDEXED",
+    "source_tools": "UNINDEXED",
+    "table_headers": "UNINDEXED",
+    "table_units": "UNINDEXED",
+    "chunk_profile": "UNINDEXED",
+    "plan_hash": "UNINDEXED",
+    "model_version": "UNINDEXED",
+    "prompt_sha": "UNINDEXED",
+    "doc_metadata": "UNINDEXED",
+}
+
 
 def expand_query(query: str) -> str:
     expanded = [query]
@@ -49,6 +73,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
     source_tools UNINDEXED,
     table_headers UNINDEXED,
     table_units UNINDEXED,
+    chunk_profile UNINDEXED,
+    plan_hash UNINDEXED,
+    model_version UNINDEXED,
+    prompt_sha UNINDEXED,
+    doc_metadata UNINDEXED,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 """
@@ -57,10 +86,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'")
     exists = cur.fetchone() is not None
-    if exists:
-        conn.execute("DROP TABLE IF EXISTS fts_chunks")
-    conn.execute(FTS_CREATE_SQL)
-    conn.commit()
+    if not exists:
+        conn.execute(FTS_CREATE_SQL)
+        conn.commit()
+        return
+    # Existing table: ensure expected columns are present.
+    current_columns = set()
+    for row in conn.execute("PRAGMA table_xinfo('fts_chunks')"):
+        name = row[1]
+        if name:
+            current_columns.add(name)
+    missing = [col for col in FTS_EXPECTED_UNINDEXED if col not in current_columns]
+    for col in missing:
+        conn.execute(f"ALTER TABLE fts_chunks ADD COLUMN {col} {FTS_EXPECTED_UNINDEXED[col]}")
+    if missing:
+        conn.commit()
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -113,6 +153,10 @@ class FTSWriter:
                 self.conn = sqlite3.connect(db_path)
                 self.conn.execute("PRAGMA journal_mode=WAL;")
                 self.conn.execute("PRAGMA busy_timeout=5000;")
+                if recreate:
+                    cur = self.conn.cursor()
+                    cur.execute("DROP TABLE IF EXISTS fts_chunks")
+                    self.conn.commit()
                 _ensure_schema(self.conn)
                 break
             except sqlite3.OperationalError as ex:
@@ -147,9 +191,10 @@ class FTSWriter:
                 text, chunk_id, doc_id, path, filename,
                 chunk_start, chunk_end, mtime, page_numbers,
                 pages, section_path, element_ids, bboxes,
-                types, source_tools, table_headers, table_units
+                types, source_tools, table_headers, table_units,
+                chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -170,6 +215,11 @@ class FTSWriter:
                     str(r.get("source_tools", "") or ""),
                     str(r.get("table_headers", "") or ""),
                     str(r.get("table_units", "") or ""),
+                    str(r.get("chunk_profile", "") or ""),
+                    str(r.get("plan_hash", "") or ""),
+                    str(r.get("model_version", "") or ""),
+                    str(r.get("prompt_sha", "") or ""),
+                    str(r.get("doc_metadata", "") or ""),
                 )
                 for r in rows
             ],
@@ -239,9 +289,10 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     text, chunk_id, doc_id, path, filename,
                     chunk_start, chunk_end, mtime, page_numbers,
                     pages, section_path, element_ids, bboxes,
-                    types, source_tools, table_headers, table_units
+                    types, source_tools, table_headers, table_units,
+                    chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r.get("text", ""),
@@ -261,6 +312,11 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     str(r.get("source_tools", "") or ""),
                     str(r.get("table_headers", "") or ""),
                     str(r.get("table_units", "") or ""),
+                    str(r.get("chunk_profile", "") or ""),
+                    str(r.get("plan_hash", "") or ""),
+                    str(r.get("model_version", "") or ""),
+                    str(r.get("prompt_sha", "") or ""),
+                    str(r.get("doc_metadata", "") or ""),
                 ),
             )
             count += 1
@@ -298,7 +354,7 @@ def search(db_path: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
             """
             SELECT chunk_id, doc_id, path, filename, chunk_start, chunk_end, mtime, page_numbers,
                    pages, section_path, element_ids, bboxes, types, source_tools,
-                   table_headers, table_units,
+                   table_headers, table_units, chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata,
                    text,
                    bm25(fts_chunks) AS bm25
             FROM fts_chunks
@@ -327,7 +383,7 @@ def fetch_texts_by_chunk_ids(db_path: str, chunk_ids: Iterable[str]) -> Dict[str
             f"""
             SELECT chunk_id, text, doc_id, path, filename, chunk_start, chunk_end, page_numbers, mtime,
                    pages, section_path, element_ids, bboxes, types, source_tools,
-                   table_headers, table_units
+                   table_headers, table_units, chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
             FROM fts_chunks
             WHERE chunk_id IN ({placeholders})
             """,

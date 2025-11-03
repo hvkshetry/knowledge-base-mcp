@@ -1,0 +1,3 @@
+{"query":"What are the design MLSS targets for the DAF system?","collection":"daf_kb","relevance":[{"doc_id":"REPLACE_DOC_ID","gain":1.0},{"path_contains":"Table 3-2","gain":0.5}]}
+{"query":"Summarise the standard polymer dosing procedure","collection":"daf_kb","relevance":[{"path_contains":"polymer","gain":1.0}]}
+{"query":"How is recycle rate controlled during high loading events?","collection":"daf_kb","relevance":[{"doc_id":"REPLACE_DOC_ID","gain":1.0}]} 

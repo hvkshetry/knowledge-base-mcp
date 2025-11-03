@@ -224,6 +224,31 @@ class DocumentStore:
                     row["table_units"] = json.loads(table_units)
                 except Exception:
                     row["table_units"] = table_units
+        if row.get("chunk_profile") in (None, ""):
+            profile = record.get("chunk_profile")
+            if profile not in (None, ""):
+                row["chunk_profile"] = profile
+        if row.get("plan_hash") in (None, ""):
+            ph = record.get("plan_hash")
+            if ph not in (None, ""):
+                row["plan_hash"] = ph
+        if row.get("model_version") in (None, ""):
+            mv = record.get("model_version")
+            if mv not in (None, ""):
+                row["model_version"] = mv
+        if row.get("prompt_sha") in (None, ""):
+            ps = record.get("prompt_sha")
+            if ps not in (None, ""):
+                row["prompt_sha"] = ps
+        if row.get("doc_metadata") in (None, ""):
+            meta = record.get("doc_metadata")
+            if isinstance(meta, dict):
+                row["doc_metadata"] = meta
+            elif isinstance(meta, str) and meta:
+                try:
+                    row["doc_metadata"] = json.loads(meta)
+                except Exception:
+                    row["doc_metadata"] = meta
         if not allowed:
             if "text" in row:
                 row.pop("text", None)

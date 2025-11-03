@@ -3,9 +3,9 @@ import argparse
 import os
 import sys
 import pathlib
-from typing import List
+from typing import Any, Dict, List
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient
 
 # Ensure repo root is on sys.path so we can import lexical_index when invoked as a file
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -25,7 +25,9 @@ def main():
     args = ap.parse_args()
 
     client = QdrantClient(url=args.qdrant_url, api_key=args.qdrant_api_key)
-    from lexical_index import upsert_chunks
+    from lexical_index import ensure_fts, upsert_chunks
+
+    ensure_fts(args.fts_db)
 
     next_page = None
     total = 0
@@ -41,7 +43,7 @@ def main():
             break
         rows = []
         for p in points:
-            pl = p.payload or {}
+            pl: Dict[str, Any] = p.payload or {}
             text = (pl.get('text') or '').strip()
             if not text:
                 continue
@@ -49,6 +51,19 @@ def main():
                 import re
                 if len(re.findall(r'[A-Za-z]{2,}', text)) < args.min_words:
                     continue
+            page_numbers = pl.get('page_numbers') or pl.get('pages')
+            section_path = pl.get('section_path')
+            element_ids = pl.get('element_ids')
+            bboxes = pl.get('bboxes')
+            types = pl.get('types')
+            source_tools = pl.get('source_tools')
+            table_headers = pl.get('table_headers')
+            table_units = pl.get('table_units')
+            chunk_profile = pl.get('chunk_profile')
+            plan_hash = pl.get('plan_hash')
+            doc_metadata = pl.get('doc_metadata')
+            model_version = pl.get('model_version')
+            prompt_sha = pl.get('prompt_sha')
             rows.append({
                 'text': text,
                 'chunk_id': str(p.id),
@@ -58,6 +73,20 @@ def main():
                 'chunk_start': pl.get('chunk_start'),
                 'chunk_end': pl.get('chunk_end'),
                 'mtime': pl.get('mtime'),
+                'page_numbers': page_numbers,
+                'pages': pl.get('pages'),
+                'section_path': section_path,
+                'element_ids': element_ids,
+                'bboxes': bboxes,
+                'types': types,
+                'source_tools': source_tools,
+                'table_headers': table_headers,
+                'table_units': table_units,
+                'chunk_profile': chunk_profile,
+                'plan_hash': plan_hash,
+                'model_version': model_version,
+                'prompt_sha': prompt_sha,
+                'doc_metadata': doc_metadata,
             })
         if rows:
             upsert_chunks(args.fts_db, rows)

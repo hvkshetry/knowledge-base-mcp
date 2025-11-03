@@ -507,8 +507,29 @@ def _deserialize_blocks(items: Iterable[Dict[str, Any]]) -> List[Block]:
     return blocks
 
 
-def extract_document_blocks(path: Path, doc_id: str) -> Tuple[List[Block], Dict[str, Any]]:
+def _plan_pages_lookup(plan_override: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    if not plan_override:
+        return {}
+    pages = plan_override.get("pages") if isinstance(plan_override, dict) else None
+    if not pages:
+        return {}
+    lookup: Dict[int, Dict[str, Any]] = {}
+    for entry in pages:
+        if not isinstance(entry, dict):
+            continue
+        page_num = entry.get("page")
+        if isinstance(page_num, int):
+            lookup[page_num] = entry
+    return lookup
+
+
+def extract_document_blocks(
+    path: Path,
+    doc_id: str,
+    plan_override: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Block], Dict[str, Any]]:
     triage = triage_pdf(path)
+    plan_lookup = _plan_pages_lookup(plan_override)
     blocks: List[Block] = []
     heading_state: List[str] = []
     counters = _init_counters()
@@ -516,6 +537,9 @@ def extract_document_blocks(path: Path, doc_id: str) -> Tuple[List[Block], Dict[
     cache_root.mkdir(parents=True, exist_ok=True)
     for page_info in triage["pages"]:
         page_num = page_info["page"]
+        override = plan_lookup.get(page_num) if plan_lookup else None
+        if override and override.get("route"):
+            page_info["route"] = override["route"]
         route = page_info["route"]
         cache_file = _cache_key(path, page_num, route)
         if cache_file.exists():
@@ -554,9 +578,14 @@ def chunk_blocks(
     blocks: List[Block],
     max_chars: int,
     overlap_sentences: int = 1,
+    profile: str = "heading_based",
 ) -> Tuple[List[Dict[str, Any]], str]:
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
+    profile = (profile or "heading_based").lower()
+    respect_headings = profile != "fixed_window"
+    sentence_overlap = overlap_sentences if respect_headings else 0
+
     chunks: List[Dict[str, Any]] = []
     buffer: List[Block] = []
     chunk_cursor = 0
@@ -576,12 +605,8 @@ def chunk_blocks(
         bboxes = [b.bbox for b in buffer]
         types = [b.type for b in buffer]
         source_tools = list({b.source_tool for b in buffer})
-        headers = [
-            b.headers for b in buffer if b.headers
-        ]
-        units = [
-            b.units for b in buffer if b.units
-        ]
+        headers = [b.headers for b in buffer if b.headers]
+        units = [b.units for b in buffer if b.units]
         chunk = {
             "text": text,
             "pages": pages,
@@ -596,12 +621,13 @@ def chunk_blocks(
             "chunk_end": chunk_cursor + len(text),
             "doc_id": buffer[0].doc_id,
             "path": buffer[0].path,
+            "profile": profile,
         }
         chunks.append(chunk)
         chunk_cursor += len(text)
-        if overlap_sentences > 0:
+        if sentence_overlap > 0:
             sentences = re.split(r"(?<=[.!?])\s+", text)
-            tail = " ".join(sentences[-overlap_sentences:]).strip()
+            tail = " ".join(sentences[-sentence_overlap:]).strip()
             buffer = [
                 Block(
                     doc_id=buffer[-1].doc_id,
@@ -623,7 +649,32 @@ def chunk_blocks(
 
     for block in blocks:
         raw_text_parts.append(block.text)
-        if block.type == "heading":
+        if profile == "table_row" and block.type == "table_row":
+            flush_buffer()
+            text = block.text or ""
+            if not text.strip():
+                continue
+            chunk = {
+                "text": text,
+                "pages": [block.page],
+                "section_path": block.section_path,
+                "element_ids": [block.element_id] if block.element_id else [],
+                "bboxes": [block.bbox] if block.bbox else [],
+                "types": [block.type],
+                "source_tools": [block.source_tool] if block.source_tool else [],
+                "headers": [block.headers] if block.headers else [],
+                "units": [block.units] if block.units else [],
+                "chunk_start": chunk_cursor,
+                "chunk_end": chunk_cursor + len(text),
+                "doc_id": block.doc_id,
+                "path": block.path,
+                "profile": profile,
+            }
+            chunks.append(chunk)
+            chunk_cursor += len(text)
+            continue
+
+        if respect_headings and block.type == "heading":
             flush_buffer()
             buffer = [block]
             flush_buffer()

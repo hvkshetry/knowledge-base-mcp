@@ -5,7 +5,7 @@ import uuid
 import time
 import fnmatch
 import hashlib
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import gc
 import re
 import json
@@ -17,6 +17,7 @@ from tqdm import tqdm
 from ingest_blocks import extract_document_blocks, chunk_blocks
 from graph_builder import update_graph
 from summary_index import upsert_summaries
+from metadata_schema import generate_metadata
 
 
 # Default skip patterns to avoid noisy/system files
@@ -33,9 +34,88 @@ DEFAULT_SKIP_PATTERNS = [
     "*/Markitdown/*",
 ]
 
+PLAN_DIR = pathlib.Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
+INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
+INGEST_PROMPT_SHA = os.getenv("INGEST_PROMPT_SHA", "sha_deterministic_chunking_v1")
+MAX_METADATA_BYTES = int(os.getenv("MAX_METADATA_BYTES", "8192"))
+
 
 def file_uri(p: pathlib.Path) -> str:
     return p.resolve().as_uri()
+
+
+def load_ingest_plan(doc_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        path = PLAN_DIR / f"{doc_id}.json"
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def save_ingest_plan(doc_id: str, data: Dict[str, Any]) -> None:
+    try:
+        PLAN_DIR.mkdir(parents=True, exist_ok=True)
+        path = PLAN_DIR / f"{doc_id}.json"
+        path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        print(f"WARN: failed to persist ingest plan for {doc_id}: {exc}")
+
+
+def sanitize_triage_for_plan(triage: Dict[str, Any]) -> Dict[str, Any]:
+    pages_out: List[Dict[str, Any]] = []
+    for entry in triage.get("pages", []):
+        if not isinstance(entry, dict):
+            continue
+        page_num = entry.get("page")
+        try:
+            page_int = int(page_num)
+        except Exception:
+            page_int = None
+        pages_out.append(
+            {
+                "page": page_int,
+                "route": entry.get("route"),
+                "text_chars": entry.get("text_chars"),
+                "images": entry.get("images"),
+                "vector_lines": entry.get("vector_lines"),
+                "multicolumn_score": entry.get("multicolumn_score"),
+                "has_table_token": entry.get("has_table_token"),
+                "has_figure_token": entry.get("has_figure_token"),
+            }
+        )
+    return {"pages": pages_out}
+
+
+def compute_plan_hash(payload: Dict[str, Any]) -> str:
+    material = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def select_chunk_profile(blocks: List[Any]) -> str:
+    if not blocks:
+        return "fixed_window"
+    table_rows = sum(1 for b in blocks if getattr(b, "type", "") == "table_row")
+    if table_rows:
+        return "table_row"
+    step_like = 0
+    for b in blocks:
+        btype = getattr(b, "type", "")
+        text = getattr(b, "text", "") or ""
+        text = text.strip()
+        if btype == "list":
+            step_like += 1
+        elif re.match(r"^\d+(\.\d+)*\s", text):
+            step_like += 1
+    if step_like and step_like >= max(3, len(blocks) // 4):
+        return "procedure_block"
+    return "heading_based"
 
 
 # -------------------- Extractors --------------------
@@ -427,8 +507,13 @@ def main():
     args = ap.parse_args()
 
     if not args.thin_payload:
-        thin_env = os.getenv("THIN_VECTOR_PAYLOAD", "").strip().lower()
-        args.thin_payload = thin_env in {"1", "true", "yes"}
+        raw_thin = os.getenv("THIN_PAYLOAD")
+        if raw_thin is None:
+            raw_thin = os.getenv("THIN_VECTOR_PAYLOAD")
+        if raw_thin:
+            args.thin_payload = raw_thin.strip().lower() in {"1", "true", "yes"}
+    if args.thin_payload:
+        print("Thin payload mode enabled: vector payloads will omit raw text.")
 
     root = pathlib.Path(args.root)
     if not root.is_dir():
@@ -533,16 +618,64 @@ def main():
                     continue
                 if args.min_words and alpha_word_count(text) < args.min_words:
                     continue
-                triage_blocks, _ = extract_document_blocks(p, doc_id)
+                existing_plan = load_ingest_plan(doc_id)
+                plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
+                triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
+                overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
+                if plan_override and isinstance(plan_override, dict):
+                    # Reuse overlap settings from existing plan if provided
+                    params = existing_plan.get("chunk_params") if isinstance(existing_plan, dict) else None
+                    if isinstance(params, dict):
+                        overlap_sentences = int(params.get("overlap_sentences", overlap_sentences) or overlap_sentences)
+                chunk_profile = (
+                    existing_plan.get("chunk_profile")
+                    if isinstance(existing_plan, dict) and existing_plan.get("chunk_profile")
+                    else select_chunk_profile(triage_blocks)
+                )
                 chunks, raw_text = chunk_blocks(
                     triage_blocks,
                     args.max_chars,
-                    overlap_sentences=max(1, args.overlap // 80 if args.overlap else 1),
+                    overlap_sentences=overlap_sentences,
+                    profile=chunk_profile,
                 )
                 if not raw_text.strip():
                     raw_text = text
                 content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
                 mtime = int(p.stat().st_mtime)
+
+                plan_payload = {
+                    "doc_id": doc_id,
+                    "path": path_str,
+                    "content_hash": content_hash,
+                    "chunk_profile": chunk_profile,
+                    "chunk_params": {
+                        "max_chars": args.max_chars,
+                        "overlap_sentences": overlap_sentences,
+                    },
+                    "triage": sanitize_triage_for_plan(triage_info),
+                    "model_version": INGEST_MODEL_VERSION,
+                    "prompt_sha": INGEST_PROMPT_SHA,
+                }
+                doc_metadata, metadata_rejects = generate_metadata(raw_text, chunks)
+                metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
+                if doc_metadata and metadata_bytes > MAX_METADATA_BYTES:
+                    metadata_rejects.append(f"metadata_bytes_exceeded:{metadata_bytes}>{MAX_METADATA_BYTES}")
+                    print(f"WARN: metadata exceeds MAX_METADATA_BYTES for {p} ({metadata_bytes} bytes)")
+                    doc_metadata = {}
+                if doc_metadata:
+                    plan_payload["doc_metadata"] = doc_metadata
+                if metadata_rejects:
+                    plan_payload["metadata_rejects"] = metadata_rejects
+                    print(f"WARN: metadata validation issues for {p}: {metadata_rejects}")
+                plan_payload["metadata_calls"] = 1 if doc_metadata else 0
+                plan_hash = compute_plan_hash(plan_payload)
+                plan_payload["plan_hash"] = plan_hash
+                if not existing_plan or existing_plan.get("plan_hash") != plan_hash:
+                    save_ingest_plan(doc_id, plan_payload)
+                for chunk in chunks:
+                    chunk["plan_hash"] = plan_hash
+                    if doc_metadata:
+                        chunk["doc_metadata"] = doc_metadata
 
                 try:
                     update_graph(args.qdrant_collection, doc_id, path_str, chunks)
@@ -587,6 +720,11 @@ def main():
                         "source_tools": chunk.get("source_tools", []),
                         "table_headers": chunk.get("headers", []),
                         "table_units": chunk.get("units", []),
+                        "chunk_profile": chunk.get("profile"),
+                        "plan_hash": plan_hash,
+                        "model_version": plan_payload.get("model_version"),
+                        "prompt_sha": plan_payload.get("prompt_sha"),
+                        "doc_metadata": doc_metadata,
                         "text": chunk.get("text", ""),
                     }
                     if args.thin_payload:
@@ -655,6 +793,8 @@ def main():
                             source_tools = chunk.get("source_tools", [])
                             table_headers = chunk.get("headers", [])
                             table_units = chunk.get("units", [])
+                            profile_tag = chunk.get("profile") or ""
+                            doc_metadata_payload = chunk.get("doc_metadata") or {}
                             rows.append({
                                 "text": t,
                                 "chunk_id": ids[i],
@@ -673,6 +813,11 @@ def main():
                                 "source_tools": json.dumps(source_tools, ensure_ascii=False) if source_tools else "",
                                 "table_headers": json.dumps(table_headers, ensure_ascii=False) if table_headers else "",
                                 "table_units": json.dumps(table_units, ensure_ascii=False) if table_units else "",
+                                "chunk_profile": profile_tag,
+                                "plan_hash": plan_hash,
+                                "model_version": plan_payload.get("model_version", ""),
+                                "prompt_sha": plan_payload.get("prompt_sha", ""),
+                                "doc_metadata": json.dumps(doc_metadata_payload, ensure_ascii=False) if doc_metadata_payload else "",
                             })
                         fts_writer.upsert_many(rows)
                     except Exception as fex:
