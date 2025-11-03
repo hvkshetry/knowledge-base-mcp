@@ -49,5 +49,8 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - `graph_builder.py` now attaches measurement nodes and heuristic relations (`feeds`, `discharges_to`, `located_in`) for graph-aware retrieval.
 - `scripts/manage_cache.py` plus new env knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) simplify Docling GPU/caching operations.
 - MCP UX surfaces (playbooks + prompt snippets) highlight graph/summary/neighbor actions for richer planning.
+- **Next Enhancements**
+  - Add canary-driven quality checks in `ingest.assess_quality()` (run 5–10 deterministic queries per doc type; flag failures).
+  - Implement safe `ingest.enhance` operations (`add_synonyms`, `link_crossrefs`, `fix_table_pages`) to close QA loops without full re-ingest.
 
 Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

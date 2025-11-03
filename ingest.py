@@ -659,6 +659,7 @@ def main():
                 plan_payload = {
                     "doc_id": doc_id,
                     "path": path_str,
+                    "collection": args.qdrant_collection,
                     "content_hash": content_hash,
                     "chunk_profile": chunk_profile,
                     "chunk_params": {

@@ -84,6 +84,8 @@ INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
 INGEST_PROMPT_SHA = os.getenv("INGEST_PROMPT_SHA", "sha_deterministic_chunking_v1")
 MAX_METADATA_BYTES = int(os.getenv("MAX_METADATA_BYTES", "8192"))
 MAX_METADATA_CALLS_PER_DOC = int(os.getenv("MAX_METADATA_CALLS_PER_DOC", "2"))
+MAX_CANARY_QUERIES = int(os.getenv("MAX_CANARY_QUERIES", "6"))
+CANARY_TIMEOUT = int(os.getenv("CANARY_TIMEOUT", "30"))
 
 SESSION_PRIORS: Dict[str, Dict[str, float]] = {}
 
@@ -407,6 +409,73 @@ def _parse_page_numbers(value: Any) -> List[int]:
     return []
 
 
+async def _run_canaries(doc_id: str, chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
+    collection = None
+    plan = _load_plan(doc_id)
+    if isinstance(plan, dict):
+        collection = plan.get("collection")
+    if not collection:
+        for cfg in SCOPES.values():
+            coll = cfg.get("collection")
+            if coll:
+                collection = coll
+                break
+    if not collection:
+        return {"available": False, "reason": "unknown_collection"}
+
+    config_path = _canary_config_path(collection)
+    if not config_path.exists():
+        return {"available": False, "reason": "no_config"}
+
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("failed to load canary config: %s", exc)
+        return {"available": False, "reason": "config_error"}
+
+    collection_config = config.get(collection) or {}
+    queries = collection_config.get("queries") or []
+    if not queries:
+        return {"available": False, "reason": "no_queries"}
+
+    results = []
+    limit = min(MAX_CANARY_QUERIES, len(queries))
+    subjects = [f"canary:{doc_id}"]
+    for entry in queries[:limit]:
+        prompt = entry.get("prompt") if isinstance(entry, dict) else entry
+        if not prompt:
+            continue
+        mode = entry.get("mode") if isinstance(entry, dict) else "hybrid"
+        top_k = entry.get("top_k", 5) if isinstance(entry, dict) else 5
+        retrieve_k = entry.get("retrieve_k", 12) if isinstance(entry, dict) else 12
+        return_k = entry.get("return_k", 5) if isinstance(entry, dict) else 5
+        try:
+            rows = await search(
+                Context(subjects=subjects),
+                prompt,
+                mode=mode,
+                top_k=top_k,
+                retrieve_k=retrieve_k,
+                return_k=return_k,
+            )
+        except Exception as exc:
+            results.append({"query": prompt, "error": str(exc)})
+            continue
+        hits = [row for row in rows if isinstance(row, dict) and row.get("doc_id") == doc_id and not row.get("abstain")]
+        results.append({
+            "query": prompt,
+            "mode": mode,
+            "hits": len(hits),
+            "best_score": _best_score(hits),
+        })
+
+    return {
+        "available": True,
+        "queries": results,
+        "limit": limit,
+    }
+
+
 def _coerce_json(value: Any) -> Any:
     if isinstance(value, str) and value:
         try:
@@ -636,6 +705,11 @@ def _blocks_artifact_path(doc_id: str) -> Path:
 
 def _chunks_artifact_path(doc_id: str) -> Path:
     return _artifact_dir(doc_id) / "chunks.json"
+
+
+def _canary_config_path(collection: str, name: str = "default") -> Path:
+    base = Path(os.getenv("CANARY_DIR", "config/canaries"))
+    return base / collection / f"{name}.json"
 
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -1018,6 +1092,8 @@ async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optiona
     if not metadata_available:
         warnings.append("no_metadata")
 
+    canary_results = await _run_canaries(doc_id, data)
+
     return {
         "doc_id": doc_id,
         "chunk_count": chunk_count,
@@ -1031,6 +1107,7 @@ async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optiona
         "metadata_calls": metadata_calls,
         "metadata_bytes": metadata_bytes,
         "warnings": warnings,
+        "canaries": canary_results,
     }
 
 
@@ -1041,10 +1118,72 @@ async def ingest_enhance(ctx: Context, doc_id: str, op: str, args: Optional[Dict
         return {"error": "missing_doc_id"}
     if op not in supported_ops:
         return {"error": "unsupported_operation", "supported_ops": sorted(supported_ops)}
+    args = args or {}
+    chunk_path = _chunks_artifact_path(doc_id)
+    data = _read_json(chunk_path)
+    if not data:
+        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
+    chunks = data.get("chunks") or []
+    modified = False
+
+    if op == "add_synonyms":
+        additions = args.get("synonyms") if isinstance(args, dict) else None
+        if not isinstance(additions, dict):
+            return {"error": "invalid_args", "detail": "synonyms dict required"}
+        for chunk in chunks:
+            meta = chunk.setdefault("synonyms", [])
+            if not isinstance(meta, list):
+                chunk["synonyms"] = meta = []
+            for term, repls in additions.items():
+                if not term or not repls:
+                    continue
+                entry = {"term": term, "replacements": repls}
+                if entry not in meta:
+                    meta.append(entry)
+                    modified = True
+
+    elif op == "link_crossrefs":
+        refs = args.get("references") if isinstance(args, dict) else None
+        if not isinstance(refs, list):
+            return {"error": "invalid_args", "detail": "references list required"}
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            chunk_id = ref.get("chunk_id")
+            target = ref.get("target")
+            if not chunk_id or not target:
+                continue
+            for chunk in chunks:
+                if chunk.get("chunk_id") == chunk_id:
+                    links = chunk.setdefault("crossrefs", [])
+                    if target not in links:
+                        links.append(target)
+                        modified = True
+                    break
+
+    elif op == "fix_table_pages":
+        fixes = args.get("pages") if isinstance(args, dict) else None
+        if not isinstance(fixes, dict):
+            return {"error": "invalid_args", "detail": "pages dict required"}
+        for chunk in chunks:
+            if "table_row" not in (chunk.get("types") or []):
+                continue
+            element_ids = chunk.get("element_ids") or []
+            for element in element_ids:
+                page = fixes.get(element)
+                if isinstance(page, int):
+                    chunk["pages"] = [page]
+                    modified = True
+
+    if modified:
+        data["chunks"] = chunks
+        _write_json(chunk_path, data)
+
     return {
         "doc_id": doc_id,
         "operation": op,
-        "status": "not_implemented",
+        "modified": modified,
+        "status": "completed",
     }
 
 

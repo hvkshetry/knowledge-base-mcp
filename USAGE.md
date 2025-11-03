@@ -504,6 +504,8 @@ Two lightweight stores are built during ingest:
 - `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
 - `sparse_splade_{slug}`: run sparse expansion retrieval (SPLADE/basic) on demand.
 - `colbert_{slug}`: route a query through the ColBERT late-interaction service when configured.
+- `ingest.assess_quality`: returns chunk stats plus canary query results (configured under `config/canaries/`).
+- `ingest.enhance`: supports safe incremental fixes (`add_synonyms`, `link_crossrefs`, `fix_table_pages`) without full re-ingest.
 
 All tools hydrate snippets through the ACL-enforcing document store.
 

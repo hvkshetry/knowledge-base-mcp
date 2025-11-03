@@ -1,0 +1,3 @@
+{
+  "_comment": "Add per-collection canary queries here. Example: 'daf_kb': { 'queries': [{ 'prompt': 'design MLSS' }] }"
+}
