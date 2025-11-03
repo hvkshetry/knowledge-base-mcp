@@ -18,6 +18,7 @@ from ingest_blocks import extract_document_blocks, chunk_blocks
 from graph_builder import update_graph
 from summary_index import upsert_summaries
 from metadata_schema import generate_metadata
+from sparse_expansion import SparseExpander
 
 
 # Default skip patterns to avoid noisy/system files
@@ -455,6 +456,7 @@ def main():
     ap.add_argument("--ollama-url", default="http://localhost:11434")
     ap.add_argument("--ollama-model", default="snowflake-arctic-embed:xs")
     ap.add_argument("--extractor", choices=["markitdown", "docling", "auto"], default="markitdown")
+    ap.add_argument("--sparse-expander", choices=["none", "basic", "splade"], default=None, help="Optional sparse expander for SPLADE/uniCOIL-style term weights")
 
     # Metric/normalization
     ap.add_argument("--metric", choices=["cosine", "dot", "euclid"], default="cosine")
@@ -580,6 +582,17 @@ def main():
         tokens = re.findall(r"[A-Za-z]{2,}", text)
         return len(tokens)
 
+    # Configure sparse expander shared with ingestion + query
+    sparse_method = args.sparse_expander
+    if sparse_method is None:
+        sparse_method = os.getenv("SPARSE_EXPANDER", "none")
+    sparse_method = (sparse_method or "none").strip().lower()
+    sparse_expander = SparseExpander(sparse_method)
+    if sparse_expander.enabled:
+        print(f"Sparse expander enabled: {sparse_expander.method}")
+    else:
+        sparse_expander = None
+
     # Prepare FTS writer if needed
     fts_writer = None
     if not args.no_fts:
@@ -676,6 +689,13 @@ def main():
                     chunk["plan_hash"] = plan_hash
                     if doc_metadata:
                         chunk["doc_metadata"] = doc_metadata
+                if sparse_expander:
+                    for chunk in chunks:
+                        terms = sparse_expander.encode(chunk.get("text", ""))
+                        if terms:
+                            chunk["sparse_terms"] = [{"term": term, "weight": float(weight)} for term, weight in terms]
+                        else:
+                            chunk["sparse_terms"] = []
 
                 try:
                     update_graph(args.qdrant_collection, doc_id, path_str, chunks)
@@ -727,6 +747,8 @@ def main():
                         "doc_metadata": doc_metadata,
                         "text": chunk.get("text", ""),
                     }
+                    if sparse_expander and chunk.get("sparse_terms"):
+                        payload["sparse_terms"] = chunk.get("sparse_terms")
                     if args.thin_payload:
                         payload["thin_payload"] = True
                         payload.pop("text", None)
@@ -818,6 +840,7 @@ def main():
                                 "model_version": plan_payload.get("model_version", ""),
                                 "prompt_sha": plan_payload.get("prompt_sha", ""),
                                 "doc_metadata": json.dumps(doc_metadata_payload, ensure_ascii=False) if doc_metadata_payload else "",
+                                "sparse_terms": chunk.get("sparse_terms", []),
                             })
                         fts_writer.upsert_many(rows)
                     except Exception as fex:

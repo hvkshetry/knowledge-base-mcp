@@ -1,6 +1,6 @@
 # Sparse Expansion & ColBERT Integration Guide
 
-This note captures the steps required to add higher-recall sparse expansions (SPLADE/uniCOIL) and late-interaction reranking (ColBERT) while keeping the MCP client in control of routing decisions.
+This note captures the steps required to add higher-recall sparse expansions (SPLADE/uniCOIL) and late-interaction reranking (ColBERT) while keeping the MCP client in control of routing decisions. The ingestion pipeline now accepts `--sparse-expander splade` (or `basic`) and exposes `kb.sparse_splade_*`; the remaining work tracks ColBERT integration and hardening.
 
 ## 1. SPLADE / uniCOIL Sparse Expansion
 

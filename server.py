@@ -22,6 +22,7 @@ from graph_builder import (
 )
 from summary_index import query_summaries
 from lexical_index import ALIASES
+from sparse_expansion import SparseExpander
 from ingest_blocks import (
     triage_pdf,
     extract_document_blocks,
@@ -57,6 +58,9 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "data/fts.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "data/graph.db")
 SUMMARY_DB_PATH = os.getenv("SUMMARY_DB_PATH", "data/summary.db")
+SPARSE_EXPANDER = SparseExpander(os.getenv("SPARSE_EXPANDER", "none"))
+SPARSE_QUERY_TOP_K = int(os.getenv("SPARSE_QUERY_TOP_K", "48"))
+HAVE_SPARSE_SPLADE = SPARSE_EXPANDER.enabled
 
 # JSON like: {"kb":{"collection":"snowflake_kb","title":"Company KB"}}
 # Backcompat: allow STELLA_SCOPES if NOMIC_KB_SCOPES not set
@@ -167,6 +171,23 @@ def _fts_search(query: str, limit: int) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("FTS search failed: %s", e)
         return []
+
+
+def _sparse_terms_search(query_terms: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
+    if not os.path.exists(FTS_DB_PATH) or not query_terms:
+        return []
+    try:
+        from lexical_index import sparse_search
+        return sparse_search(FTS_DB_PATH, query_terms, limit)
+    except Exception as exc:
+        logger.warning("Sparse-term search failed: %s", exc)
+        return []
+
+
+def _encode_sparse_query(text: str) -> Dict[str, float]:
+    if not HAVE_SPARSE_SPLADE or not text:
+        return {}
+    return SPARSE_EXPANDER.encode_dict(text, top_k=SPARSE_QUERY_TOP_K)
 
 
 def _fts_neighbors(doc_id: str, chunk_start: int, n: int) -> List[Dict[str, Any]]:
@@ -1077,9 +1098,11 @@ async def plan_route(query: str) -> Dict[str, Any]:
     n_tokens = len(tokens)
     has_caps = any(any(c.isupper() for c in tok) for tok in tokens)
     if n_tokens <= 3 and "?" not in query:
+        if HAVE_SPARSE_SPLADE:
+            return {"route": "sparse_splade", "k": 24}
         return {"route": "sparse", "k": 24}
     if n_tokens <= 4 and has_caps:
-        return {"route": "hybrid", "k": 32}
+        return {"route": "sparse_splade" if HAVE_SPARSE_SPLADE else "hybrid", "k": 32}
     if "?" in query or n_tokens > 10:
         return {"route": "rerank", "k": 24}
     return {"route": "hybrid", "k": 24}
@@ -1263,6 +1286,86 @@ async def _run_sparse(
             "doc_metadata": item.get("doc_metadata"),
             "scores": _score_breakdown(
                 bm25=bm,
+                dense=None,
+                rrf=None,
+                rerank=None,
+                decay=decay,
+                final=score,
+            ),
+        })
+        _ensure_score_bucket(rows[-1])["prior"] = prior_mult
+    await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
+    return rows
+
+
+async def _run_sparse_splade(
+    collection: str,
+    query: str,
+    retrieve_k: int,
+    return_k: int,
+    top_k: int,
+    subjects: List[str],
+    timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    if not HAVE_SPARSE_SPLADE:
+        return [{"error": "sparse_expander_disabled"}]
+    limit = min(retrieve_k, RERANK_MAX_ITEMS)
+    start = time.perf_counter()
+    query_weights = _encode_sparse_query(query)
+    timings["sparse_expand_ms"] = timings.get("sparse_expand_ms", 0.0) + (time.perf_counter() - start) * 1000.0
+    if not query_weights:
+        return []
+    start = time.perf_counter()
+    sparse_hits = await asyncio.to_thread(_sparse_terms_search, query_weights, limit)
+    timings["sparse_terms_ms"] = timings.get("sparse_terms_ms", 0.0) + (time.perf_counter() - start) * 1000.0
+    if not sparse_hits:
+        return []
+    scores = [float(row.get("sparse_score", 0.0)) for row in sparse_hits if row.get("sparse_score") is not None]
+    score_stats = (min(scores), max(scores)) if scores else None
+    rows: List[Dict[str, Any]] = []
+    for item in sparse_hits[:return_k]:
+        sparse_score = float(item.get("sparse_score", 0.0) or 0.0)
+        decay = _decay_factor(item.get("mtime"))
+        score = _combined_score(
+            bm25=sparse_score,
+            dense=None,
+            rerank=None,
+            bm_stats=score_stats,
+            dense_stats=None,
+            rerank_stats=None,
+            decay=decay,
+        )
+        prior_mult = _prior_multiplier(item.get("doc_id"), subjects, boosts)
+        score *= prior_mult
+        rows.append({
+            "score": score,
+            "final_score": score,
+            "bm25_score": sparse_score,
+            "decay_factor": decay,
+            "id": item.get("chunk_id"),
+            "chunk_id": item.get("chunk_id"),
+            "doc_id": item.get("doc_id"),
+            "path": item.get("path"),
+            "chunk_start": item.get("chunk_start"),
+            "chunk_end": item.get("chunk_end"),
+            "text": item.get("text"),
+            "pages": item.get("pages"),
+            "section_path": item.get("section_path"),
+            "element_ids": item.get("element_ids"),
+            "bboxes": item.get("bboxes"),
+            "types": item.get("types"),
+            "source_tools": item.get("source_tools"),
+            "table_headers": item.get("table_headers"),
+            "table_units": item.get("table_units"),
+            "chunk_profile": item.get("chunk_profile"),
+            "plan_hash": item.get("plan_hash"),
+            "model_version": item.get("model_version"),
+            "prompt_sha": item.get("prompt_sha"),
+            "doc_metadata": item.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=sparse_score,
                 dense=None,
                 rrf=None,
                 rerank=None,
@@ -1686,6 +1789,8 @@ async def _execute_search(
 ) -> List[Dict[str, Any]]:
     if route == "sparse":
         return await _run_sparse(collection, query, retrieve_k, return_k, top_k, subjects, timings, boosts)
+    if route == "sparse_splade":
+        return await _run_sparse_splade(collection, query, retrieve_k, return_k, top_k, subjects, timings, boosts)
     if route == "semantic":
         return await _run_semantic(collection, query, query_vec, top_k, return_k, subjects, timings, boosts)
     if route == "rerank":
@@ -1704,6 +1809,8 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
     batch_tool_name = f"batch_{slug}"
     quality_tool_name = f"quality_{slug}"
     sparse_title = f"{title or slug}: Sparse Search"
+    splade_tool_name = f"sparse_splade_{slug}"
+    splade_title = f"{title or slug}: SPLADE Sparse Search"
     dense_title = f"{title or slug}: Dense Search"
     hybrid_title = f"{title or slug}: Hybrid Search"
     rerank_title = f"{title or slug}: Rerank Search"
@@ -1740,6 +1847,50 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             "rows": rows,
             "timings": {k: round(v, 3) for k, v in timings.items()},
             "route": "sparse",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+
+    @mcp.tool(name=splade_tool_name, title=splade_title)
+    async def sparse_splade_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not HAVE_SPARSE_SPLADE:
+            return {"error": "sparse_expander_disabled"}
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_sparse_splade(
+            collection,
+            query,
+            retrieve_k,
+            return_k,
+            retrieve_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "sparse_splade",
             "best_score": best,
         }
         if boosts:
@@ -1913,7 +2064,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 continue
             timings: Dict[str, float] = {}
             route_norm = route.lower()
-            if route_norm not in {"sparse", "semantic", "rerank", "hybrid", "auto"}:
+            if route_norm not in {"sparse", "sparse_splade", "semantic", "rerank", "hybrid", "auto"}:
                 results.append({"index": idx, "query": query, "route": route, "error": "invalid_route"})
                 continue
             boosts = None
@@ -2265,7 +2416,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 logger.debug("failed to log search metrics", exc_info=True)
             return rows
 
-        valid_modes = {"semantic", "rerank", "hybrid", "sparse", "auto"}
+        valid_modes = {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "auto"}
         if mode not in valid_modes:
             return finalize([{"error": f"invalid mode '{mode}', expected one of {sorted(valid_modes)}"}], mode)
         if not isinstance(top_k, int) or top_k < 1 or top_k > 100:
@@ -2300,7 +2451,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 logger.debug("plan_route failed, falling back to rerank: %s", exc)
                 planned_route = {}
             route = str((planned_route or {}).get("route") or "rerank")
-            if route not in {"semantic", "rerank", "hybrid", "sparse"}:
+            if route not in {"semantic", "rerank", "hybrid", "sparse", "sparse_splade"}:
                 route = "rerank"
             planned_k = (planned_route or {}).get("k")
             if isinstance(planned_k, int) and 1 <= planned_k <= 256:
@@ -2308,11 +2459,22 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
         route_retrieve = max(return_k, min(route_retrieve, 256))
         route_retrieve_val = route_retrieve
 
+        query_vec: List[float] = []
+        if route in {"semantic", "rerank", "hybrid"}:
+            try:
+                embed_start = time.perf_counter()
+                query_vec = await embed_query(query, normalize=True)
+                timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
+            except Exception as e:
+                return finalize([
+                    {"error": "embedding_failed", "detail": str(e)}
+                ], route)
+
         rows = await _execute_search(
             route=route,
             collection=collection,
             query=query,
-            query_vec=vec,
+            query_vec=query_vec,
             retrieve_k=route_retrieve,
             return_k=return_k,
             top_k=top_k,
@@ -2372,7 +2534,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 route="sparse",
                 collection=collection,
                 query=query,
-                query_vec=vec,
+                query_vec=query_vec,
                 retrieve_k=max(route_retrieve, 32),
                 return_k=return_k,
                 top_k=top_k,

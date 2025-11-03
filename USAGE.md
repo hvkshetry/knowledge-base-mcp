@@ -45,6 +45,7 @@ python ingest.py \
 
   # Extraction
   --extractor auto                    # Primary extractor for text fallback
+  --sparse-expander splade            # Optional sparse expansion (none|basic|splade)
   --thin-payload                      # Store metadata-only payloads in Qdrant
   --graph-db data/graph.db            # Override graph storage (optional)
   --summary-db data/summary.db        # Override summary storage (optional)
@@ -375,6 +376,13 @@ data/
 - Page artifacts are cached under `.ingest_cache/` (override with `CACHE_DIR`).
 - Set `HF_HOME` to a writable cache directory so Docling’s layout models download once.
 
+### Sparse Expansion (SPLADE / Basic)
+
+- Enable via CLI `--sparse-expander splade` (defaults to env `SPARSE_EXPANDER`), falling back to a lightweight TF-style expander when SPLADE isn’t available.
+- During ingest each chunk stores a sparse term-weight dictionary in the FTS sidecar (`fts_chunks_sparse`).
+- Query-time, call `kb.sparse_splade_{slug}` (or let auto-route pick it) to use the expanded terms; MCP clients can mix with BM25 by calling both `kb.sparse_{slug}` and `kb.sparse_splade_{slug}`.
+- Scores surface as `sparse_score` within the standard `scores` bucket so quality gates continue to work.
+
 ### Neighbor Context Expansion
 
 Automatically includes adjacent chunks for better context.
@@ -480,6 +488,7 @@ Two lightweight stores are built during ingest:
 - `entities_{slug}`: list graph entities for the collection, filterable by `type` and substring.
 - `linkouts_{slug}`: enumerate chunks/sections that reference an entity node (pair with `open_*`).
 - `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
+- `sparse_splade_{slug}`: run sparse expansion retrieval (SPLADE/basic) on demand.
 
 All tools hydrate snippets through the ACL-enforcing document store.
 

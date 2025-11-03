@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import time
-from typing import Iterable, Dict, Any, List, Optional
+from collections import defaultdict
+from typing import Iterable, Dict, Any, List, Optional, Tuple
 
 ALIASES = {
     "MBR": ["membrane bioreactor"],
@@ -82,12 +83,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
 );
 """
 
+SPARSE_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS fts_chunks_sparse (
+    term TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    doc_id TEXT,
+    weight REAL NOT NULL,
+    PRIMARY KEY (term, chunk_id)
+);
+"""
+
+SPARSE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_sparse_terms_term ON fts_chunks_sparse(term);"
+SPARSE_CHUNK_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_sparse_terms_chunk ON fts_chunks_sparse(chunk_id);"
+
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'")
     exists = cur.fetchone() is not None
     if not exists:
         conn.execute(FTS_CREATE_SQL)
+        conn.execute(SPARSE_CREATE_SQL)
+        conn.execute(SPARSE_INDEX_SQL)
+        conn.execute(SPARSE_CHUNK_INDEX_SQL)
         conn.commit()
         return
     # Existing table: ensure expected columns are present.
@@ -99,7 +116,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     missing = [col for col in FTS_EXPECTED_UNINDEXED if col not in current_columns]
     for col in missing:
         conn.execute(f"ALTER TABLE fts_chunks ADD COLUMN {col} {FTS_EXPECTED_UNINDEXED[col]}")
+    conn.execute(SPARSE_CREATE_SQL)
+    conn.execute(SPARSE_INDEX_SQL)
+    conn.execute(SPARSE_CHUNK_INDEX_SQL)
     if missing:
+        conn.commit()
+    else:
         conn.commit()
 
 
@@ -171,7 +193,11 @@ class FTSWriter:
         cur = self.conn.cursor()
         if recreate:
             cur.execute("DROP TABLE IF EXISTS fts_chunks")
+            cur.execute("DROP TABLE IF EXISTS fts_chunks_sparse")
         cur.execute(FTS_CREATE_SQL)
+        cur.execute(SPARSE_CREATE_SQL)
+        cur.execute(SPARSE_INDEX_SQL)
+        cur.execute(SPARSE_CHUNK_INDEX_SQL)
         self.conn.commit()
 
     def upsert_many(self, rows: Iterable[Dict[str, Any]]) -> int:
@@ -224,6 +250,40 @@ class FTSWriter:
                 for r in rows
             ],
         )
+        sparse_delete = set()
+        sparse_rows: List[Tuple[str, str, str, float]] = []
+        for r in rows:
+            chunk_id = str(r.get("chunk_id"))
+            doc_id = str(r.get("doc_id"))
+            terms = r.get("sparse_terms") or []
+            if not terms:
+                continue
+            sparse_delete.add(chunk_id)
+            for entry in terms:
+                if isinstance(entry, dict):
+                    term = entry.get("term")
+                    weight = entry.get("weight")
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    term, weight = entry[0], entry[1]
+                else:
+                    continue
+                if not term:
+                    continue
+                try:
+                    w = float(weight)
+                except Exception:
+                    continue
+                term_norm = str(term).strip().lower()
+                if len(term_norm) < 3:
+                    continue
+                sparse_rows.append((term_norm, chunk_id, doc_id, w))
+        if sparse_delete:
+            cur.executemany("DELETE FROM fts_chunks_sparse WHERE chunk_id = ?", [(cid,) for cid in sparse_delete])
+        if sparse_rows:
+            cur.executemany(
+                "INSERT OR REPLACE INTO fts_chunks_sparse(term, chunk_id, doc_id, weight) VALUES(?,?,?,?)",
+                sparse_rows,
+            )
         self.conn.commit()
         return len(rows)
 
@@ -232,6 +292,7 @@ class FTSWriter:
             return
         cur = self.conn.cursor()
         cur.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (str(doc_id),))
+        cur.execute("DELETE FROM fts_chunks_sparse WHERE doc_id = ?", (str(doc_id),))
         self.conn.commit()
 
     def close(self) -> None:
@@ -278,11 +339,15 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
         cur = conn.cursor()
         count = 0
         cur.execute("BEGIN")
+        sparse_delete = set()
+        sparse_rows: List[Tuple[str, str, str, float]] = []
         for r in rows:
             if not r.get("text"):
                 continue
+            chunk_id = str(r.get("chunk_id"))
+            doc_id = str(r.get("doc_id"))
             # Delete any existing entry for this chunk_id, then insert
-            cur.execute("DELETE FROM fts_chunks WHERE chunk_id = ?", (str(r.get("chunk_id")),))
+            cur.execute("DELETE FROM fts_chunks WHERE chunk_id = ?", (chunk_id,))
             cur.execute(
                 """
                 INSERT INTO fts_chunks (
@@ -296,8 +361,8 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                 """,
                 (
                     r.get("text", ""),
-                    str(r.get("chunk_id")),
-                    str(r.get("doc_id")),
+                    chunk_id,
+                    doc_id,
                     str(r.get("path")),
                     str(r.get("filename")),
                     int(r.get("chunk_start", 0) or 0),
@@ -319,7 +384,35 @@ def upsert_chunks(db_path: str, rows: Iterable[Dict[str, Any]]) -> int:
                     str(r.get("doc_metadata", "") or ""),
                 ),
             )
+            terms = r.get("sparse_terms") or []
+            if terms:
+                sparse_delete.add(chunk_id)
+                for entry in terms:
+                    if isinstance(entry, dict):
+                        term = entry.get("term")
+                        weight = entry.get("weight")
+                    elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        term, weight = entry[0], entry[1]
+                    else:
+                        continue
+                    if not term:
+                        continue
+                    try:
+                        w = float(weight)
+                    except Exception:
+                        continue
+                    term_norm = str(term).strip().lower()
+                    if len(term_norm) < 3:
+                        continue
+                    sparse_rows.append((term_norm, chunk_id, doc_id, w))
             count += 1
+        if sparse_delete:
+            cur.executemany("DELETE FROM fts_chunks_sparse WHERE chunk_id = ?", [(cid,) for cid in sparse_delete])
+        if sparse_rows:
+            cur.executemany(
+                "INSERT OR REPLACE INTO fts_chunks_sparse(term, chunk_id, doc_id, weight) VALUES(?,?,?,?)",
+                sparse_rows,
+            )
         conn.commit()
         return count
     finally:
@@ -335,6 +428,7 @@ def delete_doc(db_path: str, doc_id: str) -> None:
     try:
         cur = conn.cursor()
         cur.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (str(doc_id),))
+        cur.execute("DELETE FROM fts_chunks_sparse WHERE doc_id = ?", (str(doc_id),))
         conn.commit()
     finally:
         conn.close()
@@ -365,6 +459,50 @@ def search(db_path: str, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         )
         rows = cur.fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def sparse_search(db_path: str, query_terms: Dict[str, float], limit: int = 20) -> List[Dict[str, Any]]:
+    if not query_terms or not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        terms = list({term.lower(): weight for term, weight in query_terms.items()}.items())
+        if not terms:
+            return []
+        placeholders = ",".join("?" for _ in terms)
+        cur.execute(
+            f"SELECT term, chunk_id, doc_id, weight FROM fts_chunks_sparse WHERE term IN ({placeholders})",
+            [t[0] for t in terms],
+        )
+        q_weights = {term: weight for term, weight in terms}
+        scores: Dict[str, float] = defaultdict(float)
+        doc_ids: Dict[str, str] = {}
+        for row in cur.fetchall():
+            term = row["term"]
+            chunk_id = row["chunk_id"]
+            doc_id = row["doc_id"]
+            weight = row["weight"]
+            q_weight = q_weights.get(term)
+            if q_weight is None:
+                continue
+            scores[chunk_id] += float(weight) * float(q_weight)
+            if doc_id:
+                doc_ids.setdefault(chunk_id, doc_id)
+        if not scores:
+            return []
+        top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[: int(limit)]
+        chunk_map = fetch_texts_by_chunk_ids(db_path, [cid for cid, _ in top])
+        results: List[Dict[str, Any]] = []
+        for chunk_id, score in top:
+            row = chunk_map.get(chunk_id, {"chunk_id": chunk_id, "doc_id": doc_ids.get(chunk_id)})
+            data = dict(row)
+            data["sparse_score"] = score
+            results.append(data)
+        return results
     finally:
         conn.close()
 
