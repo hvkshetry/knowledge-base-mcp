@@ -9,6 +9,7 @@ Comprehensive guide for ingesting documents and searching your knowledge base.
 - [Search Modes](#search-modes)
 - [Multi-Collection Setup](#multi-collection-setup)
 - [Advanced Features](#advanced-features)
+- [MCP Playbooks](#mcp-playbooks)
 - [Operational Acceptance Checks](#operational-acceptance-checks)
 - [Performance Tuning](#performance-tuning)
 - [Best Practices](#best-practices)
@@ -469,6 +470,7 @@ Two lightweight stores are built during ingest:
 **Entity tips**
 - Table rows add parameter nodes automatically; `linkouts_*` returns the chunk ids so you can follow up with `open_*`.
 - Frequent co-occurrences between entities are stored as `co_occurs` edges, giving agent planners a cheap signal for likely relationships (e.g., equipment ↔ operating parameter).
+- Numeric readings matched in chunks (e.g., “MLSS = 8000 mg/L”) become `measurement` nodes linked to their parameter via `has_measurement`, so you can query values directly from the graph.
 
 ### MCP Utility Tools
 
@@ -480,6 +482,17 @@ Two lightweight stores are built during ingest:
 - `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
 
 All tools hydrate snippets through the ACL-enforcing document store.
+
+## MCP Playbooks
+
+Use the composable tools above to let the MCP client drive retrieval and critique loops. See [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md) for ready-to-run sequences:
+
+- **Retrieve → Assess → Refine**: combine `kb.hybrid`, `kb.quality`, `kb.open`, and `kb.hint` / `kb.hyde` to iterate safely.
+- **Table QA**: pair `kb.table` with `kb.open` and `kb.quality` to guarantee grounded tabular answers.
+- **Graph Walks**: `kb.entities` → `kb.linkouts` → `kb.graph` uncovers multi-hop evidence.
+- **Ingestion QA**: `ingest.analyze_document` → `ingest.extract_with_strategy` → `ingest.chunk_with_guidance` → `ingest.assess_quality` ensures deterministic plans.
+
+These playbooks can be embedded directly into Claude prompts, Codex CLI scripts, or other MCP clients.
 
 ### Evaluation Guardrails
 

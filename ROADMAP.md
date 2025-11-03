@@ -45,9 +45,9 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 
 ## Stage 6 – Advanced Enhancements
 - Train or integrate SPLADE/uniCOIL expansions and bring ColBERT late-interaction online once instrumentation is stable.
-- Distil a learning-to-route or answer-critic model that predicts retrieval recipes and governs self-critique loops.
+- Leverage the MCP client as the answer critic/self-rerouter (codify “retrieve → assess → refine” playbooks, document prompt patterns, and only distil to a server-side model if we later need a lighter-weight fallback).
 - Upgrade `graph_builder.py` with learned/domain NER + relation extraction (heuristic entity co-occurrence shipped) and explore graph-aware retrieval blends for multi-hop questions.
 - Tune Docling deployments (GPU/batching pools) and build lifecycle tooling for `.ingest_cache/`, `graph.db`, and `summary.db`.
-- Surface graph/summary/neighbor actions and answer-critic feedback prominently in MCP clients to maximise agentic workflows.
+- Surface graph/summary/neighbor actions and answer-critic feedback prominently in MCP clients to maximise agentic workflows (e.g., curated Claude playbooks, UI affordances).
 
 Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

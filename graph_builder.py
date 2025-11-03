@@ -1,3 +1,4 @@
+import hashlib
 import itertools
 import json
 import os
@@ -48,8 +49,12 @@ KEYWORD_CLASSES: Dict[str, Sequence[str]] = {
 ENTITY_MIN_LEN = 4
 ENTITY_TYPE_CONCEPT = "concept"
 ENTITY_TYPE_UNIT = "unit"
+ENTITY_TYPE_MEASUREMENT = "measurement"
 
 UPPER_ENTITY_RE = re.compile(r"\b([A-Z]{3,}(?:\s+[A-Z0-9]{2,})*)\b")
+MEASUREMENT_RE = re.compile(
+    r"(?P<parameter>[A-Za-z][A-Za-z0-9\s/%°\-\(\)]{2,}?)\s*(?:=|:)\s*(?P<value>-?\d+(?:\.\d+)?(?:\s*[x×]\s*10\^\d+)?)\s*(?P<unit>[A-Za-zμ/%°\-\^0-9]+)?"
+)
 
 
 def _ensure_graph(path: Path) -> sqlite3.Connection:
@@ -106,6 +111,12 @@ def _slugify(value: str) -> str:
 
 def _node_id_entity(label: str) -> str:
     return f"entity::{_slugify(label)}"
+
+
+def _measurement_node_id(parameter: str, value: str, unit: Optional[str], doc_id: str, chunk_node: str) -> str:
+    base = f"{parameter}|{value}|{unit or ''}|{doc_id}|{chunk_node}"
+    digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+    return f"measurement::{digest}"
 
 
 def _keyword_entities(text_lower: str) -> List[Tuple[str, str]]:
@@ -175,7 +186,25 @@ def _unit_entities(doc_metadata: Optional[Dict[str, Any]]) -> List[Tuple[str, st
     return out
 
 
-def _collect_chunk_entities(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _metadata_bucket_entities(doc_metadata: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    if not isinstance(doc_metadata, dict):
+        return []
+    entities_meta = doc_metadata.get("entities") or {}
+    collected: List[Tuple[str, str, str]] = []
+    if isinstance(entities_meta, dict):
+        for etype, items in entities_meta.items():
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, str):
+                        continue
+                    label = item.strip()
+                    if len(label) < ENTITY_MIN_LEN:
+                        continue
+                    collected.append((label, etype or "entity", "metadata"))
+    return collected
+
+
+def _collect_chunk_entities(chunk: Dict[str, Any], doc_metadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     text = (chunk.get("text") or "").strip()
     if not text:
         return []
@@ -184,6 +213,7 @@ def _collect_chunk_entities(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
     entities.extend(_keyword_entities(text_lower))
     entities.extend(_table_entities(chunk))
     entities.extend(_uppercase_entities(text))
+    entities.extend([(label, etype) for label, etype, _ in _metadata_bucket_entities(doc_metadata)])
     seen: Dict[str, str] = {}
     out: List[Dict[str, Any]] = []
     for label, etype in entities:
@@ -195,7 +225,7 @@ def _collect_chunk_entities(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
             {
                 "label": label.strip(),
                 "type": etype,
-                "source": "table" if etype == "parameter" else "text",
+                "source": "table" if etype == "parameter" else "metadata" if etype in {"equipment", "chemical", "parameter"} else "text",
             }
         )
     return out
@@ -279,7 +309,8 @@ def update_graph(
 
         element_ids = chunk.get("element_ids") or []
         types = chunk.get("types") or []
-        chunk_entities = _collect_chunk_entities(chunk)
+        chunk_entities = _collect_chunk_entities(chunk, doc_meta)
+        parameter_id_lookup: Dict[str, str] = {}
 
         for idx, element_id in enumerate(element_ids):
             if not element_id:
@@ -320,6 +351,63 @@ def update_graph(
                     )
                     seen_edges.add(key)
                 entity_ids_for_chunk.append(entity_id)
+                if etype == "parameter":
+                    parameter_id_lookup[label.lower()] = entity_id
+
+            measurements = []
+            text = chunk.get("text") or ""
+            for match in MEASUREMENT_RE.finditer(text):
+                parameter = match.group("parameter").strip()
+                value = match.group("value").strip()
+                unit = match.group("unit")
+                if len(parameter) < ENTITY_MIN_LEN:
+                    continue
+                measurements.append((parameter, value, unit))
+
+            for parameter, value, unit in measurements:
+                norm_param = parameter.lower()
+                parameter_entity_id = parameter_id_lookup.get(norm_param)
+                if not parameter_entity_id:
+                    parameter_entity_id = _node_id_entity(parameter)
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (parameter_entity_id, parameter, "parameter", collection, None),
+                    )
+                    parameter_id_lookup[norm_param] = parameter_entity_id
+                    entity_ids_for_chunk.append(parameter_entity_id)
+                measurement_label = f"{value} {unit or ''}".strip()
+                measurement_node = _measurement_node_id(parameter, value, unit, doc_id, chunk_node)
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (measurement_node, measurement_label, ENTITY_TYPE_MEASUREMENT, collection, None),
+                )
+                key_measure = (chunk_node, measurement_node, "mentions")
+                if key_measure not in seen_edges:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                        (chunk_node, measurement_node, "mentions", collection, doc_id),
+                    )
+                    seen_edges.add(key_measure)
+                key_param_link = (parameter_entity_id, measurement_node, "has_measurement")
+                if key_param_link not in seen_edges:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                        (parameter_entity_id, measurement_node, "has_measurement", collection, doc_id),
+                    )
+                    seen_edges.add(key_param_link)
+                edge_param_chunk = (chunk_node, parameter_entity_id, "mentions")
+                if edge_param_chunk not in seen_edges:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                        (chunk_node, parameter_entity_id, "mentions", collection, doc_id),
+                    )
+                    seen_edges.add(edge_param_chunk)
 
             for left_id, right_id in _co_occurrence_pairs(entity_ids_for_chunk):
                 key = (left_id, right_id, "co_occurs")

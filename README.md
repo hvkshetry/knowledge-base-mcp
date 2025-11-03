@@ -13,6 +13,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 - **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface page numbers, section paths, element IDs, table metadata, and original tool provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
+- **Agent Playbooks**: Ready-to-run “retrieve → assess → refine” workflows for Claude and other MCP clients are documented in [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md).
 
 ## 🤖 MCP-First Architecture
 
@@ -235,6 +236,12 @@ See [USAGE.md](USAGE.md) for comprehensive documentation including:
 - Performance tuning
 
 For upcoming improvements, check [ROADMAP.md](ROADMAP.md).
+
+## 📘 Further Reading
+
+- [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md) – agent playbooks for retrieve → assess → refine loops, table QA, ingestion QA, and multi-hop reasoning.
+- [`SPARSE_COLBERT_PLAN.md`](SPARSE_COLBERT_PLAN.md) – step-by-step outline for adding SPLADE/uniCOIL expansions and ColBERT late interaction with MCP-aware routing.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) – deep dive into RRF, reranking, and chunking design choices.
 
 ## 🏛️ Architecture Details
 
