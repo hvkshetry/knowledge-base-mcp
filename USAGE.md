@@ -46,6 +46,7 @@ python ingest.py \
   # Extraction
   --extractor auto                    # Primary extractor for text fallback
   --sparse-expander splade            # Optional sparse expansion (none|basic|splade)
+  --colbert-url http://localhost:7000 # Optional ColBERT service endpoint
   --thin-payload                      # Store metadata-only payloads in Qdrant
   --graph-db data/graph.db            # Override graph storage (optional)
   --summary-db data/summary.db        # Override summary storage (optional)
@@ -383,6 +384,13 @@ data/
 - Query-time, call `kb.sparse_splade_{slug}` (or let auto-route pick it) to use the expanded terms; MCP clients can mix with BM25 by calling both `kb.sparse_{slug}` and `kb.sparse_splade_{slug}`.
 - Scores surface as `sparse_score` within the standard `scores` bucket so quality gates continue to work.
 
+### ColBERT Late Interaction
+
+- Configure a ColBERT service (e.g., `colbertv2` + Faiss) and set `COLBERT_URL` (and optional `COLBERT_TIMEOUT`).
+- `kb.colbert_{slug}` invokes the service with `POST {COLBERT_URL}/query` and expects `{"results": [{"chunk_id": ..., "doc_id": ..., "score": ...}, ...]}`.
+- Auto routing (`mode="auto"`) will prefer ColBERT for question-style queries when the service is available; call it explicitly when you want late-interaction reranking.
+- Returned rows include `colbert_score` under `scores.dense`, so quality gates can reason about confidence alongside other routes.
+
 ### Neighbor Context Expansion
 
 Automatically includes adjacent chunks for better context.
@@ -489,6 +497,7 @@ Two lightweight stores are built during ingest:
 - `linkouts_{slug}`: enumerate chunks/sections that reference an entity node (pair with `open_*`).
 - `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
 - `sparse_splade_{slug}`: run sparse expansion retrieval (SPLADE/basic) on demand.
+- `colbert_{slug}`: route a query through the ColBERT late-interaction service when configured.
 
 All tools hydrate snippets through the ACL-enforcing document store.
 

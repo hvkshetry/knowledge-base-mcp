@@ -7,6 +7,7 @@ These playbooks show how an MCP-aware client (Claude Desktop/Code, Codex CLI, et
 1. **Plan a route**
    - Start with `kb.hybrid_{slug}` or `kb.rerank_{slug}`.
    - For short, keyword-heavy prompts call `kb.sparse_{slug}` or `kb.sparse_splade_{slug}` when sparse expansion is enabled.
+   - For long-form or multi-fact questions, try `kb.colbert_{slug}` (requires `COLBERT_URL`).
    - Use `kb.hyde_{slug}` to generate a hypothetical answer when confidence is low.
 
 2. **Inspect evidence**

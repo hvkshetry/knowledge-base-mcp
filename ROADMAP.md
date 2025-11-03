@@ -44,7 +44,7 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Add lightweight dashboards or reports (CSV → Grafana/static HTML) to visualise quality and latency deltas per release. *(done – JSON/CSV exports from `eval.py`)*
 
 ## Stage 6 – Advanced Enhancements
-- SPLADE/uniCOIL sparse expansion wired via `--sparse-expander`; next step is packaging ColBERT late-interaction as a companion route.
+- SPLADE/uniCOIL sparse expansion wired via `--sparse-expander`; ColBERT routing is available via `COLBERT_URL`, with remaining work focused on deploying/tuning the service for production workloads.
 - Leverage the MCP client as the answer critic/self-rerouter (codify “retrieve → assess → refine” playbooks, document prompt patterns, and only distil to a server-side model if we later need a lighter-weight fallback).
 - Upgrade `graph_builder.py` with learned/domain NER + relation extraction (heuristic entity co-occurrence shipped) and explore graph-aware retrieval blends for multi-hop questions.
 - Tune Docling deployments (GPU/batching pools) and build lifecycle tooling for `.ingest_cache/`, `graph.db`, and `summary.db`.

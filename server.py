@@ -21,7 +21,7 @@ from graph_builder import (
     neighbors as graph_neighbors,
 )
 from summary_index import query_summaries
-from lexical_index import ALIASES
+from lexical_index import ALIASES, fetch_texts_by_chunk_ids
 from sparse_expansion import SparseExpander
 from ingest_blocks import (
     triage_pdf,
@@ -55,12 +55,15 @@ OLLAMA_LLM = os.getenv("OLLAMA_LLM", os.getenv("OLLAMA_MODEL_GENERATE", "llama3:
 TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://localhost:8087")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+COLBERT_URL = os.getenv("COLBERT_URL")
+COLBERT_TIMEOUT = int(os.getenv("COLBERT_TIMEOUT", "60"))
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "data/fts.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "data/graph.db")
 SUMMARY_DB_PATH = os.getenv("SUMMARY_DB_PATH", "data/summary.db")
 SPARSE_EXPANDER = SparseExpander(os.getenv("SPARSE_EXPANDER", "none"))
 SPARSE_QUERY_TOP_K = int(os.getenv("SPARSE_QUERY_TOP_K", "48"))
 HAVE_SPARSE_SPLADE = SPARSE_EXPANDER.enabled
+HAVE_COLBERT = bool(COLBERT_URL)
 
 # JSON like: {"kb":{"collection":"snowflake_kb","title":"Company KB"}}
 # Backcompat: allow STELLA_SCOPES if NOMIC_KB_SCOPES not set
@@ -188,6 +191,124 @@ def _encode_sparse_query(text: str) -> Dict[str, float]:
     if not HAVE_SPARSE_SPLADE or not text:
         return {}
     return SPARSE_EXPANDER.encode_dict(text, top_k=SPARSE_QUERY_TOP_K)
+
+
+async def _run_colbert(
+    collection: str,
+    query: str,
+    retrieve_k: int,
+    return_k: int,
+    top_k: int,
+    subjects: List[str],
+    timings: Dict[str, float],
+    boosts: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    if not HAVE_COLBERT:
+        return [{"error": "colbert_service_unavailable"}]
+    limit = max(return_k, min(retrieve_k, 64))
+    start = time.perf_counter()
+    try:
+        resp = await asyncio.to_thread(
+            requests.post,
+            f"{COLBERT_URL.rstrip('/')}/query",
+            json={
+                "collection": collection,
+                "query": query,
+                "k": limit,
+            },
+            timeout=COLBERT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            hits = data.get("results") or data.get("hits") or []
+        else:
+            hits = data
+        if not isinstance(hits, list):
+            raise ValueError("Unexpected ColBERT response format")
+    except Exception as exc:
+        timings["colbert_ms"] = timings.get("colbert_ms", 0.0) + (time.perf_counter() - start) * 1000.0
+        return [{"error": "colbert_query_failed", "detail": str(exc)}]
+    timings["colbert_ms"] = timings.get("colbert_ms", 0.0) + (time.perf_counter() - start) * 1000.0
+    scored: List[Dict[str, Any]] = []
+    chunk_ids: List[str] = []
+    for entry in hits:
+        if not isinstance(entry, dict):
+            continue
+        chunk_id = entry.get("chunk_id")
+        doc_id = entry.get("doc_id")
+        if not chunk_id:
+            continue
+        chunk_ids.append(str(chunk_id))
+        scored.append(
+            {
+                "chunk_id": str(chunk_id),
+                "doc_id": doc_id,
+                "colbert_score": float(entry.get("score", 0.0) or 0.0),
+            }
+        )
+    if not scored:
+        return []
+    payload_map = fetch_texts_by_chunk_ids(FTS_DB_PATH, chunk_ids)
+    col_scores = [row["colbert_score"] for row in scored]
+    stats = (min(col_scores), max(col_scores)) if col_scores else None
+    rows: List[Dict[str, Any]] = []
+    for info in scored[:return_k]:
+        chunk_id = info["chunk_id"]
+        base = payload_map.get(chunk_id, {})
+        col_score = info["colbert_score"]
+        decay = _decay_factor(base.get("mtime"))
+        score = _combined_score(
+            bm25=None,
+            dense=col_score,
+            rerank=None,
+            bm_stats=None,
+            dense_stats=stats,
+            rerank_stats=None,
+            decay=decay,
+        )
+        prior_mult = _prior_multiplier(base.get("doc_id"), subjects, boosts)
+        score *= prior_mult
+        row = {
+            "score": score,
+            "final_score": score,
+            "dense_score": col_score,
+            "colbert_score": col_score,
+            "decay_factor": decay,
+            "id": chunk_id,
+            "chunk_id": chunk_id,
+            "doc_id": base.get("doc_id"),
+            "path": base.get("path"),
+            "chunk_start": base.get("chunk_start"),
+            "chunk_end": base.get("chunk_end"),
+            "text": base.get("text"),
+            "pages": base.get("pages"),
+            "section_path": base.get("section_path"),
+            "element_ids": base.get("element_ids"),
+            "bboxes": base.get("bboxes"),
+            "types": base.get("types"),
+            "source_tools": base.get("source_tools"),
+            "table_headers": base.get("table_headers"),
+            "table_units": base.get("table_units"),
+            "chunk_profile": base.get("chunk_profile"),
+            "plan_hash": base.get("plan_hash"),
+            "model_version": base.get("model_version"),
+            "prompt_sha": base.get("prompt_sha"),
+            "doc_metadata": base.get("doc_metadata"),
+            "scores": _score_breakdown(
+                bm25=None,
+                dense=col_score,
+                rrf=None,
+                rerank=None,
+                decay=decay,
+                final=score,
+            ),
+        }
+        _ensure_score_bucket(row)["prior"] = prior_mult
+        rows.append(row)
+    await _ensure_row_texts(rows, collection, subjects)
+    _annotate_rows(rows, query)
+    return rows
 
 
 def _fts_neighbors(doc_id: str, chunk_start: int, n: int) -> List[Dict[str, Any]]:
@@ -1104,7 +1225,11 @@ async def plan_route(query: str) -> Dict[str, Any]:
     if n_tokens <= 4 and has_caps:
         return {"route": "sparse_splade" if HAVE_SPARSE_SPLADE else "hybrid", "k": 32}
     if "?" in query or n_tokens > 10:
+        if HAVE_COLBERT:
+            return {"route": "colbert", "k": 32}
         return {"route": "rerank", "k": 24}
+    if HAVE_COLBERT and n_tokens >= 6:
+        return {"route": "colbert", "k": 24}
     return {"route": "hybrid", "k": 24}
 
 
@@ -1797,6 +1922,8 @@ async def _execute_search(
         return await _run_rerank(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings, boosts)
     if route == "hybrid":
         return await _run_hybrid(collection, query, query_vec, retrieve_k, return_k, top_k, subjects, timings, boosts)
+    if route == "colbert":
+        return await _run_colbert(collection, query, retrieve_k, return_k, top_k, subjects, timings, boosts)
     return [{"error": f"invalid route '{route}'"}]
 
 
@@ -1806,6 +1933,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
     dense_tool_name = f"dense_{slug}"
     hybrid_tool_name = f"hybrid_{slug}"
     rerank_tool_name = f"rerank_{slug}"
+    colbert_tool_name = f"colbert_{slug}"
     batch_tool_name = f"batch_{slug}"
     quality_tool_name = f"quality_{slug}"
     sparse_title = f"{title or slug}: Sparse Search"
@@ -1814,6 +1942,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
     dense_title = f"{title or slug}: Dense Search"
     hybrid_title = f"{title or slug}: Hybrid Search"
     rerank_title = f"{title or slug}: Rerank Search"
+    colbert_title = f"{title or slug}: ColBERT Search"
     batch_title = f"{title or slug}: Batch Search"
     quality_title = f"{title or slug}: Inspect Hits"
 
@@ -1891,6 +2020,49 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             "rows": rows,
             "timings": {k: round(v, 3) for k, v in timings.items()},
             "route": "sparse_splade",
+            "best_score": best,
+        }
+        if boosts:
+            result["boosts"] = boosts
+        if best < ANSWERABILITY_THRESHOLD:
+            result.update({
+                "abstain": True,
+                "reason": "best_score_below_threshold",
+                "threshold": ANSWERABILITY_THRESHOLD,
+            })
+        return result
+    @mcp.tool(name=colbert_tool_name, title=colbert_title)
+    async def colbert_tool(
+        ctx: Context,
+        query: str,
+        retrieve_k: int = 24,
+        return_k: int = 8,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "empty_query"}
+        if not HAVE_COLBERT:
+            return {"error": "colbert_service_unavailable"}
+        retrieve_k = max(1, min(int(retrieve_k), 256))
+        return_k = max(1, min(int(return_k), retrieve_k))
+        subjects = get_subjects_from_context(ctx)
+        timings: Dict[str, float] = {}
+        boosts = _parse_scope_boosts(scope)
+        rows = await _run_colbert(
+            collection,
+            query,
+            retrieve_k,
+            return_k,
+            retrieve_k,
+            subjects,
+            timings,
+            boosts,
+        )
+        best = _best_score(rows)
+        result = {
+            "rows": rows,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "route": "colbert",
             "best_score": best,
         }
         if boosts:
@@ -2064,7 +2236,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 continue
             timings: Dict[str, float] = {}
             route_norm = route.lower()
-            if route_norm not in {"sparse", "sparse_splade", "semantic", "rerank", "hybrid", "auto"}:
+            if route_norm not in {"sparse", "sparse_splade", "semantic", "rerank", "hybrid", "colbert", "auto"}:
                 results.append({"index": idx, "query": query, "route": route, "error": "invalid_route"})
                 continue
             boosts = None
@@ -2416,7 +2588,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 logger.debug("failed to log search metrics", exc_info=True)
             return rows
 
-        valid_modes = {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "auto"}
+        valid_modes = {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert", "auto"}
         if mode not in valid_modes:
             return finalize([{"error": f"invalid mode '{mode}', expected one of {sorted(valid_modes)}"}], mode)
         if not isinstance(top_k, int) or top_k < 1 or top_k > 100:
@@ -2431,15 +2603,6 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
             return finalize([
                 {"error": "invalid return_k", "detail": "return_k must be int between 1 and retrieve_k"}
             ], mode)
-        try:
-            embed_start = time.perf_counter()
-            vec = await embed_query(query, normalize=True)
-            timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
-        except Exception as e:
-            return finalize([
-                {"error": "embedding_failed", "detail": str(e)}
-            ], mode)
-
         subjects = get_subjects_from_context(ctx)
         planned_route: Optional[Dict[str, Any]] = None
         route = mode
@@ -2451,7 +2614,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 logger.debug("plan_route failed, falling back to rerank: %s", exc)
                 planned_route = {}
             route = str((planned_route or {}).get("route") or "rerank")
-            if route not in {"semantic", "rerank", "hybrid", "sparse", "sparse_splade"}:
+            if route not in {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert"}:
                 route = "rerank"
             planned_k = (planned_route or {}).get("k")
             if isinstance(planned_k, int) and 1 <= planned_k <= 256:
@@ -2460,12 +2623,12 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
         route_retrieve_val = route_retrieve
 
         query_vec: List[float] = []
-        if route in {"semantic", "rerank", "hybrid"}:
-            try:
-                embed_start = time.perf_counter()
-                query_vec = await embed_query(query, normalize=True)
-                timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
-            except Exception as e:
+    if route in {"semantic", "rerank", "hybrid"}:
+        try:
+            embed_start = time.perf_counter()
+            query_vec = await embed_query(query, normalize=True)
+            timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
+        except Exception as e:
                 return finalize([
                     {"error": "embedding_failed", "detail": str(e)}
                 ], route)
@@ -2529,7 +2692,7 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
                 route,
             )
 
-        if route != "sparse" and _should_retry_sparse(query, rows):
+        if route not in {"sparse", "sparse_splade"} and _should_retry_sparse(query, rows):
             sparse_rows = await _execute_search(
                 route="sparse",
                 collection=collection,

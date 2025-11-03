@@ -1,6 +1,6 @@
 # Sparse Expansion & ColBERT Integration Guide
 
-This note captures the steps required to add higher-recall sparse expansions (SPLADE/uniCOIL) and late-interaction reranking (ColBERT) while keeping the MCP client in control of routing decisions. The ingestion pipeline now accepts `--sparse-expander splade` (or `basic`) and exposes `kb.sparse_splade_*`; the remaining work tracks ColBERT integration and hardening.
+This note captures the steps required to add higher-recall sparse expansions (SPLADE/uniCOIL) and late-interaction reranking (ColBERT) while keeping the MCP client in control of routing decisions. The ingestion pipeline now accepts `--sparse-expander splade` (or `basic`) and exposes `kb.sparse_splade_*`; the ColBERT hook is wired via `COLBERT_URL` + `kb.colbert_*`, with the remaining work focused on deploying a production-grade ColBERT service and tuning fusion.
 
 ## 1. SPLADE / uniCOIL Sparse Expansion
 
@@ -36,14 +36,14 @@ This note captures the steps required to add higher-recall sparse expansions (SP
      - Execute ANN search against the pre-built index.
    - Record endpoint URL via `COLBERT_URL` env var.
 
-3. **Server integration**
-   - Add `_run_colbert` helper mirroring `_run_semantic`.
-   - When `plan_route` detects short natural-language questions with entity mentions, set `route="colbert"`.
-   - Fuse ColBERT scores into the existing mix: allocate dedicated weight `MIX_W_COLBERT` and expose it via env.
+3. **Server integration** *(implemented)*
+   - `_run_colbert` posts to `{COLBERT_URL}/query` and hydrates chunk payloads via the FTS index.
+   - Planner will auto-select `colbert` when questions contain `?` or longer phrasings; agents can call `kb.colbert_*` directly.
+   - Scores appear under `scores.dense/colbert_score`; quality gates can reason about them alongside other components.
 
-4. **MCP tooling**
-   - Register `kb.colbert_{slug}` (atomic primitive) and allow `kb.batch_{slug}` to accept `route="colbert"`.
-   - Update `kb.quality_{slug}` to understand the additional score bucket so agents can reason about ColBERT confidence.
+4. **MCP tooling** *(implemented)*
+   - `kb.colbert_{slug}` is available when `COLBERT_URL` is set, and `kb.batch_{slug}` accepts `route="colbert"`.
+   - `kb.quality_{slug}` already consumes `scores.final`, so ColBERT confidence flows through existing checks.
 
 ## 3. Orchestrating with MCP Clients
 
@@ -67,6 +67,6 @@ Agents can:
 1. Prototype SPLADE inference inside the ingestion pipeline (ensure it respects `plan_hash` determinism).
 2. Stand up a ColBERT service and build the first collection index (e.g., `daf_kb`).
 3. Add planner heuristics + MCP documentation updates.
-4. Collect evaluation deltas using `eval.py` and new gold-set slices focusing on acronym-heavy queries.
+4. Collect evaluation deltas using `eval.py` and new gold-set slices focusing on acronym-heavy or multi-hop queries.
 
 With these building blocks, the MCP client can choose the best retrieval modality per query while the server remains deterministic and auditable.
