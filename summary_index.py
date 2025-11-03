@@ -3,7 +3,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 SUMMARY_DB_PATH = os.getenv("SUMMARY_DB_PATH", "data/summary.db")

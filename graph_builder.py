@@ -94,11 +94,81 @@ def _ensure_graph(path: Path) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst)")
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(src, dst, type, collection, doc_id)"
-    )
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(src, dst, type, collection, doc_id)"
+        )
+    except sqlite3.IntegrityError:
+        # Legacy graphs may contain duplicate edges; remove them and recreate the index.
+        conn.execute(
+            """
+            DELETE FROM edges
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM edges
+                GROUP BY src, dst, type, collection, doc_id
+            )
+            """
+        )
+        conn.commit()
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(src, dst, type, collection, doc_id)"
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_doc ON nodes(doc_id)")
     return conn
+
+
+def _parse_doc_ids(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x) for x in data if x]
+            if data:
+                return [str(data)]
+        except json.JSONDecodeError:
+            pass
+        return [raw] if raw else []
+    return []
+
+
+def _format_doc_ids(doc_ids: Iterable[str]) -> Optional[str]:
+    unique = sorted({str(doc_id) for doc_id in doc_ids if doc_id})
+    if not unique:
+        return None
+    return json.dumps(unique, ensure_ascii=False)
+
+
+def _upsert_node(
+    cur: sqlite3.Cursor,
+    node_id: str,
+    label: str,
+    node_type: str,
+    collection: str,
+    doc_ids: Iterable[str],
+) -> None:
+    existing_doc_ids: List[str] = []
+    cur.execute("SELECT doc_id FROM nodes WHERE id = ?", (node_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        existing_doc_ids = _parse_doc_ids(row[0])
+    combined = set(existing_doc_ids)
+    combined.update(str(doc_id) for doc_id in doc_ids if doc_id)
+    doc_field = _format_doc_ids(combined)
+    cur.execute(
+        """
+        INSERT INTO nodes(id, label, type, collection, doc_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            label = excluded.label,
+            type = excluded.type,
+            collection = excluded.collection,
+            doc_id = excluded.doc_id
+        """,
+        (node_id, label, node_type, collection, doc_field),
+    )
 
 
 def _node_id_doc(doc_id: str) -> str:
@@ -214,7 +284,7 @@ def _metadata_bucket_entities(doc_metadata: Optional[Dict[str, Any]]) -> List[Tu
     return collected
 
 
-def _collect_chunk_entities(chunk: Dict[str, Any], doc_metadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _extract_entities(chunk: Dict[str, Any], doc_metadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     text = (chunk.get("text") or "").strip()
     if not text:
         return []
@@ -239,6 +309,24 @@ def _collect_chunk_entities(chunk: Dict[str, Any], doc_metadata: Optional[Dict[s
             }
         )
     return out
+
+
+def _extract_relations(text: str, entity_lookup: Dict[str, str]) -> List[Tuple[str, str, str]]:
+    relations: List[Tuple[str, str, str]] = []
+    if not text or not entity_lookup:
+        return relations
+    for pattern, relation in RELATION_PATTERNS:
+        for match in pattern.finditer(text):
+            src_norm = _normalize_label(match.group("src"))
+            dst_norm = _normalize_label(match.group("dst"))
+            if not src_norm or not dst_norm or src_norm == dst_norm:
+                continue
+            src_id = entity_lookup.get(src_norm)
+            dst_id = entity_lookup.get(dst_norm)
+            if not src_id or not dst_id:
+                continue
+            relations.append((src_id, dst_id, relation))
+    return relations
 
 
 def _doc_metadata(chunks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -270,26 +358,14 @@ def update_graph(
     cur = conn.cursor()
 
     doc_node = _node_id_doc(doc_id)
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (doc_node, path, "doc", collection, doc_id),
-    )
+    _upsert_node(cur, doc_node, path, "doc", collection, [doc_id])
 
     doc_meta = _doc_metadata(chunk_list)
     seen_edges: set[Tuple[str, str, str]] = set()
 
     for label, etype in itertools.chain(_concept_entities(doc_meta), _unit_entities(doc_meta)):
         entity_id = _node_id_entity(label)
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (entity_id, label, etype, collection, None),
-        )
+        _upsert_node(cur, entity_id, label, etype, collection, [doc_id])
         edge_type = "has_concept" if etype == ENTITY_TYPE_CONCEPT else "uses_unit"
         key = (doc_node, entity_id, edge_type)
         if key not in seen_edges:
@@ -303,13 +379,7 @@ def update_graph(
         section_path = tuple(chunk.get("section_path") or [])
         if section_path:
             section_node = _node_id_section(doc_id, section_path)
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (section_node, " > ".join(section_path), "section", collection, doc_id),
-            )
+            _upsert_node(cur, section_node, " > ".join(section_path), "section", collection, [doc_id])
             cur.execute(
                 "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
                 (doc_node, section_node, "has_section", collection, doc_id),
@@ -319,7 +389,7 @@ def update_graph(
 
         element_ids = chunk.get("element_ids") or []
         types = chunk.get("types") or []
-        chunk_entities = _collect_chunk_entities(chunk, doc_meta)
+        chunk_entities = _extract_entities(chunk, doc_meta)
         parameter_id_lookup: Dict[str, str] = {}
         entity_lookup: Dict[str, str] = {}
 
@@ -328,13 +398,7 @@ def update_graph(
                 continue
             chunk_type = types[idx] if idx < len(types) else "chunk"
             chunk_node = _node_id_chunk(doc_id, element_id)
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (chunk_node, element_id, chunk_type, collection, doc_id),
-            )
+            _upsert_node(cur, chunk_node, element_id, chunk_type, collection, [doc_id])
             parent = section_node or doc_node
             cur.execute(
                 "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
@@ -346,13 +410,7 @@ def update_graph(
                 label = entity["label"]
                 etype = entity["type"] or "entity"
                 entity_id = _node_id_entity(label)
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (entity_id, label, etype, collection, None),
-                )
+                _upsert_node(cur, entity_id, label, etype, collection, [doc_id])
                 relation = "row_has_parameter" if entity.get("source") == "table" else "mentions"
                 key = (chunk_node, entity_id, relation)
                 if key not in seen_edges:
@@ -383,13 +441,7 @@ def update_graph(
                 parameter_entity_id = parameter_id_lookup.get(norm_param)
                 if not parameter_entity_id:
                     parameter_entity_id = _node_id_entity(parameter)
-                    cur.execute(
-                        """
-                        INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (parameter_entity_id, parameter, "parameter", collection, None),
-                    )
+                    _upsert_node(cur, parameter_entity_id, parameter, "parameter", collection, [doc_id])
                     if norm_param:
                         parameter_id_lookup[norm_param] = parameter_entity_id
                         entity_lookup.setdefault(norm_param, parameter_entity_id)
@@ -398,13 +450,7 @@ def update_graph(
                 entity_ids_for_chunk.append(parameter_entity_id)
                 measurement_label = f"{value} {unit or ''}".strip()
                 measurement_node = _measurement_node_id(parameter, value, unit, doc_id, chunk_node)
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO nodes(id, label, type, collection, doc_id)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (measurement_node, measurement_label, ENTITY_TYPE_MEASUREMENT, collection, None),
-                )
+                _upsert_node(cur, measurement_node, measurement_label, ENTITY_TYPE_MEASUREMENT, collection, [doc_id])
                 key_measure = (chunk_node, measurement_node, "mentions")
                 if key_measure not in seen_edges:
                     cur.execute(
@@ -427,24 +473,14 @@ def update_graph(
                     )
                     seen_edges.add(edge_param_chunk)
 
-            # Heuristic relation extraction between entities in the chunk
-            for pattern, relation in RELATION_PATTERNS:
-                for match in pattern.finditer(text):
-                    src_norm = _normalize_label(match.group("src"))
-                    dst_norm = _normalize_label(match.group("dst"))
-                    if not src_norm or not dst_norm or src_norm == dst_norm:
-                        continue
-                    src_id = entity_lookup.get(src_norm)
-                    dst_id = entity_lookup.get(dst_norm)
-                    if not src_id or not dst_id:
-                        continue
-                    key_rel = (src_id, dst_id, relation)
-                    if key_rel not in seen_edges:
-                        cur.execute(
-                            "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                            (src_id, dst_id, relation, collection, doc_id),
-                        )
-                        seen_edges.add(key_rel)
+            for src_id, dst_id, relation in _extract_relations(text, entity_lookup):
+                key_rel = (src_id, dst_id, relation)
+                if key_rel not in seen_edges:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                        (src_id, dst_id, relation, collection, doc_id),
+                    )
+                    seen_edges.add(key_rel)
 
             for left_id, right_id in _co_occurrence_pairs(entity_ids_for_chunk):
                 key = (left_id, right_id, "co_occurs")
@@ -474,12 +510,14 @@ def neighbors(
     cur.execute("SELECT id, label, type, collection, doc_id FROM nodes WHERE id = ?", (node_id,))
     row = cur.fetchone()
     if row:
+        doc_ids = _parse_doc_ids(row[4])
         result["node"] = {
             "id": row[0],
             "label": row[1],
             "type": row[2],
             "collection": row[3],
-            "doc_id": row[4],
+            "doc_id": doc_ids[0] if doc_ids else None,
+            "doc_ids": doc_ids,
         }
     cur.execute(
         """
@@ -531,10 +569,16 @@ def list_entities(
     sql.append("ORDER BY label LIMIT ?")
     params.append(max(1, min(limit, 500)))
     cur.execute(" ".join(sql), params)
-    records = [
-        {"id": row[0], "label": row[1], "type": row[2], "doc_id": row[3]}
-        for row in cur.fetchall()
-    ]
+    records = []
+    for row in cur.fetchall():
+        doc_ids = _parse_doc_ids(row[3])
+        records.append({
+            "id": row[0],
+            "label": row[1],
+            "type": row[2],
+            "doc_id": doc_ids[0] if doc_ids else None,
+            "doc_ids": doc_ids,
+        })
     conn.close()
     return records
 
@@ -565,24 +609,27 @@ def entity_linkouts(
         """,
         (entity_id, max(1, min(limit, 200))),
     )
-    mentions = [
-        {
+    mentions: List[Dict[str, Any]] = []
+    for row in cur.fetchall():
+        doc_ids = _parse_doc_ids(row[3])
+        mentions.append({
             "node_id": row[0],
             "label": row[1],
             "type": row[2],
-            "doc_id": row[3],
+            "doc_id": doc_ids[0] if doc_ids else None,
+            "doc_ids": doc_ids,
             "relation": row[4],
-        }
-        for row in cur.fetchall()
-    ]
+        })
     conn.close()
+    entity_doc_ids = _parse_doc_ids(entity_row[4]) if entity_row else []
     return {
         "entity": {
             "id": entity_row[0],
             "label": entity_row[1],
             "type": entity_row[2],
             "collection": entity_row[3],
-            "doc_id": entity_row[4],
+            "doc_id": entity_doc_ids[0] if entity_doc_ids else None,
+            "doc_ids": entity_doc_ids,
         },
         "mentions": mentions,
     }

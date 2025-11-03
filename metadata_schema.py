@@ -1,8 +1,8 @@
 import re
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
-from pydantic import BaseModel, Field, ValidationError, validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
 STOPWORDS = {
@@ -18,29 +18,62 @@ TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-/]{2,}")
 
 
 class EntityBucket(BaseModel):
-    equipment: List[str] = Field(default_factory=list, max_items=12)
-    chemicals: List[str] = Field(default_factory=list, max_items=12)
-    parameters: List[str] = Field(default_factory=list, max_items=12)
+    equipment: List[str] = Field(default_factory=list, max_length=12)
+    chemicals: List[str] = Field(default_factory=list, max_length=12)
+    parameters: List[str] = Field(default_factory=list, max_length=12)
 
-    @validator("*", pre=True, each_item=True)
-    def _strip(cls, value: str) -> str:
-        return value.strip()[:64]
+    @field_validator("equipment", "chemicals", "parameters", mode="before")
+    def _normalize_items(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            items = [value]
+        else:
+            items = list(value)
+        normalized: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                normalized.append(text[:64])
+        return normalized
 
 
 class Metadata(BaseModel):
     summary: str = Field(default="", max_length=320)
-    key_concepts: List[str] = Field(default_factory=list, max_items=8)
+    key_concepts: List[str] = Field(default_factory=list, max_length=8)
     entities: EntityBucket = Field(default_factory=EntityBucket)
-    units: List[str] = Field(default_factory=list, max_items=16)
+    units: List[str] = Field(default_factory=list, max_length=16)
     quality_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
-    @validator("key_concepts", pre=True, each_item=True)
-    def _normalize_concept(cls, value: str) -> str:
-        return value.strip()[:48]
+    @field_validator("key_concepts", mode="before")
+    def _normalize_concepts(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            items = [value]
+        else:
+            items = list(value)
+        normalized: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                normalized.append(text[:48])
+        return normalized
 
-    @validator("units", pre=True, each_item=True)
-    def _normalize_unit(cls, value: str) -> str:
-        return value.strip()[:32]
+    @field_validator("units", mode="before")
+    def _normalize_units(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            items = [value]
+        else:
+            items = list(value)
+        normalized: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                normalized.append(text[:32])
+        return normalized
 
 
 def _top_concepts(text: str) -> List[str]:
@@ -99,14 +132,14 @@ def generate_metadata(raw_text: str, chunks: List[Dict[str, object]]) -> Tuple[D
     candidate = {
         "summary": summary,
         "key_concepts": concepts,
-        "entities": entities.dict(),
+        "entities": entities.model_dump(),
         "units": units,
         "quality_score": _quality_score(summary, concepts),
     }
     rejects: List[str] = []
     try:
         model = Metadata(**candidate)
-        return model.dict(), rejects
+        return model.model_dump(), rejects
     except ValidationError as exc:
         rejects.append(str(exc))
         return {}, rejects

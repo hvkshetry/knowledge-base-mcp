@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import warnings
+
+warnings.filterwarnings("ignore", message=r".*SwigPy.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=r".*swigvarlink.*", category=DeprecationWarning)
+
 import fitz
 
 os.environ.setdefault("HF_HOME", str(Path(".cache") / "hf"))
@@ -21,6 +26,35 @@ from structured_chunk import detect_blocks, _expand_table_block
 
 TABLE_TOKEN = re.compile(r"\bTable\s+\d+(\-\d+)?\b", re.IGNORECASE)
 FIGURE_TOKEN = re.compile(r"\b(Fig\.?|Figure)\s+\d+(\-\d+)?\b", re.IGNORECASE)
+
+
+def _calculate_page_confidence(
+    table_tokens: int,
+    text_density: float,
+    multicolumn_score: float,
+    has_images: bool,
+    vector_lines: int,
+) -> float:
+    if table_tokens > 100:
+        return 0.98
+    if vector_lines > 150:
+        return 0.97
+    if text_density > 1400 and table_tokens == 0 and not has_images:
+        return 0.95
+
+    if 50 <= table_tokens <= 100:
+        return 0.75
+    if 120 <= vector_lines <= 150:
+        return 0.70
+
+    if 20 <= table_tokens < 50:
+        return 0.60
+    if has_images and text_density > 1000:
+        return 0.50
+    if 2.0 <= multicolumn_score < 4.0:
+        return 0.65
+
+    return 0.80
 
 
 @dataclass
@@ -79,6 +113,7 @@ def triage_pdf(path: Path) -> Dict[str, Any]:
         )[:4000]
         has_table_token = bool(TABLE_TOKEN.search(sample_text))
         has_figure_token = bool(FIGURE_TOKEN.search(sample_text))
+        table_token_count = len(TABLE_TOKEN.findall(sample_text))
         is_scan = text_chars < 200 and images > 0
         is_tabley = vector_lines > 120 or has_table_token
         is_multicol = multicolumn_score > float(os.getenv("MULTICOL_GAP_FACTOR", "4.0"))
@@ -93,16 +128,30 @@ def triage_pdf(path: Path) -> Dict[str, Any]:
             route = "docling"
 
         page_text = page.get_text("text") or ""
+        text_density = float(text_chars)
+        confidence = _calculate_page_confidence(
+            table_tokens=table_token_count,
+            text_density=text_density,
+            multicolumn_score=multicolumn_score,
+            has_images=images > 0,
+            vector_lines=vector_lines,
+        )
         pages.append(
             {
                 "page": page_index,
                 "route": route,
+                "original_route": route,
                 "text_chars": text_chars,
                 "images": images,
                 "vector_lines": vector_lines,
                 "multicolumn_score": multicolumn_score,
                 "has_table_token": has_table_token,
                 "has_figure_token": has_figure_token,
+                "table_tokens": table_token_count,
+                "text_density": text_density,
+                "confidence": confidence,
+                "has_images": images > 0,
+                "sample_text": page_text[:200],
                 "page_text": page_text,
             }
         )
@@ -116,7 +165,13 @@ def triage_pdf(path: Path) -> Dict[str, Any]:
         for p in pages:
             p["route"] = "docling"
 
-    return {"pages": pages}
+    confidence_stats = {
+        "high_confidence": sum(1 for p in pages if p.get("confidence", 0.0) >= 0.75),
+        "low_confidence": sum(1 for p in pages if p.get("confidence", 0.0) < 0.75),
+        "total_pages": len(pages),
+    }
+
+    return {"pages": pages, "confidence_stats": confidence_stats}
 
 
 def _init_counters() -> Dict[str, int]:
@@ -605,8 +660,18 @@ def chunk_blocks(
         bboxes = [b.bbox for b in buffer]
         types = [b.type for b in buffer]
         source_tools = list({b.source_tool for b in buffer})
-        headers = [b.headers for b in buffer if b.headers]
-        units = [b.units for b in buffer if b.units]
+        headers: List[str] = []
+        units: List[str] = []
+        for b in buffer:
+            if b.headers:
+                headers.extend([str(h).strip() for h in b.headers if h])
+            if b.units:
+                if isinstance(b.units, dict):
+                    units.extend(str(v).strip() for v in b.units.values() if v)
+                elif isinstance(b.units, list):
+                    units.extend(str(u).strip() for u in b.units if u)
+                else:
+                    units.append(str(b.units).strip())
         chunk = {
             "text": text,
             "pages": pages,
@@ -616,7 +681,9 @@ def chunk_blocks(
             "types": types,
             "source_tools": source_tools,
             "headers": headers,
+            "table_headers": headers,
             "units": units,
+            "table_units": units,
             "chunk_start": chunk_cursor,
             "chunk_end": chunk_cursor + len(text),
             "doc_id": buffer[0].doc_id,
@@ -654,6 +721,15 @@ def chunk_blocks(
             text = block.text or ""
             if not text.strip():
                 continue
+            row_headers = [str(h).strip() for h in (block.headers or []) if h]
+            row_units: List[str] = []
+            if block.units:
+                if isinstance(block.units, dict):
+                    row_units.extend(str(v).strip() for v in block.units.values() if v)
+                elif isinstance(block.units, list):
+                    row_units.extend(str(u).strip() for u in block.units if u)
+                else:
+                    row_units.append(str(block.units).strip())
             chunk = {
                 "text": text,
                 "pages": [block.page],
@@ -662,8 +738,10 @@ def chunk_blocks(
                 "bboxes": [block.bbox] if block.bbox else [],
                 "types": [block.type],
                 "source_tools": [block.source_tool] if block.source_tool else [],
-                "headers": [block.headers] if block.headers else [],
-                "units": [block.units] if block.units else [],
+                "headers": row_headers,
+                "table_headers": row_headers,
+                "units": row_units,
+                "table_units": row_units,
                 "chunk_start": chunk_cursor,
                 "chunk_end": chunk_cursor + len(text),
                 "doc_id": block.doc_id,

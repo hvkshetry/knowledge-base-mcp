@@ -93,15 +93,24 @@ def sanitize_triage_for_plan(triage: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "page": page_int,
                 "route": entry.get("route"),
+                "original_route": entry.get("original_route"),
                 "text_chars": entry.get("text_chars"),
                 "images": entry.get("images"),
                 "vector_lines": entry.get("vector_lines"),
                 "multicolumn_score": entry.get("multicolumn_score"),
                 "has_table_token": entry.get("has_table_token"),
                 "has_figure_token": entry.get("has_figure_token"),
+                "table_tokens": entry.get("table_tokens"),
+                "text_density": entry.get("text_density"),
+                "confidence": entry.get("confidence"),
+                "sample_text": entry.get("sample_text"),
             }
         )
-    return {"pages": pages_out}
+    result = {"pages": pages_out}
+    stats = triage.get("confidence_stats")
+    if isinstance(stats, dict):
+        result["confidence_stats"] = stats
+    return result
 
 
 def compute_plan_hash(payload: Dict[str, Any]) -> str:
@@ -210,6 +219,8 @@ def choose_extractor(extractor: str, p: pathlib.Path):
     # Prefer MarkItDown for speed, even for PDFs
     if extractor == "docling":
         return extract_docling
+    if extractor == "pymupdf":
+        return extract_pdf_pymupdf
     return extract_markitdown
 
 

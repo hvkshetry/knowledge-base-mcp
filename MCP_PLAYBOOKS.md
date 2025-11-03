@@ -10,7 +10,7 @@ _First list the configured collections with `kb.collections` if you need to conf
    - Start with `kb.hybrid(collection="<slug>")` or `kb.rerank(collection="<slug>")`.
    - For short, keyword-heavy prompts call `kb.sparse(collection="<slug>")` or `kb.sparse_splade(collection="<slug>") (requires a configured SPLADE expander)` when sparse expansion is enabled.
    - For long-form or multi-fact questions, try `kb.colbert(collection="<slug>") (requires an external ColBERT service)` (requires `COLBERT_URL`).
-   - Optionally call `kb.hyde` or `kb.generate_hyde` to generate a hypothetical answer when a text-generation model is configured.
+   - If scores are low, generate a hypothetical answer locally (HyDE) and retry with `kb.dense`.
 
 2. **Inspect evidence**
    - Call `kb.open(collection="<slug>", chunk_id=...)` for the top chunk(s) to ensure the text matches expectations.

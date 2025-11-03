@@ -85,32 +85,6 @@ async def run_search(
     duration_ms = (time.perf_counter() - start) * 1000.0
     hyde_used = False
     abstained = any(isinstance(r, dict) and r.get("abstain") for r in rows)
-    best = server._best_score(rows)
-    if server.ANSWERABILITY_THRESHOLD > 0.0 and best < server.ANSWERABILITY_THRESHOLD:
-        hypo = await server.hyde(query)
-        if hypo:
-            try:
-                hypo_vec = await server.embed_query(hypo, normalize=True)
-            except Exception:
-                hypo_vec = None
-            if hypo_vec is not None:
-                hyde_rows = await server._execute_search(
-                    route="semantic",
-                    collection=collection,
-                    query=hypo,
-                    query_vec=hypo_vec,
-                    retrieve_k=min(route_retrieve, 16),
-                    return_k=return_k,
-                    top_k=top_k,
-                    subjects=subjects,
-                    timings=timings,
-                )
-                hyde_best = server._best_score(hyde_rows)
-                if hyde_best >= server.ANSWERABILITY_THRESHOLD:
-                    hyde_rows.insert(0, {"note": "HyDE retry satisfied threshold", "base_route": route})
-                    rows = hyde_rows
-                    hyde_used = True
-                    abstained = any(isinstance(r, dict) and r.get("abstain") for r in rows)
     return rows, route, hyde_used, duration_ms, timings, abstained
 
 

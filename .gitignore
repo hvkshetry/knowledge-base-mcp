@@ -116,3 +116,4 @@ eval/gold_sets/*.jsonl
 eval/gold_sets/*.json
 !eval/gold_sets/README.md
 !eval/gold_sets/*_template.jsonl
+!eval/gold_sets/*_auto.jsonl

@@ -315,7 +315,7 @@ All search routes return the same response schema so planners can swap modes wit
 The default MCP mode. Heuristics pick a route based on query shape:
 
 1. Dense or hybrid retrieval runs first.
-2. If the top result underperforms, the planner triggers a HyDE (hypothetical passage) rerun and, if needed, a sparse retry before abstaining.
+2. If the best score is below `ANSWERABILITY_THRESHOLD`, the server abstains and returns telemetry so your MCP client can decide whether to generate a HyDE hypothesis (via `kb.hyde`) or try an alternate phrasing/sparse query.
 
 | Query Type | Suggested Mode |
 |------------|----------------|
@@ -335,20 +335,22 @@ The default MCP mode. Heuristics pick a route based on query shape:
 }
 ```
 
-### HyDE Tools
+### HyDE Workflow (Client-Orchestrated)
 
-Use `kb.generate_hyde` when you want to craft a hypothetical answer with additional context before retrying search. The tool accepts optional `context`, `temperature`, and `max_length` arguments and returns the generated hypothesis along with the prompt hash for provenance. Example:
+Instead of calling a server-side generator, craft the hypothesis directly in your MCP client:
 
-```json
-{
-  "query": "How is recycle flow pressurised in DAF systems?",
-  "context": "Top results mention air saturation tanks and recycle pumps.",
-  "temperature": 0.1,
-  "max_length": 600
-}
+```python
+results = await kb.hybrid(collection="daf_kb", query=user_query, retrieve_k=32, return_k=12)
+best_score = max((row.get("score") or 0.0) for row in results if isinstance(row, dict)) if results else 0.0
+
+if best_score < 0.35:
+    hypothesis = """
+    [Generate a grounded 5-7 sentence hypothetical answer based on the query and the low-confidence hits.]
+    """
+    hyde_results = await kb.dense(collection="daf_kb", query=hypothesis, retrieve_k=24, return_k=12)
 ```
 
-Pair this with `ingest.generate_summary` and `ingest.upsert` to build closed-loop retrieval plans that log every client decision in the ingest plan via `client_orchestration`.
+Log both the original and HyDE scores in your notes so you can explain the retry decision.
 
 ## Multi-Collection Setup
 

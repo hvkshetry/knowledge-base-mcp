@@ -37,13 +37,15 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Emit hashed JSONL audit records for every search/open/neighbors call, capturing subject hashes, query hashes, doc/element IDs, decision, and latency. *(done – `AUDIT_LOG_PATH`)*
 - Refresh governance docs covering ACL config, audit log rotation, and thin-index deployment guidance. *(done – see USAGE.md security section)*
 
-## Stage 5 – Evaluation & CI Rails *(completed)*
-- Expand each collection’s gold set to 150–300 queries split by narrative/table/multi-hop types, with stored relevance judgments. *(done – 160 excerpt-matching queries generated for each collection under `eval/gold_sets/`)*
-- Enhance `eval.py` to compute Recall@50, nDCG@10, MRR@10, and stage latency stats (embed, sparse, hybrid, rerank, HyDE), emitting machine-readable summaries. *(done)*
-- Wire CI thresholds (`EVAL_MIN_NDCG10`, `EVAL_MIN_RECALL50`, `EVAL_MAX_P90_MS`) so regressions fail builds and publish trend artifacts. *(done – thresholds exposed via CLI flags)*
-- Add lightweight dashboards or reports (CSV → Grafana/static HTML) to visualise quality and latency deltas per release. *(done – JSON/CSV exports from `eval.py`)*
+## Stage 5 – Evaluation & CI Rails *(in progress)*
+- [x] Remove server-side HyDE retries so evaluation reflects the client-led planner; document the workflow in `eval/gold_sets/README.md`.
+- [x] Generate 200 deterministic excerpt-matching queries per collection via `scripts/generate_goldset.py` (e.g., `eval/gold_sets/daf_kb_auto.jsonl`) to seed the expanded gold sets.
+- [ ] Curate the generated seeds into 150–300 hand-verified queries per collection spanning narrative/table/multi-hop scenarios, with maintained relevance judgments.
+- [ ] Enhance `eval.py` to emit Recall@50, nDCG@10, MRR@10 plus per-stage latency metrics (embed, sparse, hybrid, rerank) and structured outputs for dashboards.
+- [ ] Add CI thresholds (`EVAL_MIN_NDCG10`, `EVAL_MIN_RECALL50`, `EVAL_MAX_P90_MS`) so quality or latency regressions fail builds.
+- [ ] Publish lightweight reports (CSV/JSON → Grafana/static HTML) to visualise quality and latency deltas per release.
 
-## Stage 6 – Advanced Enhancements *(in progress)*
+## Stage 6 – Advanced Enhancements *(active)*
 - SPLADE/uniCOIL sparse expansion: hooks (`--sparse-expander`, `kb.sparse_splade`) are present, but no SPLADE model is bundled yet.
 - MCP playbooks/prompts documented in `MCP_PLAYBOOKS.md` and `MCP_PROMPTS.md`, encouraging the agent to act as critic/self-rerouter.
 - `graph_builder.py` currently attaches entity → chunk links; richer relations (`feeds`, `discharges_to`, `located_in`) remain on the backlog.
@@ -57,5 +59,6 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Table metadata: ensure table headers/units survive extraction before re-enabling the stronger table lookup guarantees (current MCP `kb.table` often returns empty hits).
 - Summary/outline/hint builders: ship the background jobs that populate `summary.db`, outline indices, and richer alias expansions so `kb.summary`, `kb.outline`, and `kb.hint` return real data instead of placeholders.
 - Entity provenance: extend the graph pipeline to retain `doc_id` on entity nodes/edges so `kb.entities` can always surface source documents.
+- Evaluation telemetry: integrate `eval.py` outputs with CI and dashboards (see Stage 5 tasks above) and automate ingestion of new judgments.
 
 Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

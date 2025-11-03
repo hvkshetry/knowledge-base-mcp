@@ -1,3 +1,3 @@
 {
-  "_comment": "Add per-collection canary queries here. Example: 'daf_kb': { 'queries': [{ 'prompt': 'design MLSS' }] }"
+  "_comment": "Add per-collection canary queries here. Example: 'daf_kb': { 'queries': [{ 'prompt': 'design MLSS' }] }. The defaults are intentionally empty so ingest.assess_quality only warns until you populate this file."
 }

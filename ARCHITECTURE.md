@@ -96,6 +96,19 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 - Cache-aware per-page extraction drastically reduces re-ingest cost.
 - Governance-friendly “thin payload” option omits raw text from Qdrant; snippets are hydrated via the document store.
 
+### Client vs Server Responsibilities
+
+| Responsibility | Server (Deterministic) | MCP Client (Intelligent) |
+|----------------|------------------------|---------------------------|
+| Text extraction | PyMuPDF / MarkItDown / Docling | — |
+| Page heuristics | Confidence scoring, routing suggestions | Review low-confidence pages, override routes |
+| Embeddings & search | Qdrant vectors, SQLite FTS, reranking | Compose search strategies, decide retries |
+| Summaries | Persist summaries with provenance metadata | Generate the summaries themselves |
+| HyDE | Returns abstain on low confidence | Generate hypotheses and retry search |
+| Governance | Enforce thin-index + ACLs | Log decisions via `client_orchestration` |
+
+The guiding principle: the server never calls an LLM. Claude (or any MCP client) provides the strategic intelligence, while the server provides deterministic, auditable execution.
+
 #### Client Orchestration & Provenance
 
 Plans stored under `data/ingest_plans/<doc_id>.plan.json` now include a `client_orchestration` stanza so the MCP client can log every high-level decision alongside the server’s deterministic hash:
@@ -119,7 +132,7 @@ Plans stored under `data/ingest_plans/<doc_id>.plan.json` now include a `client_
 }
 ```
 
-Tools such as `ingest.generate_summary`, `ingest.upsert`, and `kb.generate_hyde` populate this log automatically; clients can add their own entries (e.g., triage overrides) by appending decisions before kicking off a batch upsert.
+Tools such as `ingest.generate_summary` and `ingest.upsert` populate this log automatically; clients can add their own entries (e.g., triage overrides or HyDE retries) by appending decisions before kicking off a batch upsert.
 
 ### 3. Vector Store (Qdrant)
 
@@ -144,8 +157,8 @@ Tools such as `ingest.generate_summary`, `ingest.upsert`, and `kb.generate_hyde`
         "bboxes": List[List[float]],
         "types": List[str],
         "source_tools": List[str],
-        "table_headers": List[List[str]],
-        "table_units": List[Dict[str, str]],
+        "table_headers": List[str],
+        "table_units": List[str],
         # optional when thin payload disabled
         "text": str,
     }
@@ -439,7 +452,7 @@ Used directly when `mode="sparse"` and as a fallback when dense retrieval underp
 Auto mode adds light orchestration around the base routes:
 
 1. Heuristic planner picks an initial route (`semantic`, `hybrid`, `rerank`, or `sparse`).
-2. If the best rerank score < `ANSWERABILITY_THRESHOLD`, a HyDE (Hypothetical Document Embeddings) pass runs.
+2. If the best rerank score < `ANSWERABILITY_THRESHOLD`, the server returns an abstain. The MCP client can then decide to run HyDE (Hypothetical Document Embeddings) by generating a hypothesis locally and calling `kb.dense`.
 3. If results still look lexically weak, a sparse retry executes before the server abstains.
 
 Retrieval logs include stage-level timings (`embed_ms`, `qdrant_ms`, `fts_ms`, `rerank_ms`, `hyde_ms`) for observability and CI gating.

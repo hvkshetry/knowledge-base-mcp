@@ -11,7 +11,7 @@ A production-grade MCP (Model Context Protocol) server that provides hybrid sema
 - **Zero Embedding Cost**: Use Ollama locally - no per-document charges for embeddings during ingestion
 - **Zero Reranking Cost**: Local TEI reranking - no per-query charges for result reranking
 - **Unlimited Scale**: Ingest and search unlimited documents without incremental API costs
-- **Speed**: <300ms search latency - no API roundtrips for embeddings or reranking
+- **Speed**: <300ms search latency on our reference hardware (hybrid route; actual latency depends on your CPU and rerank configuration) - no API roundtrips for embeddings or reranking
 - **Control**: Full customization of embedding models, search parameters, and chunking
 
 ### What document formats are supported?
@@ -55,7 +55,7 @@ A production-grade MCP (Model Context Protocol) server that provides hybrid sema
 
 ### Can I use GPU acceleration?
 
-Currently optimized for CPU. GPU support for Ollama embeddings is possible:
+Currently optimised for CPU out of the box. GPU support for Ollama embeddings is possible (not enabled in the default docker-compose):
 
 ```bash
 # Use Ollama with GPU (requires NVIDIA GPU + CUDA)
@@ -72,6 +72,16 @@ Yes, Docker is currently required for:
 - **TEI Reranker**: Cross-encoder reranking
 
 *Future enhancement*: Optional local alternatives without Docker.
+
+### How do I add another knowledge base (collection)?
+
+Edit the `NOMIC_KB_SCOPES` environment variable (or the corresponding entry in `.mcp.json` / `.codex/config.toml`) and add a new slug-to-collection mapping, for example:
+
+```json
+{"kb": {"collection": "daf_kb", "title": "DAF Knowledge Base"}, "ro": {"collection": "ro_kb", "title": "Reverse Osmosis"}}
+```
+
+Only `daf_kb` is configured by default so that the repository ships without proprietary data. After updating `NOMIC_KB_SCOPES`, ingest documents into the new collection and pass `collection="<slug>"` when calling the `kb.*` tools.
 
 ### Can I run this on Windows?
 
@@ -193,6 +203,24 @@ Hybrid mode performs:
 4. Cross-encoder reranking
 
 Each step adds latency. Typical: ~200-300ms (vs ~100ms for rerank).
+
+## Client Orchestration
+
+### Why doesn't the server generate summaries or HyDE hypotheses?
+
+Because the MCP client (Claude) already has best-in-class generation capabilities at no marginal cost. The server stays deterministic—extracting text, running search, and storing results—while the client reads evidence and produces summaries or hypotheses.
+
+### How does hybrid per-page routing work without server LLM calls?
+
+The server supplies page-level heuristics and confidence scores (`ingest.analyze_document`). For high-confidence pages the suggested extractor is used as-is; for low-confidence pages the client inspects metadata (`table_tokens`, `text_density`, `sample_text`) and chooses the extractor before calling `ingest.extract_with_strategy`.
+
+### What is client orchestration?
+
+Client orchestration means Claude plans the ingestion/search strategy—generating HyDE passages, selecting extractors, and writing summaries—while the server executes deterministically. This keeps the system reproducible, avoids extra API costs, and ensures the highest-quality model is making decisions.
+
+### Does this add latency or cost?
+
+No. Claude is already in the loop; examining metadata for the ~10% low-confidence pages takes seconds. Avoiding server-side LLM calls removes the need to run additional LLM infrastructure on the backend.
 
 ## Configuration
 

@@ -58,11 +58,15 @@ When handed a new PDF:
 - `ingest.corpus_upsert` root_path="./daf_kb" collection="daf_kb" dry_run=true extractor="auto" chunk_profile="auto"
 ```
 
-## HyDE Generation
+## HyDE Generation (Client-Side)
 
 ```
-- `kb.generate_hyde` query="How is recycle flow pressurised in DAF systems?" context="Top hits mention recycle pumps and saturation tanks." temperature=0.1
-- Rerun `kb.dense` (or `kb.hybrid`) with the returned hypothesis to see if scores clear the answerability threshold.
+results = await kb.hybrid(collection="daf_kb", query=user_query, retrieve_k=32, return_k=12)
+if max((row.get("score") or 0.0) for row in results if isinstance(row, dict)) < 0.35:
+    hypothesis = """
+    [Generate a grounded hypothetical answer summarising the expected content.]
+    """
+    hyde_results = await kb.dense(collection="daf_kb", query=hypothesis, retrieve_k=24, return_k=12)
 ```
 
 Include these fragments in your system prompt or invocation instructions to make

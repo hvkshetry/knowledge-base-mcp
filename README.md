@@ -6,7 +6,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 
 - **Zero-Cost Embeddings & Reranking**: Ollama-powered embeddings and a local TEI cross-encoder keep every document and query free of per-token fees.
 - **Structure-Aware Ingestion**: A triage pass keeps most pages on MarkItDown while routing complex layouts through Docling for table/figure-aware blocks, including bboxes, section breadcrumbs, and element IDs.
-- **Agent-Directed Hybrid Retrieval**: Auto mode chooses among dense, hybrid, sparse, and rerank routes, with adaptive retries when confidence drops (HyDE retries require a configured text-generation model)—while MCP tools expose every primitive so the client can override the plan when needed.
+- **Agent-Directed Hybrid Retrieval**: Auto mode chooses among dense, hybrid, sparse, and rerank routes; when scores are low it returns an abstain so the MCP client can decide whether to run HyDE or try alternate queries. Every primitive stays exposed for manual overrides.
 - **Multi-Collection Support (manual)**: Organize documents into separate knowledge bases by adding entries to `NOMIC_KB_SCOPES`; the default configuration ships with a single collection (`daf_kb`).
 - **Incremental & Cached Ingestion**: Smart update detection only reprocesses changed documents, and per-page extraction is cached to accelerate re-ingests.
 - **Graph & Entities (lightweight)**: Ingestion extracts equipment/chemical/parameter entities and links them back to chunks so agents can pivot via `kb.entities`/`kb.linkouts`. (Full semantic relationship extraction is still on the roadmap.)
@@ -14,7 +14,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 - **Canary QA Framework**: `ingest.assess_quality` can run user-supplied canary queries (`config/canaries/`) and report warnings before documents reach production.
 - **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface canonical `page_numbers`, section paths, element IDs, table metadata, and original tool provenance.
 - **MCP-Controlled Upserts**: `ingest.upsert`, `ingest.upsert_batch`, and `ingest.corpus_upsert` let agents push chunk artifacts straight into Qdrant + FTS without leaving the MCP workflow.
-- **Client-Orchestrated Summaries & HyDE**: LLM clients can contribute section summaries via `ingest.generate_summary` and generate context-aware HyDE hypotheses with `kb.generate_hyde`, with every decision recorded in plan provenance.
+- **Client-Orchestrated Summaries & HyDE**: LLM clients contribute section summaries via `ingest.generate_summary` and generate context-aware HyDE hypotheses locally before re-querying `kb.dense`, with every decision recorded in plan provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
 - **Agent Playbooks**: Ready-to-run “retrieve → assess → refine” workflows for Claude and other MCP clients are documented in [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md).
@@ -30,7 +30,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 | Table retrieval | ✅ Working (data-dependent) | Requires tables extracted during ingestion |
 | Canary QA | ⚠️ Requires user config | Default `config/canaries/*.json` are placeholders; add queries to enforce gates |
 | Document summaries / outlines | ⚠️ Client-provided | `ingest.generate_summary` stores semantic summaries with provenance; outlines still require building the heading index |
-| HyDE query expansion | ⚠️ Optional | `kb.hyde` and `kb.generate_hyde` require a local text-generation model (`OLLAMA_LLM`) |
+| HyDE query expansion | ⚠️ Client-driven | `kb.hyde` returns guidance; generate hypotheses in the MCP client and retry search |
 | MCP upsert pipeline | ✅ Working | `ingest.upsert`, `ingest.upsert_batch`, `ingest.corpus_upsert` |
 | SPLADE sparse expansion | 💤 Planned | `--sparse-expander` hooks are present but no SPLADE model is bundled by default |
 | ColBERT late interaction | 💤 Planned | Requires an external ColBERT service; disabled when `COLBERT_URL` is unset |
@@ -207,7 +207,7 @@ Combines vector search + BM25 lexical search using RRF, then reranks.
 Runs alias-aware BM25 only, useful for short keyword queries or as a fallback when semantic routes miss exact terminology.
 
 ### Auto Planner (`mode="auto"`)
-Default. Heuristics pick among semantic, hybrid, rerank, and sparse routes. If the top result scores poorly, the planner triggers a HyDE retry and an optional sparse re-query to recover lexical matches before abstaining.
+Default. Heuristics pick among semantic, hybrid, rerank, and sparse routes. When the top score falls below `ANSWERABILITY_THRESHOLD`, the server abstains and returns telemetry so the MCP client (Claude, etc.) can decide whether to generate a HyDE hypothesis and retry with `kb.dense` or `kb.sparse`.
 
 ### Additional MCP Tools
 
@@ -248,7 +248,7 @@ Set via environment variables (or CLI flags when available):
 | `DOCLING_TIMEOUT` | Seconds to wait for Docling to finish processing a page (default 45). |
 | `HF_HOME` | Hugging Face cache directory used by Docling models (default `.cache/hf`). |
 | `GRAPH_DB_PATH`, `SUMMARY_DB_PATH` | Override lightweight graph and summary storage locations. |
-| `ANSWERABILITY_THRESHOLD` | Minimum rerank score before HyDE + sparse retries run. |
+| `ANSWERABILITY_THRESHOLD` | Minimum score required for auto mode to respond; lower scores return an abstain for the client to handle (e.g., run HyDE or rephrase). |
 | `ROUTE_HEAVY_FRACTION`, `MULTICOL_GAP_FACTOR`, `TABLE_LINE_THRESHOLD` | Tune triage sensitivity for heavy tables/multi-column PDF layouts. |
 
 ## 📚 Usage

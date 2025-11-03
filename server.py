@@ -7,7 +7,7 @@ import re
 import hashlib
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP, Context
@@ -32,7 +32,7 @@ from ingest_blocks import (
 )
 from metadata_schema import generate_metadata
 from ingest_core import upsert_document_artifacts
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def _env_float(name: str, default: float) -> float:
@@ -40,6 +40,10 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except Exception:
         return default
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _env_flag(name: str, *, fallback: Optional[str] = None, default: bool = False) -> bool:
@@ -53,7 +57,6 @@ def _env_flag(name: str, *, fallback: Optional[str] = None, default: bool = Fals
 # ---- Env & config -----------------------------------------------------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "snowflake-arctic-embed:xs")
-OLLAMA_LLM = os.getenv("OLLAMA_LLM", os.getenv("OLLAMA_MODEL_GENERATE", "llama3:8b"))
 TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://localhost:8087")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -761,6 +764,26 @@ def _chunks_artifact_path(doc_id: str) -> Path:
     return _artifact_dir(doc_id) / "chunks.json"
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_artifact_path(artifact_path: Union[str, Path]) -> Path:
+    if not artifact_path:
+        raise ValueError("artifact_path is required")
+    path = Path(artifact_path).expanduser().resolve()
+    allowed_roots = [PLAN_DIR.resolve(), ARTIFACT_DIR.resolve()]
+    if not any(_is_relative_to(path, root) for root in allowed_roots):
+        raise ValueError(f"Invalid artifact path: {artifact_path}")
+    if not path.exists():
+        raise ValueError(f"Artifact not found: {artifact_path}")
+    return path
+
+
 def _canary_config_path(collection: str, name: str = "default") -> Path:
     base = Path(os.getenv("CANARY_DIR", "config/canaries"))
     return base / collection / f"{name}.json"
@@ -948,7 +971,7 @@ def _record_client_decisions(
                 entry = dict(decision)
             else:
                 entry = {"detail": str(decision)}
-            entry.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+            entry.setdefault("timestamp", _utc_iso_now())
             entries.append(entry)
     _save_plan(doc_id, plan)
 
@@ -1065,7 +1088,10 @@ async def ingest_validate_extraction(
 ) -> Dict[str, Any]:
     if not artifact_ref:
         return {"error": "missing_artifact"}
-    artifact_path = Path(artifact_ref).expanduser()
+    try:
+        artifact_path = _validate_artifact_path(artifact_ref)
+    except ValueError as exc:
+        return {"error": "artifact_not_found", "detail": str(exc)}
     data = _read_json(artifact_path)
     if not data:
         return {"error": "artifact_not_found", "detail": f"no artifact at {artifact_path.as_posix()}"}
@@ -1411,12 +1437,15 @@ async def ingest_upsert_tool(
 ) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
-    chunk_path = Path(chunks_artifact).expanduser() if chunks_artifact else _chunks_artifact_path(doc_id)
-    if not chunk_path.exists():
-        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
-    meta_path = Path(metadata_artifact).expanduser() if metadata_artifact else None
-    if meta_path and not meta_path.exists():
-        return {"error": "metadata_not_found", "detail": f"no metadata artifact at {meta_path.as_posix()}"}
+    default_chunk_path = _chunks_artifact_path(doc_id)
+    try:
+        chunk_path = _validate_artifact_path(chunks_artifact or default_chunk_path)
+    except ValueError as exc:
+        return {"error": "artifact_not_found", "detail": str(exc)}
+    try:
+        meta_path = _validate_artifact_path(metadata_artifact) if metadata_artifact else None
+    except ValueError as exc:
+        return {"error": "metadata_not_found", "detail": str(exc)}
 
     plan = _load_plan(doc_id)
     plan_collection = plan.get("collection") if isinstance(plan, dict) else None
@@ -1554,6 +1583,11 @@ async def ingest_generate_summary_tool(
     client_id: Optional[str] = None,
     client_model: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if os.getenv("ENABLE_CLIENT_SUMMARIES", "true").strip().lower() != "true":
+        return {
+            "error": "client_summaries_disabled",
+            "detail": "Set ENABLE_CLIENT_SUMMARIES=true to enable ingest.generate_summary",
+        }
     if not doc_id:
         return {"error": "missing_doc_id"}
     if not isinstance(summary_text, str) or not summary_text.strip():
@@ -1590,7 +1624,7 @@ async def ingest_generate_summary_tool(
         elements = [str(e) for e in element_ids]
 
     metadata = summary_metadata.copy() if isinstance(summary_metadata, dict) else {}
-    metadata.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
+    metadata.setdefault("timestamp", _utc_iso_now())
     if client_id:
         metadata.setdefault("client_id", client_id)
     if client_model:
@@ -1781,10 +1815,22 @@ async def ingest_corpus_upsert(
                 })
                 continue
 
+            try:
+                chunk_path_obj = _validate_artifact_path(chunk_artifact)
+            except ValueError as exc:
+                failures += 1
+                progress_log.append({
+                    "path": path_str,
+                    "doc_id": doc_id,
+                    "status": "error",
+                    "error": {"detail": str(exc)},
+                })
+                continue
+
             upsert_result = await _perform_upsert(
                 doc_id,
                 collection_name,
-                Path(chunk_artifact),
+                chunk_path_obj,
                 thin_payload=thin_payload,
                 skip_vectors=skip_vectors,
                 update_graph_links=update_graph,
@@ -2059,64 +2105,6 @@ def _should_retry_sparse(query: str, rows: List[Dict[str, Any]]) -> bool:
     if not _is_table_row(types) and coverage < 0.4 and best < 0.2:
         return True
     return False
-
-
-async def hyde(
-    query: str,
-    *,
-    context: Optional[str] = None,
-    temperature: float = 0.2,
-    max_length: int = 900,
-) -> Dict[str, Any]:
-    """Generate a short hypothetical answer paragraph for HyDE retrieval."""
-    max_length = max(100, min(int(max_length), 2000))
-    temperature = max(0.0, min(float(temperature), 0.8))
-
-    prompt_parts = [
-        "You are preparing a hypothetical passage for retrieval augmentation.",
-    ]
-    if context:
-        prompt_parts.append("Context:\n" + context.strip())
-    prompt_parts.append(
-        "Task: Write a concise factual paragraph (5-7 sentences) that could answer the question below while staying grounded in real-world engineering knowledge."
-    )
-    prompt_parts.append("Question:\n" + query.strip())
-    prompt = "\n\n".join(prompt_parts)
-
-    try:
-        def _do_request():
-            r = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_LLM,
-                    "prompt": prompt,
-                    "options": {"temperature": temperature},
-                },
-                timeout=60,
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data.get("response", "")
-
-        response = await asyncio.to_thread(_do_request)
-        hypothesis = (response or "").strip()[:max_length]
-        return {
-            "hypothesis": hypothesis,
-            "prompt": prompt,
-            "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "temperature": temperature,
-            "model": OLLAMA_LLM,
-        }
-    except Exception as exc:
-        logger.debug("HyDE generation failed: %s", exc)
-        return {
-            "hypothesis": "",
-            "prompt": prompt,
-            "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "temperature": temperature,
-            "model": OLLAMA_LLM,
-            "error": str(exc),
-        }
 
 
 async def _run_semantic(
@@ -3296,71 +3284,16 @@ async def kb_hint(
 async def kb_hyde(ctx: Context, query: str) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
-    hyde_output = await hyde(query)
-    hypothesis = hyde_output.get("hypothesis", "")
-    status = "ok" if hypothesis else "unavailable"
-    info = None
-    if not hypothesis:
-        info = (
-            "HyDE generation requires a local text-generation model. "
-            "Set OLLAMA_LLM to an installed model (for example 'llama3:8b') "
-            "and ensure the Ollama server at OLLAMA_URL is reachable."
-        )
     _audit("hyde_hint", {
         "query": query,
         "subjects": _audit_subjects(get_subjects_from_context(ctx)),
     })
-    result = {
-        "query": query,
-        "hypothesis": hypothesis,
-        "prompt": hyde_output.get("prompt"),
-        "prompt_sha": hyde_output.get("prompt_sha"),
-        "temperature": hyde_output.get("temperature"),
-        "model": hyde_output.get("model"),
-        "status": status,
-    }
-    if info:
-        result["info"] = info
-    return result
-
-
-@mcp.tool(name="kb.generate_hyde", title="KB: Generate HyDE")
-async def kb_generate_hyde(
-    ctx: Context,
-    query: str,
-    context: Optional[str] = None,
-    temperature: float = 0.2,
-    max_length: int = 900,
-    client_id: Optional[str] = None,
-    client_model: Optional[str] = None,
-) -> Dict[str, Any]:
-    if not isinstance(query, str) or not query.strip():
-        return {"error": "empty_query"}
-    hyde_output = await hyde(query, context=context, temperature=temperature, max_length=max_length)
-    hypothesis = hyde_output.get("hypothesis", "")
-
-    _audit("hyde_generate", {
-        "query": query,
-        "context": context[:2000] if context else None,
-        "prompt_sha": hyde_output.get("prompt_sha"),
-        "client": {"client_id": client_id, "client_model": client_model} if (client_id or client_model) else None,
-    })
-
     return {
         "query": query,
-        "context": context,
-        "hypothesis": hypothesis,
-        "prompt": hyde_output.get("prompt"),
-        "prompt_sha": hyde_output.get("prompt_sha"),
-        "temperature": hyde_output.get("temperature"),
-        "model": hyde_output.get("model"),
-        "metadata": {
-            "client_id": client_id,
-            "client_model": client_model,
-            "context_sha": hashlib.sha256(context.encode("utf-8")).hexdigest() if context else None,
-        },
+        "hypothesis": "",
+        "status": "client_generate",
+        "info": "Generate a context-aware hypothesis in the MCP client and retry search (e.g., via kb.dense).",
     }
-
 @mcp.tool(name="kb.table", title="KB: Table Lookup")
 async def kb_table(
     ctx: Context,
@@ -3695,7 +3628,7 @@ async def kb_search(
     boosts = _parse_scope_boosts(scope)
     subjects = get_subjects_from_context(ctx)
 
-    def finalize(rows: List[Dict[str, Any]], route_name: str, hyde_used: bool = False) -> List[Dict[str, Any]]:
+    def finalize(rows: List[Dict[str, Any]], route_name: str) -> List[Dict[str, Any]]:
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         clean_rows = [r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")]
         best_score = _best_score(rows)
@@ -3710,7 +3643,6 @@ async def kb_search(
             "top_k": top_k,
             "result_count": len(clean_rows),
             "best_score": best_score,
-            "hyde_used": hyde_used,
             "duration_ms": round(duration_ms, 3),
             "thin_payload": THIN_PAYLOAD_ENABLED,
             "abstain": abstain_flag,
@@ -3799,50 +3731,13 @@ async def kb_search(
 
     best = _best_score(rows)
     if ANSWERABILITY_THRESHOLD > 0.0 and best < ANSWERABILITY_THRESHOLD:
-        hypo_data = await hyde(query)
-        hypo = hypo_data.get("hypothesis")
-        if hypo:
-            hyde_start = time.perf_counter()
-            try:
-                hypo_vec = await embed_query(hypo, normalize=True)
-            except Exception as exc:
-                logger.debug("HyDE embed failed: %s", exc)
-                hypo_vec = None
-            if hypo_vec is not None:
-                hyde_rows = await _execute_search(
-                    route="semantic",
-                    collection=collection_name,
-                    query=hypo,
-                    query_vec=hypo_vec,
-                    retrieve_k=min(route_retrieve, 16),
-                    return_k=return_k,
-                    top_k=top_k,
-                    subjects=subjects,
-                    timings=timings,
-                    boosts=boosts,
-                )
-                timings["hyde_ms"] = timings.get("hyde_ms", 0.0) + (time.perf_counter() - hyde_start) * 1000.0
-                if hyde_rows and isinstance(hyde_rows[0], dict) and hyde_rows[0].get("error"):
-                    return finalize(hyde_rows, "semantic")
-                for row in hyde_rows:
-                    if isinstance(row, dict) and "route" not in row:
-                        row["route"] = "semantic"
-                hyde_best = _best_score(hyde_rows)
-                if hyde_best >= ANSWERABILITY_THRESHOLD:
-                    hyde_rows.insert(0, {
-                        "note": "HyDE retry satisfied threshold",
-                        "base_route": route,
-                        "hyde_prompt_sha": hypo_data.get("prompt_sha"),
-                        "hyde_model": hypo_data.get("model"),
-                        "hyde_temperature": hypo_data.get("temperature"),
-                    })
-                    return finalize(hyde_rows, "semantic", hyde_used=True)
         return finalize([
             {
                 "abstain": True,
                 "reason": "low_answerability",
                 "top_score": best,
                 "threshold": ANSWERABILITY_THRESHOLD,
+                "suggestion": "client_generate_hypothesis",
             }
         ], route)
 
@@ -3866,7 +3761,7 @@ async def kb_search(
             rows = sparse_rows
             route = "sparse"
 
-    return finalize(rows, route, hyde_used)
+    return finalize(rows, route)
 
 if __name__ == "__main__":
     try:
