@@ -103,3 +103,9 @@ docker-compose.override.yml
 
 # Qdrant storage (if running without docker)
 qdrant_storage/
+
+# Evaluation gold sets (stored locally to avoid leaking source text)
+eval/gold_sets/*.jsonl
+eval/gold_sets/*.json
+!eval/gold_sets/README.md
+!eval/gold_sets/*_template.jsonl
