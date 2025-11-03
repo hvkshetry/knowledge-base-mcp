@@ -2,6 +2,8 @@
 *_kb/
 */kb/
 collections/
+!config/canaries/
+!config/canaries/*/
 
 # FTS Databases (generated from user's documents)
 data/*.db
@@ -22,6 +24,11 @@ claude_desktop_config.json
 
 # Claude Code settings (contains local paths and permissions)
 .claude/
+
+# Codex CLI settings (local paths/approvals)
+.codex/*
+!.codex/config.toml.example
+!.codex/AGENTS.md
 
 # Python virtual environment
 .venv/

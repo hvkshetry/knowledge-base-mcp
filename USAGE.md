@@ -224,6 +224,11 @@ python ingest.py \
 
 ## Search Modes
 
+All search routes return the same response schema so planners can swap modes without branching logic. Every hit includes:
+- `page_numbers` (canonical list of 1-based pages; `pages` mirrors it for backward compatibility)
+- `section_path`, `element_ids`, `table_headers`, `table_units`, and other structural metadata when available
+- `plan_hash`, `model_version`, and `prompt_sha` populated consistently across dense, sparse, and hybrid routes
+
 ### Semantic Search (`mode="semantic"`)
 
 **Method**: Pure vector similarity using dense embeddings.
@@ -383,13 +388,13 @@ data/
 
 - Enable via CLI `--sparse-expander splade` (defaults to env `SPARSE_EXPANDER`), falling back to a lightweight TF-style expander when SPLADE isn’t available.
 - During ingest each chunk stores a sparse term-weight dictionary in the FTS sidecar (`fts_chunks_sparse`).
-- Query-time, call `kb.sparse_splade_{slug}` (or let auto-route pick it) to use the expanded terms; MCP clients can mix with BM25 by calling both `kb.sparse_{slug}` and `kb.sparse_splade_{slug}`.
+- Query-time, call `kb.sparse_splade(collection="slug")` (or let auto-route pick it) to use the expanded terms; MCP clients can mix with BM25 by calling both `kb.sparse(collection="slug")` and `kb.sparse_splade(collection="slug")`.
 - Scores surface as `sparse_score` within the standard `scores` bucket so quality gates continue to work.
 
 ### ColBERT Late Interaction
 
 - Configure a ColBERT service (e.g., `colbertv2` + Faiss) and set `COLBERT_URL` (and optional `COLBERT_TIMEOUT`).
-- `kb.colbert_{slug}` invokes the service with `POST {COLBERT_URL}/query` and expects `{"results": [{"chunk_id": ..., "doc_id": ..., "score": ...}, ...]}`.
+- `kb.colbert(collection="slug")` invokes the service with `POST {COLBERT_URL}/query` and expects `{"results": [{"chunk_id": ..., "doc_id": ..., "score": ...}, ...]}`.
 - Auto routing (`mode="auto"`) will prefer ColBERT for question-style queries when the service is available; call it explicitly when you want late-interaction reranking.
 - Returned rows include `colbert_score` under `scores.dense`, so quality gates can reason about confidence alongside other routes.
 
@@ -488,8 +493,8 @@ RERANK_MAX_ITEMS=16    # Max number of items to rerank
 
 Two lightweight stores are built during ingest:
 
-- `GRAPH_DB_PATH` – documents, sections, chunks, and heuristic entity nodes linked by `contains`/`mentions` edges. Use `entities_{slug}` to browse by type, `linkouts_{slug}` to jump straight to supporting chunks, and `graph_{slug}` for raw neighbor walks.
-- `SUMMARY_DB_PATH` – RAPTOR-style section synopses with element IDs. Use `summary_{slug}` to retrieve.
+- `GRAPH_DB_PATH` – documents, sections, chunks, and heuristic entity nodes linked by `contains`/`mentions` edges. Use `kb.entities(collection="slug")` to browse by type, `kb.linkouts(entity_id=...)` to jump straight to supporting chunks, and `kb.graph(node_id=...)` for raw neighbor walks.
+- `SUMMARY_DB_PATH` – RAPTOR-style section synopses with element IDs. Use `kb.summary(collection="slug")` to retrieve.
 
 **Entity tips**
 - Table rows add parameter nodes automatically; `linkouts_*` returns the chunk ids so you can follow up with `open_*`.
@@ -498,15 +503,17 @@ Two lightweight stores are built during ingest:
 
 ### MCP Utility Tools
 
-- `open_{slug}`: fetch a specific chunk by `chunk_id`/`element_id`, optionally slicing text.
-- `neighbors_{slug}`: pull BM25 neighbors around a chunk for more context.
-- `summary_{slug}`: retrieve stored section summaries + citations.
-- `entities_{slug}`: list graph entities for the collection, filterable by `type` and substring.
-- `linkouts_{slug}`: enumerate chunks/sections that reference an entity node (pair with `open_*`).
-- `graph_{slug}`: inspect the neighbourhood in the knowledge graph for any node id.
-- `sparse_splade_{slug}`: run sparse expansion retrieval (SPLADE/basic) on demand.
-- `colbert_{slug}`: route a query through the ColBERT late-interaction service when configured.
-- `ingest.assess_quality`: returns chunk stats plus canary query results (configured under `config/canaries/`).
+- `kb.collections`: enumerate configured collection slugs and their underlying Qdrant/FTS names.
+- `kb.open(collection="slug", ...)`: fetch a specific chunk by `chunk_id`/`element_id`, optionally slicing text.
+- `kb.neighbors(collection="slug", chunk_id=...)`: pull BM25 neighbors around a chunk for more context.
+- `kb.summary(collection="slug", topic=...)`: retrieve stored section summaries + citations (only populated if you run a summary build step; defaults to `no_matches`).
+- `kb.entities(collection="slug", ...)`: list graph entities for the collection, filterable by `type` and substring.
+- `kb.linkouts(entity_id=...)`: enumerate chunks/sections that reference an entity node (pair with `kb.open`).
+- `kb.graph(node_id=...)`: inspect the neighbourhood in the knowledge graph for any node id.
+- `kb.sparse_splade(collection="slug")`: run sparse expansion retrieval when a SPLADE expander is configured (returns an error if `SPARSE_EXPANDER` is left at the default `none`).
+- `kb.colbert(collection="slug")`: route a query through the ColBERT late-interaction service when `COLBERT_URL` points at a running ColBERT instance.
+- `kb.quality(collection="slug", query="...")`: score retrieved hits against rules (min score, metadata/plan hash/table requirements). The response includes coverage stats, doc concentration warnings, and score summaries so the MCP client can act as the critic.
+- `ingest.assess_quality`: returns chunk stats plus canary query results (configure your own queries under `config/canaries/`; the defaults are placeholders).
 - `ingest.enhance`: supports safe incremental fixes (`add_synonyms`, `link_crossrefs`, `fix_table_pages`) without full re-ingest.
 
 All tools hydrate snippets through the ACL-enforcing document store.
@@ -579,7 +586,7 @@ score(doc) = Σ [1 / (K + rank_i(doc))]
      --collection daf_kb \
      --fts-only
    ```
-   Inspect a Qdrant point (via the UI or the API) to confirm payloads only carry provenance while `open_{slug}` still dereferences text.
+   Inspect a Qdrant point (via the UI or the API) to confirm payloads only carry provenance while `kb.open(collection="slug")` still dereferences text.
 
 ### Stage 1 – Deterministic Ingestion Plans
 
@@ -592,9 +599,9 @@ score(doc) = Σ [1 / (K + rank_i(doc))]
    Re-run the sequence—`plan_hash`, chunk previews, and `data/ingest_plans/<doc>.plan.json` should be identical.
 2. **Table indexing sanity check**
    ```bash
-   python -m fastmcp.client call table_daf_kb query="design MLSS" limit=3
+  python -m fastmcp.client call kb.table collection="daf_kb" query="design MLSS" limit=3
    ```
-   Rows return `type="table_row"` with headers/units. Follow up with `open_daf_kb` to fetch the exact span.
+  Rows return `type="table_row"` with headers/units. Follow up with `kb.open collection="daf_kb" chunk_id=<id>` to fetch the exact span.
 3. **Metadata budget + quality**
    ```bash
    python -m fastmcp.client call ingest.generate_metadata doc_id=<uuid>

@@ -1,0 +1,27 @@
+{
+  "daf_kb": {
+    "queries": [
+      {
+        "prompt": "What does DAF stand for in wastewater treatment?",
+        "mode": "hybrid",
+        "top_k": 5,
+        "retrieve_k": 24,
+        "return_k": 5
+      },
+      {
+        "prompt": "List the main equipment stages in a dissolved air flotation plant.",
+        "mode": "hybrid",
+        "top_k": 5,
+        "retrieve_k": 24,
+        "return_k": 5
+      },
+      {
+        "prompt": "How is pressurised recycle flow used in dissolved air flotation systems?",
+        "mode": "hybrid",
+        "top_k": 5,
+        "retrieve_k": 24,
+        "return_k": 5
+      }
+    ]
+  }
+}

@@ -133,6 +133,36 @@ def l2norm(vec: List[float]) -> List[float]:
     return [x / n for x in vec]
 
 
+QUALITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+
+
+def _tokenize_quality(text: Optional[str]) -> List[str]:
+    if not text:
+        return []
+    return [tok.lower() for tok in QUALITY_TOKEN_RE.findall(text)]
+
+
+def _coverage_ratio(tokens: List[str], text: Optional[str]) -> float:
+    if not tokens:
+        return 0.0
+    content = (text or "").lower()
+    if not content:
+        return 0.0
+    hits = sum(1 for tok in tokens if tok in content)
+    return hits / max(len(tokens), 1)
+
+
+def _summarize(values: List[float]) -> Optional[Dict[str, float]]:
+    if not values:
+        return None
+    return {
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+        "avg": round(sum(values) / len(values), 4),
+        "count": len(values),
+    }
+
+
 async def embed_query(text: str, normalize: bool = True) -> List[float]:
     try:
         r = await asyncio.to_thread(
@@ -284,7 +314,6 @@ async def _run_colbert(
             "chunk_start": base.get("chunk_start"),
             "chunk_end": base.get("chunk_end"),
             "text": base.get("text"),
-            "pages": base.get("pages"),
             "section_path": base.get("section_path"),
             "element_ids": base.get("element_ids"),
             "bboxes": base.get("bboxes"),
@@ -306,6 +335,7 @@ async def _run_colbert(
                 final=score,
             ),
         }
+        _set_page_fields(row, base)
         _ensure_score_bucket(row)["prior"] = prior_mult
         rows.append(row)
     await _ensure_row_texts(rows, collection, subjects)
@@ -394,19 +424,27 @@ def _parse_page_numbers(value: Any) -> List[int]:
     if isinstance(value, list):
         return [int(v) for v in value if isinstance(v, (int, float))]
     if isinstance(value, str):
-        nums = []
-        for part in value.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                nums.append(int(part))
-            except ValueError:
-                continue
-        return nums
+        digits = re.findall(r"\d+", value)
+        return [int(d) for d in digits]
     if isinstance(value, (int, float)):
         return [int(value)]
     return []
+
+
+def _canonical_page_numbers(source: Any) -> List[int]:
+    if isinstance(source, dict):
+        candidate = source.get("page_numbers")
+        if candidate in (None, "", []):
+            candidate = source.get("pages")
+    else:
+        candidate = source
+    return _parse_page_numbers(candidate)
+
+
+def _set_page_fields(row: Dict[str, Any], source: Any) -> None:
+    pages = _canonical_page_numbers(source)
+    row["page_numbers"] = pages
+    row["pages"] = list(pages)
 
 
 async def _run_canaries(doc_id: str, chunk_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -683,6 +721,12 @@ def _load_plan(doc_id: str) -> Dict[str, Any]:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    legacy_path = PLAN_DIR / f"{doc_id}.json"
+    if legacy_path.exists():
+        try:
+            return json.loads(legacy_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
@@ -1233,8 +1277,6 @@ async def _hydrate_qdrant_hits(hits) -> None:
                 elif value not in (None, ""):
                     payload[key] = _coerce_json(value)
         setattr(h, "payload", payload)
-
-
 async def _ensure_row_texts(
     rows: List[Dict[str, Any]],
     collection: Optional[str],
@@ -1248,6 +1290,25 @@ async def _ensure_row_texts(
         if chunk_id:
             missing.append(chunk_id)
     fetched = await _fetch_chunks_by_ids(missing)
+    missing_qdrant = [cid for cid in missing if cid not in fetched]
+    if missing_qdrant and collection:
+        try:
+            records = await asyncio.to_thread(
+                qdr.retrieve,
+                collection_name=collection,
+                ids=missing_qdrant,
+                with_vectors=False,
+                with_payload=True,
+            )
+            for rec in records or []:
+                cid = str(getattr(rec, "id", ""))
+                if not cid or cid in fetched:
+                    continue
+                payload = rec.payload or {}
+                payload.setdefault("chunk_id", cid)
+                fetched[cid] = payload
+        except Exception as exc:
+            logger.debug("qdrant retrieve fallback failed: %s", exc)
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1257,9 +1318,14 @@ async def _ensure_row_texts(
         doc_id = row.get("doc_id") or (info.get("doc_id") if info else None)
         allowed = doc_store.is_allowed(str(doc_id) if doc_id else None, collection, subjects)
         doc_store.build_row(row, info, allowed, include_text=False)
-        page_numbers = row.get("page_numbers")
-        if isinstance(page_numbers, str):
-            row["page_numbers"] = _parse_page_numbers(page_numbers)
+        source_for_pages = info or row
+        _set_page_fields(row, source_for_pages)
+        if info:
+            for key in ("plan_hash", "model_version", "prompt_sha"):
+                if row.get(key) in (None, ""):
+                    val = info.get(key)
+                    if val not in (None, ""):
+                        row[key] = val
         if allowed:
             row.pop("forbidden", None)
             row.pop("reason", None)
@@ -1272,7 +1338,7 @@ async def _ensure_row_texts(
         else:
             row.pop("text", None)
             row.setdefault("reason", "access_denied")
-        for key in ("pages", "section_path", "element_ids", "bboxes", "types", "source_tools"):
+        for key in ("section_path", "element_ids", "bboxes", "types", "source_tools"):
             value = row.get(key)
             if isinstance(value, str) and value:
                 try:
@@ -1297,8 +1363,6 @@ async def _ensure_row_texts(
                 row["doc_metadata"] = json.loads(dm)
             except Exception:
                 pass
-
-
 def _extract_score(row: Dict[str, Any]) -> float:
     for key in ("final_score", "score", "rerank_score", "rrf_score", "dense_score"):
         val = row.get(key)
@@ -1463,7 +1527,6 @@ async def _run_semantic(
             "chunk_start": pl.get("chunk_start"),
             "chunk_end": pl.get("chunk_end"),
             "text": pl.get("text"),
-            "pages": pl.get("page_numbers") or pl.get("pages"),
             "section_path": pl.get("section_path"),
             "element_ids": pl.get("element_ids"),
             "bboxes": pl.get("bboxes"),
@@ -1485,6 +1548,7 @@ async def _run_semantic(
                 final=final_score,
             ),
         }
+        _set_page_fields(row, pl)
         _ensure_score_bucket(row)["prior"] = prior_mult
         rows.append(row)
     await _ensure_row_texts(rows, collection, subjects)
@@ -1535,7 +1599,6 @@ async def _run_sparse(
             "chunk_start": item.get("chunk_start"),
             "chunk_end": item.get("chunk_end"),
             "text": item.get("text"),
-            "pages": item.get("pages"),
             "section_path": item.get("section_path"),
             "element_ids": item.get("element_ids"),
             "bboxes": item.get("bboxes"),
@@ -1557,6 +1620,7 @@ async def _run_sparse(
                 final=score,
             ),
         })
+        _set_page_fields(rows[-1], item)
         _ensure_score_bucket(rows[-1])["prior"] = prior_mult
     await _ensure_row_texts(rows, collection, subjects)
     _annotate_rows(rows, query)
@@ -1615,7 +1679,6 @@ async def _run_sparse_splade(
             "chunk_start": item.get("chunk_start"),
             "chunk_end": item.get("chunk_end"),
             "text": item.get("text"),
-            "pages": item.get("pages"),
             "section_path": item.get("section_path"),
             "element_ids": item.get("element_ids"),
             "bboxes": item.get("bboxes"),
@@ -1637,6 +1700,7 @@ async def _run_sparse_splade(
                 final=score,
             ),
         })
+        _set_page_fields(rows[-1], item)
         _ensure_score_bucket(rows[-1])["prior"] = prior_mult
     await _ensure_row_texts(rows, collection, subjects)
     _annotate_rows(rows, query)
@@ -1706,7 +1770,6 @@ async def _run_rerank(
                 "chunk_start": pl.get("chunk_start"),
                 "chunk_end": pl.get("chunk_end"),
                 "text": pl.get("text"),
-                "pages": pl.get("page_numbers") or pl.get("pages"),
                 "section_path": pl.get("section_path"),
                 "element_ids": pl.get("element_ids"),
                 "bboxes": pl.get("bboxes"),
@@ -1728,6 +1791,7 @@ async def _run_rerank(
                     final=dense_val,
                 ),
             })
+            _set_page_fields(fallback_rows[-1], pl)
         await _ensure_row_texts(fallback_rows, collection, subjects)
         _annotate_rows(fallback_rows, query)
         return fallback_rows
@@ -1738,8 +1802,6 @@ async def _run_rerank(
     rerank_stats = (min(rerank_values), max(rerank_values)) if rerank_values else None
     scored = []
     decay_map: Dict[int, float] = {}
-    prior_map: Dict[int, float] = {}
-    prior_map: Dict[int, float] = {}
     prior_map: Dict[int, float] = {}
     for o in order:
         idx = o.get("index", 0)
@@ -1783,7 +1845,6 @@ async def _run_rerank(
             "chunk_start": payload.get("chunk_start"),
             "chunk_end": payload.get("chunk_end"),
             "text": payload.get("text"),
-            "pages": payload.get("page_numbers") or payload.get("pages"),
             "section_path": payload.get("section_path"),
             "element_ids": payload.get("element_ids"),
             "bboxes": payload.get("bboxes"),
@@ -1805,6 +1866,7 @@ async def _run_rerank(
                 final=final_scores.get(idx, 0.0),
             ),
         }
+        _set_page_fields(row, payload)
         _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
             neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
@@ -1865,7 +1927,6 @@ async def _run_hybrid(
             "mtime": payload.get("mtime"),
             "text": payload.get("text"),
             "dense_score": getattr(h, "score", None),
-            "pages": payload.get("page_numbers") or payload.get("pages"),
             "section_path": payload.get("section_path"),
             "element_ids": payload.get("element_ids"),
             "bboxes": payload.get("bboxes"),
@@ -1875,6 +1936,7 @@ async def _run_hybrid(
             "table_units": payload.get("table_units"),
             "_prior_mult": prior_mult,
         })
+        _set_page_fields(dense_list[-1], payload)
 
     fts_list: List[Dict[str, Any]] = list(lexical_hits)
     fused = _rrf_fuse([dense_list, fts_list], id_getter=lambda x: x.get("chunk_id"))
@@ -1922,7 +1984,6 @@ async def _run_hybrid(
                 "chunk_start": x.get("chunk_start"),
                 "chunk_end": x.get("chunk_end"),
                 "text": x.get("text"),
-                "pages": x.get("pages"),
                 "section_path": x.get("section_path"),
                 "element_ids": x.get("element_ids"),
                 "bboxes": x.get("bboxes"),
@@ -1944,6 +2005,7 @@ async def _run_hybrid(
                     final=final,
                 ),
             })
+            _set_page_fields(fallback_rows[-1], x)
             _ensure_score_bucket(fallback_rows[-1])["prior"] = prior_mult
         await _ensure_row_texts(fallback_rows, collection, subjects)
         _annotate_rows(fallback_rows, query)
@@ -1957,6 +2019,7 @@ async def _run_hybrid(
     rerank_stats = (min(rerank_values), max(rerank_values)) if rerank_values else None
     scored = []
     decay_map: Dict[int, float] = {}
+    prior_map: Dict[int, float] = {}
     for o in order:
         idx = o.get("index", 0)
         base = float(o.get("score", 0.0) or 0.0)
@@ -2001,7 +2064,6 @@ async def _run_hybrid(
             "chunk_start": x.get("chunk_start"),
             "chunk_end": x.get("chunk_end"),
             "text": x.get("text"),
-            "pages": x.get("pages"),
             "section_path": x.get("section_path"),
             "element_ids": x.get("element_ids"),
             "bboxes": x.get("bboxes"),
@@ -2023,6 +2085,7 @@ async def _run_hybrid(
                 final=final_scores.get(idx, 0.0),
             ),
         }
+        _set_page_fields(row, x)
         _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
             neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
@@ -2067,969 +2130,1060 @@ async def _execute_search(
 
 
 # ---- Register search tools per scope ---------------------------------------
-def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> None:
-    sparse_tool_name = f"sparse_{slug}"
-    dense_tool_name = f"dense_{slug}"
-    hybrid_tool_name = f"hybrid_{slug}"
-    rerank_tool_name = f"rerank_{slug}"
-    colbert_tool_name = f"colbert_{slug}"
-    batch_tool_name = f"batch_{slug}"
-    quality_tool_name = f"quality_{slug}"
-    sparse_title = f"{title or slug}: Sparse Search"
-    splade_tool_name = f"sparse_splade_{slug}"
-    splade_title = f"{title or slug}: SPLADE Sparse Search"
-    dense_title = f"{title or slug}: Dense Search"
-    hybrid_title = f"{title or slug}: Hybrid Search"
-    rerank_title = f"{title or slug}: Rerank Search"
-    colbert_title = f"{title or slug}: ColBERT Search"
-    batch_title = f"{title or slug}: Batch Search"
-    quality_title = f"{title or slug}: Inspect Hits"
+def _resolve_scope(collection: Optional[str]) -> Tuple[str, str, str]:
+    if not SCOPES:
+        raise ValueError("NOMIC_KB_SCOPES is empty; configure at least one collection")
+    if collection:
+        key = collection.strip()
+        if not key:
+            raise ValueError("collection argument was empty")
+        if key in SCOPES:
+            cfg = SCOPES[key]
+            return key, cfg["collection"], cfg.get("title") or key
+        lowered = key.lower()
+        for slug, cfg in SCOPES.items():
+            title = (cfg.get("title") or slug or "").lower()
+            if cfg.get("collection") == key or title == lowered:
+                return slug, cfg["collection"], cfg.get("title") or slug
+        raise ValueError(f"Unknown collection '{collection}'. Known entries: {sorted(SCOPES)}")
+    slug, cfg = next(iter(SCOPES.items()))
+    return slug, cfg["collection"], cfg.get("title") or slug
 
-    @mcp.tool(name=sparse_tool_name, title=sparse_title)
-    async def sparse_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_sparse(
-            collection,
-            query,
-            retrieve_k,
-            return_k,
-            retrieve_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "sparse",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
+# ---- Unified retrieval tools (collection parameter required) --------------
 
-    @mcp.tool(name=splade_tool_name, title=splade_title)
-    async def sparse_splade_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not HAVE_SPARSE_SPLADE:
-            return {"error": "sparse_expander_disabled"}
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_sparse_splade(
-            collection,
-            query,
-            retrieve_k,
-            return_k,
-            retrieve_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "sparse_splade",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
-    @mcp.tool(name=colbert_tool_name, title=colbert_title)
-    async def colbert_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        if not HAVE_COLBERT:
-            return {"error": "colbert_service_unavailable"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_colbert(
-            collection,
-            query,
-            retrieve_k,
-            return_k,
-            retrieve_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "colbert",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
-
-    @mcp.tool(name=dense_tool_name, title=dense_title)
-    async def dense_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        query_vec = await embed_query(query)
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_semantic(
-            collection,
-            query,
-            query_vec,
-            retrieve_k,
-            return_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "semantic",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
-
-    @mcp.tool(name=hybrid_tool_name, title=hybrid_title)
-    async def hybrid_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        top_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        top_k = max(return_k, min(int(top_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        query_vec = await embed_query(query)
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_hybrid(
-            collection,
-            query,
-            query_vec,
-            retrieve_k,
-            return_k,
-            top_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "hybrid",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
-
-    @mcp.tool(name=rerank_tool_name, title=rerank_title)
-    async def rerank_tool(
-        ctx: Context,
-        query: str,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        top_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        retrieve_k = max(1, min(int(retrieve_k), RERANK_MAX_ITEMS))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        top_k = max(return_k, min(int(top_k), retrieve_k))
-        subjects = get_subjects_from_context(ctx)
-        timings: Dict[str, float] = {}
-        query_vec = await embed_query(query)
-        boosts = _parse_scope_boosts(scope)
-        rows = await _run_rerank(
-            collection,
-            query,
-            query_vec,
-            retrieve_k,
-            return_k,
-            top_k,
-            subjects,
-            timings,
-            boosts,
-        )
-        best = _best_score(rows)
-        result = {
-            "rows": rows,
-            "timings": {k: round(v, 3) for k, v in timings.items()},
-            "route": "rerank",
-            "best_score": best,
-        }
-        if boosts:
-            result["boosts"] = boosts
-        if best < ANSWERABILITY_THRESHOLD:
-            result.update({
-                "abstain": True,
-                "reason": "best_score_below_threshold",
-                "threshold": ANSWERABILITY_THRESHOLD,
-            })
-        return result
-
-    @mcp.tool(name=batch_tool_name, title=batch_title)
-    async def batch_tool(
-        ctx: Context,
-        queries: List[str],
-        routes: Optional[List[str]] = None,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-        scopes: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(queries, list) or not queries:
-            return {"error": "missing_queries"}
-        retrieve_k = max(1, min(int(retrieve_k), 256))
-        return_k = max(1, min(int(return_k), retrieve_k))
-        if routes and len(routes) != len(queries):
-            return {"error": "routes_length_mismatch"}
-        use_routes = routes or ["auto"] * len(queries)
-        subjects = get_subjects_from_context(ctx)
-        results: List[Dict[str, Any]] = []
-        for idx, (query, route) in enumerate(zip(queries, use_routes)):
-            q = (query or "").strip()
-            if not q:
-                results.append({"index": idx, "query": query, "route": route, "error": "empty_query"})
-                continue
-            timings: Dict[str, float] = {}
-            route_norm = route.lower()
-            if route_norm not in {"sparse", "sparse_splade", "semantic", "rerank", "hybrid", "colbert", "auto"}:
-                results.append({"index": idx, "query": query, "route": route, "error": "invalid_route"})
-                continue
-            boosts = None
-            if scopes and idx < len(scopes):
-                boosts = _parse_scope_boosts(scopes[idx])
-            elif scope:
-                boosts = _parse_scope_boosts(scope)
-            try:
-                query_vec = []
-                if route_norm in {"semantic", "rerank", "hybrid", "auto"}:
-                    query_vec = await embed_query(q)
-                rows = await _execute_search(
-                    route_norm,
-                    collection,
-                    q,
-                    query_vec,
-                    retrieve_k,
-                    return_k,
-                    max(return_k, retrieve_k),
-                    subjects,
-                    timings,
-                    boosts,
-                )
-                best = _best_score(rows)
-                result_entry = {
-                    "index": idx,
-                    "query": q,
-                    "route": route_norm,
-                    "rows": rows,
-                    "timings": {k: round(v, 3) for k, v in timings.items()},
-                    "best_score": best,
-                }
-                if boosts:
-                    result_entry["boosts"] = boosts
-                if best < ANSWERABILITY_THRESHOLD:
-                    result_entry.update({
-                        "abstain": True,
-                        "reason": "best_score_below_threshold",
-                        "threshold": ANSWERABILITY_THRESHOLD,
-                    })
-                results.append(result_entry)
-            except Exception as exc:
-                results.append({"index": idx, "query": q, "route": route_norm, "error": str(exc)})
-        return {"results": results}
-
-    @mcp.tool(name=quality_tool_name, title=quality_title)
-    async def quality_tool(
-        ctx: Context,
-        hits: List[Dict[str, Any]],
-        rules: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        rules = rules or {}
-        min_score = float(rules.get("min_score", ANSWERABILITY_THRESHOLD))
-        require_metadata = bool(rules.get("require_metadata", False))
-        require_plan_hash = bool(rules.get("require_plan_hash", False))
-        failures: List[str] = []
-        valid_hits = [hit for hit in hits if isinstance(hit, dict)] if hits else []
-        for idx, hit in enumerate(valid_hits):
-            score = hit.get("final_score")
-            if score is None:
-                score = hit.get("score")
-            try:
-                score_val = float(score)
-            except Exception:
-                score_val = 0.0
-            if score_val < min_score:
-                failures.append(f"hit_{idx}_score_below_min")
-            if require_metadata and not hit.get("doc_metadata"):
-                failures.append(f"hit_{idx}_missing_metadata")
-            if require_plan_hash and not hit.get("plan_hash"):
-                failures.append(f"hit_{idx}_missing_plan_hash")
-        passed = not failures
-        return {
-            "pass": passed,
-            "failures": failures,
-            "evaluated": len(valid_hits),
-            "rules": {
-                "min_score": min_score,
-                "require_metadata": require_metadata,
-                "require_plan_hash": require_plan_hash,
-            },
-        }
-
-    hint_tool_name = f"hint_{slug}"
-    hint_title = f"{title or slug}: Sparse Hints"
-
-    @mcp.tool(name=hint_tool_name, title=hint_title)
-    async def hint_tool(
-        ctx: Context,
-        term: Optional[str] = None,
-        terms: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        seeds: List[str] = []
-        if term:
-            seeds.append(str(term))
-        if isinstance(terms, list):
-            seeds.extend(str(t) for t in terms if t)
-        seeds = [s for s in map(str.strip, seeds) if s]
-        if not seeds:
-            return {"error": "missing_terms"}
-        expansions: Dict[str, List[str]] = {}
-        for seed in seeds:
-            upper = seed.upper()
-            matches: List[str] = []
-            alias_list = ALIASES.get(upper)
-            if alias_list:
-                matches.extend(alias_list)
-            for key, synonyms in ALIASES.items():
-                bucket = [key] + synonyms
-                if any(seed.lower() == entry.lower() for entry in bucket):
-                    matches.extend(bucket)
-            normalized = []
-            for candidate in matches:
-                if candidate.lower() != seed.lower() and candidate not in normalized:
-                    normalized.append(candidate)
-            expansions[seed] = normalized
-        _audit("hint", {
-            "slug": slug,
-            "terms": seeds,
-            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+@mcp.tool(name="kb.sparse", title="KB: Sparse Search")
+async def kb_sparse(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_sparse(
+        collection_name,
+        query,
+        retrieve_k,
+        return_k,
+        retrieve_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "sparse",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
         })
-        return {
-            "terms": seeds,
-            "expansions": expansions,
-            "alias_count": len(ALIASES),
-        }
+    return result
 
-    hyde_tool_name = f"hyde_{slug}"
-    hyde_title = f"{title or slug}: HyDE Hint"
-
-    @mcp.tool(name=hyde_tool_name, title=hyde_title)
-    async def hyde_tool(ctx: Context, query: str) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        hypothesis = await hyde(query)
-        _audit("hyde_hint", {
-            "slug": slug,
-            "query": query,
-            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+@mcp.tool(name="kb.sparse_splade", title="KB: SPLADE Sparse Search")
+async def kb_sparse_splade(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not HAVE_SPARSE_SPLADE:
+        return {"error": "sparse_expander_disabled"}
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_sparse_splade(
+        collection_name,
+        query,
+        retrieve_k,
+        return_k,
+        retrieve_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "sparse_splade",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
         })
-        return {
-            "query": query,
-            "hypothesis": hypothesis,
-            "model_version": INGEST_MODEL_VERSION,
-            "prompt_sha": INGEST_PROMPT_SHA,
-        }
+    return result
 
-    table_tool_name = f"table_{slug}"
-    table_title = f"{title or slug}: Table Lookup"
-
-    @mcp.tool(name=table_tool_name, title=table_title)
-    async def table_lookup(
-        ctx: Context,
-        query: str,
-        doc_id: Optional[str] = None,
-        limit: int = 10,
-        where: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        if not isinstance(query, str) or not query.strip():
-            return {"error": "empty_query"}
-        limit = max(1, min(int(limit), 50))
-        fetch_limit = max(limit * 3, limit)
-        raw_hits = await asyncio.to_thread(_fts_search, query, fetch_limit)
-        filtered: List[Dict[str, Any]] = []
-        target_doc = str(doc_id) if doc_id else None
-        where = where or {}
-        for item in raw_hits:
-            if target_doc and str(item.get("doc_id")) != target_doc:
-                continue
-            if not _is_table_row(item.get("types")):
-                continue
-            text = (item.get("text") or "").lower()
-            ok = True
-            for key, val in where.items():
-                if key and str(key).lower() not in text:
-                    ok = False
-                    break
-                if val and str(val).lower() not in text:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            filtered.append(item)
-            if len(filtered) >= limit:
-                break
-        await _ensure_row_texts(filtered, collection, get_subjects_from_context(ctx))
-        for row in filtered:
-            row.setdefault("route", "table")
-        filtered = [row for row in filtered if _is_allowed_path(row.get("path"))]
-        _audit("table_lookup", {
-            "slug": slug,
-            "query": query,
-            "doc_id": doc_id,
-            "count": len(filtered),
-            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+@mcp.tool(name="kb.dense", title="KB: Dense Search")
+async def kb_dense(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    query_vec = await embed_query(query)
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_semantic(
+        collection_name,
+        query,
+        query_vec,
+        retrieve_k,
+        return_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "semantic",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
         })
-        return {
-            "query": query,
-            "doc_id": doc_id,
-            "rows": filtered,
-            "limit": limit,
-        }
+    return result
 
-    outline_tool_name = f"outline_{slug}"
-    outline_title = f"{title or slug}: Outline"
+@mcp.tool(name="kb.hybrid", title="KB: Hybrid Search")
+async def kb_hybrid(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    top_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    top_k = max(return_k, min(int(top_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    query_vec = await embed_query(query)
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_hybrid(
+        collection_name,
+        query,
+        query_vec,
+        retrieve_k,
+        return_k,
+        top_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "hybrid",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
+        })
+    return result
 
-    @mcp.tool(name=outline_tool_name, title=outline_title)
-    async def outline_tool(ctx: Context, doc_id: str) -> Dict[str, Any]:
-        if not doc_id:
-            return {"error": "missing_doc_id"}
-        conn = sqlite3.connect(FTS_DB_PATH)
+@mcp.tool(name="kb.rerank", title="KB: Rerank Search")
+async def kb_rerank(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    top_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), RERANK_MAX_ITEMS))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    top_k = max(return_k, min(int(top_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    query_vec = await embed_query(query)
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_rerank(
+        collection_name,
+        query,
+        query_vec,
+        retrieve_k,
+        return_k,
+        top_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "rerank",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
+        })
+    return result
+
+@mcp.tool(name="kb.colbert", title="KB: ColBERT Search")
+async def kb_colbert(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    if not HAVE_COLBERT:
+        return {"error": "colbert_service_unavailable"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    subjects = get_subjects_from_context(ctx)
+    timings: Dict[str, float] = {}
+    boosts = _parse_scope_boosts(scope)
+    rows = await _run_colbert(
+        collection_name,
+        query,
+        retrieve_k,
+        return_k,
+        retrieve_k,
+        subjects,
+        timings,
+        boosts,
+    )
+    best = _best_score(rows)
+    result = {
+        "collection": collection_name,
+        "slug": slug,
+        "rows": rows,
+        "timings": {k: round(v, 3) for k, v in timings.items()},
+        "route": "colbert",
+        "best_score": best,
+    }
+    if boosts:
+        result["boosts"] = boosts
+    if best < ANSWERABILITY_THRESHOLD:
+        result.update({
+            "abstain": True,
+            "reason": "best_score_below_threshold",
+            "threshold": ANSWERABILITY_THRESHOLD,
+        })
+    return result
+
+@mcp.tool(name="kb.batch", title="KB: Batch Search")
+async def kb_batch(
+    ctx: Context,
+    queries: List[str],
+    routes: Optional[List[str]] = None,
+    collection: Optional[str] = None,
+    collections: Optional[List[str]] = None,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+    scopes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(queries, list) or not queries:
+        return {"error": "missing_queries"}
+    retrieve_k = max(1, min(int(retrieve_k), 256))
+    return_k = max(1, min(int(return_k), retrieve_k))
+    if routes and len(routes) != len(queries):
+        return {"error": "routes_length_mismatch"}
+    use_routes = routes or ["auto"] * len(queries)
+    subjects = get_subjects_from_context(ctx)
+    results: List[Dict[str, Any]] = []
+    for idx, (query, route) in enumerate(zip(queries, use_routes)):
+        q = (query or "").strip()
+        if not q:
+            results.append({"index": idx, "query": query, "route": route, "error": "empty_query"})
+            continue
+        route_norm = route.lower()
+        valid_routes = {"sparse", "sparse_splade", "semantic", "rerank", "hybrid", "colbert", "auto"}
+        if route_norm not in valid_routes:
+            results.append({"index": idx, "query": query, "route": route, "error": "invalid_route"})
+            continue
+        coll_name = collections[idx] if collections and idx < len(collections) else collection
         try:
-            cur = conn.execute(
-                "SELECT text, section_path, pages, chunk_start, chunk_end FROM fts_chunks WHERE doc_id = ? AND types LIKE '%heading%' ORDER BY chunk_start",
-                (doc_id,),
-            )
-            outline: List[Dict[str, Any]] = []
-            for text, section_path, pages, chunk_start, chunk_end in cur.fetchall():
-                try:
-                    section = json.loads(section_path) if isinstance(section_path, str) else section_path
-                except Exception:
-                    section = section_path
-                pages_list = _parse_page_numbers(pages)
-                outline.append(
-                    {
-                        "heading": text,
-                        "section_path": section or [],
-                        "pages": pages_list,
-                        "chunk_start": chunk_start,
-                        "chunk_end": chunk_end,
-                    }
-                )
-        finally:
-            conn.close()
-        _audit("outline", {
-            "slug": slug,
-            "doc_id": doc_id,
-            "count": len(outline),
-            "subjects": _audit_subjects(get_subjects_from_context(ctx)),
-        })
-        return {"doc_id": doc_id, "outline": outline}
-
-    promote_tool_name = f"promote_{slug}"
-    demote_tool_name = f"demote_{slug}"
-    promote_title = f"{title or slug}: Promote Doc"
-    demote_title = f"{title or slug}: Demote Doc"
-
-    @mcp.tool(name=promote_tool_name, title=promote_title)
-    async def promote_tool(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
-        if not doc_id:
-            return {"error": "missing_doc_id"}
-        subjects = get_subjects_from_context(ctx)
-        multiplier = _update_session_prior(subjects, doc_id, abs(weight))
-        key = _session_key(subjects)
-        delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
-        _audit("promote", {
-            "slug": slug,
-            "doc_id": doc_id,
-            "delta": delta,
-            "subjects": _audit_subjects(subjects),
-        })
-        return {
-            "doc_id": doc_id,
-            "prior_delta": delta,
-            "multiplier": multiplier,
-        }
-
-    @mcp.tool(name=demote_tool_name, title=demote_title)
-    async def demote_tool(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
-        if not doc_id:
-            return {"error": "missing_doc_id"}
-        subjects = get_subjects_from_context(ctx)
-        multiplier = _update_session_prior(subjects, doc_id, -abs(weight))
-        key = _session_key(subjects)
-        delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
-        _audit("demote", {
-            "slug": slug,
-            "doc_id": doc_id,
-            "delta": delta,
-            "subjects": _audit_subjects(subjects),
-        })
-        return {
-            "doc_id": doc_id,
-            "prior_delta": delta,
-            "multiplier": multiplier,
-        }
-
-    tool_name = f"search_{slug}"
-    tool_title = f"{title or slug}: Search"
-
-    @mcp.tool(name=tool_name, title=tool_title)
-    async def search(
-        ctx: Context,
-        query: str,
-        mode: str = "rerank",  # "semantic", "rerank", "hybrid", or "auto"
-        top_k: int = 8,
-        retrieve_k: int = 24,
-        return_k: int = 8,
-        scope: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Vector search (semantic), vector+rerank, hybrid, or auto-planned retrieval."""
-        start_time = time.perf_counter()
+            slug, collection_name, _ = _resolve_scope(coll_name)
+        except Exception as exc:
+            results.append({"index": idx, "query": query, "route": route_norm, "error": str(exc)})
+            continue
         timings: Dict[str, float] = {}
-        route_retrieve_val = retrieve_k
-        boosts = _parse_scope_boosts(scope)
-
-        def finalize(rows: List[Dict[str, Any]], route_name: str, hyde_used: bool = False) -> List[Dict[str, Any]]:
-            duration_ms = (time.perf_counter() - start_time) * 1000.0
-            clean_rows = [r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")]
-            best_score = _best_score(rows)
-            abstain_flag = ANSWERABILITY_THRESHOLD > 0.0 and best_score < ANSWERABILITY_THRESHOLD
-            payload = {
+        boosts = None
+        if scopes and idx < len(scopes):
+            boosts = _parse_scope_boosts(scopes[idx])
+        elif scope:
+            boosts = _parse_scope_boosts(scope)
+        try:
+            route_exec = route_norm
+            route_retrieve = retrieve_k
+            if route_norm == "auto":
+                try:
+                    planned = await plan_route(q)
+                except Exception as exc:
+                    logger.debug("plan_route failed in batch: %s", exc)
+                    planned = {}
+                route_exec = str((planned or {}).get("route") or "rerank")
+                if route_exec not in valid_routes - {"auto"}:
+                    route_exec = "rerank"
+                planned_k = (planned or {}).get("k")
+                if isinstance(planned_k, int) and 1 <= planned_k <= 256:
+                    route_retrieve = planned_k
+            route_retrieve = max(return_k, min(route_retrieve, 256))
+            query_vec: List[float] = []
+            if route_exec in {"semantic", "rerank", "hybrid"}:
+                query_vec = await embed_query(q)
+            rows = await _execute_search(
+                route_exec,
+                collection_name,
+                q,
+                query_vec,
+                route_retrieve,
+                return_k,
+                max(return_k, route_retrieve),
+                subjects,
+                timings,
+                boosts,
+            )
+            best = _best_score(rows)
+            entry = {
+                "index": idx,
+                "query": q,
+                "requested_route": route_norm,
+                "route": route_exec,
+                "collection": collection_name,
                 "slug": slug,
-                "mode": mode,
-                "route": route_name,
-                "retrieve_k": route_retrieve_val,
-                "return_k": return_k,
-                "top_k": top_k,
-                "result_count": len(clean_rows),
-                "best_score": best_score,
-                "hyde_used": hyde_used,
-                "duration_ms": round(duration_ms, 3),
-                "thin_payload": THIN_PAYLOAD_ENABLED,
-                "abstain": abstain_flag,
+                "rows": rows,
                 "timings": {k: round(v, 3) for k, v in timings.items()},
-                "subjects": [hashlib.sha1(s.encode("utf-8")).hexdigest() for s in subjects if s],
-                "results": [
-                    {
-                        "doc_id": row.get("doc_id"),
-                        "element_ids": row.get("element_ids"),
-                        "chunk_id": row.get("chunk_id"),
-                        "score": row.get("score"),
-                    }
-                    for row in clean_rows[:return_k]
-                ],
+                "best_score": best,
             }
             if boosts:
-                payload["boosts"] = boosts
-            if abstain_flag:
-                payload.setdefault("reason", "best_score_below_threshold")
-                payload["threshold"] = ANSWERABILITY_THRESHOLD
-            try:
-                _audit("search", payload)
-            except Exception:
-                logger.debug("audit_log_failed", exc_info=True)
-            try:
-                logger.info("search_metrics %s", json.dumps(payload))
-            except Exception:
-                logger.debug("failed to log search metrics", exc_info=True)
-            return rows
+                entry["boosts"] = boosts
+            if best < ANSWERABILITY_THRESHOLD:
+                entry.update({
+                    "abstain": True,
+                    "reason": "best_score_below_threshold",
+                    "threshold": ANSWERABILITY_THRESHOLD,
+                })
+            results.append(entry)
+        except Exception as exc:
+            results.append({"index": idx, "query": q, "route": route_norm, "error": str(exc)})
+    return {"results": results}
 
-        valid_modes = {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert", "auto"}
-        if mode not in valid_modes:
-            return finalize([{"error": f"invalid mode '{mode}', expected one of {sorted(valid_modes)}"}], mode)
-        if not isinstance(top_k, int) or top_k < 1 or top_k > 100:
-            return finalize([
-                {"error": "invalid top_k", "detail": "top_k must be int between 1 and 100"}
-            ], mode)
-        if not isinstance(retrieve_k, int) or retrieve_k < 1 or retrieve_k > 256:
-            return finalize([
-                {"error": "invalid retrieve_k", "detail": "retrieve_k must be int between 1 and 256"}
-            ], mode)
-        if not isinstance(return_k, int) or return_k < 1 or return_k > retrieve_k:
-            return finalize([
-                {"error": "invalid return_k", "detail": "return_k must be int between 1 and retrieve_k"}
-            ], mode)
-        subjects = get_subjects_from_context(ctx)
-        planned_route: Optional[Dict[str, Any]] = None
-        route = mode
-        route_retrieve = retrieve_k
-        if mode == "auto":
+@mcp.tool(name="kb.quality", title="KB: Inspect Hits")
+async def kb_quality(
+    ctx: Context,
+    hits: List[Dict[str, Any]],
+    collection: Optional[str] = None,
+    rules: Optional[Dict[str, Any]] = None,
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    rules = rules or {}
+    slug, collection_name, _ = _resolve_scope(collection)
+    min_score = float(rules.get("min_score", ANSWERABILITY_THRESHOLD))
+    require_metadata = bool(rules.get("require_metadata", False))
+    require_plan_hash = bool(rules.get("require_plan_hash", False))
+    require_table = bool(rules.get("require_table_hit", False))
+    valid_hits = [hit for hit in hits if isinstance(hit, dict)] if hits else []
+    query_tokens = _tokenize_quality(query)
+    score_values: List[float] = []
+    coverage_values: List[float] = []
+    doc_counts: Dict[str, int] = {}
+    table_hits = 0
+    failures: List[str] = []
+    for idx, hit in enumerate(valid_hits):
+        score = hit.get("final_score") if hit.get("final_score") is not None else hit.get("score")
+        try:
+            score_val = float(score)
+        except Exception:
+            score_val = 0.0
+        if score_val < min_score:
+            failures.append(f"hit_{idx}_score_below_min")
+        score_values.append(score_val)
+        if require_metadata and not hit.get("doc_metadata"):
+            failures.append(f"hit_{idx}_missing_metadata")
+        if require_plan_hash and not hit.get("plan_hash"):
+            failures.append(f"hit_{idx}_missing_plan_hash")
+        if query_tokens:
+            coverage = _coverage_ratio(query_tokens, hit.get("text"))
+            coverage_values.append(coverage)
+        doc_id = str(hit.get("doc_id") or "")
+        if doc_id:
+            doc_counts[doc_id] = doc_counts.get(doc_id, 0) + 1
+        if _is_table_row(hit.get("types")):
+            table_hits += 1
+    if require_table and table_hits == 0:
+        failures.append("missing_table_hit")
+    warnings: List[str] = []
+    if query_tokens and coverage_values and max(coverage_values) < 0.3:
+        warnings.append("low_query_coverage")
+    duplicate_docs = [doc for doc, count in doc_counts.items() if count > 1]
+    if duplicate_docs:
+        warnings.append("duplicate_doc_hits")
+    analysis = {
+        "score_summary": _summarize(score_values),
+        "coverage_summary": _summarize(coverage_values) if coverage_values else None,
+        "query_tokens": len(query_tokens),
+        "table_hits": table_hits,
+        "doc_counts": sorted(
+            [{"doc_id": doc, "hits": count} for doc, count in doc_counts.items()],
+            key=lambda x: x["hits"],
+            reverse=True,
+        ),
+        "warnings": warnings,
+    }
+    return {
+        "collection": collection_name,
+        "slug": slug,
+        "pass": not failures,
+        "failures": failures,
+        "evaluated": len(valid_hits),
+        "rules": {
+            "min_score": min_score,
+            "require_metadata": require_metadata,
+            "require_plan_hash": require_plan_hash,
+            "require_table_hit": require_table,
+        },
+        "analysis": analysis,
+    }
+
+@mcp.tool(name="kb.hint", title="KB: Sparse Hints")
+async def kb_hint(
+    ctx: Context,
+    term: Optional[str] = None,
+    terms: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    seeds: List[str] = []
+    if term:
+        seeds.append(str(term))
+    if isinstance(terms, list):
+        seeds.extend(str(t) for t in terms if t)
+    seeds = [s for s in map(str.strip, seeds) if s]
+    if not seeds:
+        return {"error": "missing_terms"}
+    expansions: Dict[str, List[str]] = {}
+    for seed in seeds:
+        upper = seed.upper()
+        matches: List[str] = []
+        alias_list = ALIASES.get(upper)
+        if alias_list:
+            matches.extend(alias_list)
+        for key, synonyms in ALIASES.items():
+            bucket = [key] + synonyms
+            if any(seed.lower() == entry.lower() for entry in bucket):
+                matches.extend(bucket)
+        normalized: List[str] = []
+        for candidate in matches:
+            if candidate.lower() != seed.lower() and candidate not in normalized:
+                normalized.append(candidate)
+        expansions[seed] = normalized
+    _audit("hint", {
+        "terms": seeds,
+        "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+    })
+    return {
+        "terms": seeds,
+        "expansions": expansions,
+        "alias_count": len(ALIASES),
+    }
+
+@mcp.tool(name="kb.hyde", title="KB: HyDE Hint")
+async def kb_hyde(ctx: Context, query: str) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    hypothesis = await hyde(query)
+    status = "ok" if hypothesis else "unavailable"
+    info = None
+    if not hypothesis:
+        info = (
+            "HyDE generation requires a local text-generation model. "
+            "Set OLLAMA_LLM to an installed model (for example 'llama3:8b') "
+            "and ensure the Ollama server at OLLAMA_URL is reachable."
+        )
+    _audit("hyde_hint", {
+        "query": query,
+        "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+    })
+    result = {
+        "query": query,
+        "hypothesis": hypothesis,
+        "model_version": INGEST_MODEL_VERSION,
+        "prompt_sha": INGEST_PROMPT_SHA,
+        "status": status,
+    }
+    if info:
+        result["info"] = info
+    return result
+
+@mcp.tool(name="kb.table", title="KB: Table Lookup")
+async def kb_table(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    limit: int = 10,
+    where: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "empty_query"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    limit = max(1, min(int(limit), 50))
+    fetch_limit = max(limit * 3, limit)
+    raw_hits = await asyncio.to_thread(_fts_search, query, fetch_limit)
+    filtered: List[Dict[str, Any]] = []
+    target_doc = str(doc_id) if doc_id else None
+    where_map = where or {}
+    for item in raw_hits:
+        if target_doc and str(item.get("doc_id")) != target_doc:
+            continue
+        if not _is_table_row(item.get("types")):
+            continue
+        text = (item.get("text") or "").lower()
+        ok = True
+        for key, val in where_map.items():
+            if key and str(key).lower() not in text:
+                ok = False
+                break
+            if val and str(val).lower() not in text:
+                ok = False
+                break
+        if not ok:
+            continue
+        filtered.append(item)
+        if len(filtered) >= limit:
+            break
+    await _ensure_row_texts(filtered, collection_name, get_subjects_from_context(ctx))
+    filtered = [row for row in filtered if _is_allowed_path(row.get("path"))]
+    _audit("table_lookup", {
+        "slug": slug,
+        "collection": collection_name,
+        "query": query,
+        "doc_id": doc_id,
+        "count": len(filtered),
+        "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+    })
+    return {
+        "collection": collection_name,
+        "slug": slug,
+        "query": query,
+        "doc_id": doc_id,
+        "rows": filtered,
+        "limit": limit,
+    }
+
+@mcp.tool(name="kb.open", title="KB: Open Chunk")
+async def kb_open(
+    ctx: Context,
+    chunk_id: Optional[str] = None,
+    element_id: Optional[str] = None,
+    collection: Optional[str] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+) -> Dict[str, Any]:
+    slug, collection_name, _ = _resolve_scope(collection)
+    target = chunk_id or _lookup_chunk_by_element(element_id or "")
+    if not target:
+        return {"error": "missing_target", "detail": "Provide chunk_id or element_id"}
+    row = {"id": target}
+    subjects = get_subjects_from_context(ctx)
+    await _ensure_row_texts([row], collection_name, subjects)
+    if not row.get("text"):
+        return {"error": "not_found"}
+    if not _is_allowed_path(row.get("path")):
+        _audit("open_denied", {
+            "slug": slug,
+            "collection": collection_name,
+            "doc_id": row.get("doc_id"),
+            "chunk_id": target,
+            "reason": "path_not_allowed",
+            "path": row.get("path"),
+            "subjects": _audit_subjects(subjects),
+        })
+        return {"error": "forbidden", "detail": "path not allowed"}
+    text = row.get("text", "")
+    if start is not None or end is not None:
+        s = max(0, int(start or 0))
+        e = int(end) if end is not None else len(text)
+        row["text"] = text[s:e]
+        row["slice"] = {"start": s, "end": e}
+    row["chunk_id"] = target
+    _audit("open", {
+        "slug": slug,
+        "collection": collection_name,
+        "doc_id": row.get("doc_id"),
+        "chunk_id": target,
+        "subjects": _audit_subjects(subjects),
+    })
+    return row
+
+@mcp.tool(name="kb.neighbors", title="KB: Neighbor Chunks")
+async def kb_neighbors(
+    ctx: Context,
+    chunk_id: str,
+    collection: Optional[str] = None,
+    n: int = 1,
+) -> List[Dict[str, Any]]:
+    if not chunk_id:
+        return [{"error": "missing_chunk_id"}]
+    slug, collection_name, _ = _resolve_scope(collection)
+    seed = {"id": chunk_id}
+    subjects = get_subjects_from_context(ctx)
+    await _ensure_row_texts([seed], collection_name, subjects)
+    doc_id = seed.get("doc_id")
+    chunk_start = seed.get("chunk_start")
+    if doc_id is None or chunk_start is None:
+        return [{"error": "not_found"}]
+    neighbor_rows_raw = _fts_neighbors(str(doc_id), int(chunk_start), max(1, int(n)))
+    rows: List[Dict[str, Any]] = []
+    for raw in neighbor_rows_raw:
+        rows.append({
+            "id": raw.get("chunk_id"),
+            "chunk_id": raw.get("chunk_id"),
+            "doc_id": raw.get("doc_id"),
+            "path": raw.get("path"),
+            "chunk_start": raw.get("chunk_start"),
+            "chunk_end": raw.get("chunk_end"),
+            "text": raw.get("text"),
+            "pages": raw.get("pages"),
+            "section_path": raw.get("section_path"),
+            "element_ids": raw.get("element_ids"),
+        })
+    await _ensure_row_texts(rows, collection_name, subjects)
+    rows = [row for row in rows if _is_allowed_path(row.get("path"))]
+    _audit("neighbors", {
+        "slug": slug,
+        "collection": collection_name,
+        "chunk_id": chunk_id,
+        "count": len(rows),
+        "subjects": _audit_subjects(subjects),
+    })
+    return rows
+
+@mcp.tool(name="kb.summary", title="KB: Section Summary")
+async def kb_summary(
+    ctx: Context,
+    topic: str,
+    collection: Optional[str] = None,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    topic = (topic or "").strip()
+    if not topic:
+        return [{"error": "missing_topic"}]
+    slug, collection_name, _ = _resolve_scope(collection)
+    results = await asyncio.to_thread(
+        query_summaries,
+        collection_name,
+        topic,
+        max(1, int(limit)),
+        SUMMARY_DB_PATH,
+    )
+    if not results:
+        return [{"info": "no_matches"}]
+    return results
+
+@mcp.tool(name="kb.outline", title="KB: Outline")
+async def kb_outline(ctx: Context, doc_id: str, collection: Optional[str] = None) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    slug, collection_name, _ = _resolve_scope(collection)
+    conn = sqlite3.connect(FTS_DB_PATH)
+    try:
+        cur = conn.execute(
+            "SELECT text, section_path, pages, chunk_start, chunk_end FROM fts_chunks WHERE doc_id = ? AND types LIKE '%heading%' ORDER BY chunk_start",
+            (doc_id,),
+        )
+        outline: List[Dict[str, Any]] = []
+        for text, section_path, pages, chunk_start, chunk_end in cur.fetchall():
             try:
-                planned_route = await plan_route(query)
+                section = json.loads(section_path) if isinstance(section_path, str) else section_path
+            except Exception:
+                section = section_path
+            pages_list = _parse_page_numbers(pages)
+            outline.append({
+                "heading": text,
+                "section_path": section or [],
+                "pages": pages_list,
+                "chunk_start": chunk_start,
+                "chunk_end": chunk_end,
+            })
+    finally:
+        conn.close()
+    _audit("outline", {
+        "slug": slug,
+        "collection": collection_name,
+        "doc_id": doc_id,
+        "count": len(outline),
+        "subjects": _audit_subjects(get_subjects_from_context(ctx)),
+    })
+    return {"doc_id": doc_id, "outline": outline}
+
+@mcp.tool(name="kb.entities", title="KB: Graph Entities")
+async def kb_entities(
+    ctx: Context,
+    collection: Optional[str] = None,
+    types: Optional[List[str]] = None,
+    match: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    slug, collection_name, _ = _resolve_scope(collection)
+    type_filter: List[str] = []
+    if isinstance(types, list):
+        type_filter = [str(t).strip() for t in types if t]
+    data = await asyncio.to_thread(
+        graph_list_entities,
+        collection_name,
+        type_filter or None,
+        (match or "").strip() or None,
+        max(1, int(limit)),
+        GRAPH_DB_PATH,
+    )
+    return {
+        "collection": collection_name,
+        "slug": slug,
+        "types": type_filter,
+        "match": (match or "").strip() or None,
+        "entities": data,
+    }
+
+@mcp.tool(name="kb.linkouts", title="KB: Entity Mentions")
+async def kb_linkouts(
+    ctx: Context,
+    entity_id: str,
+    limit: int = 25,
+) -> Dict[str, Any]:
+    entity_id = (entity_id or "").strip()
+    if not entity_id:
+        return {"error": "missing_entity_id"}
+    data = await asyncio.to_thread(
+        graph_entity_linkouts,
+        entity_id,
+        max(1, int(limit)),
+        GRAPH_DB_PATH,
+    )
+    if not data.get("entity"):
+        return {"error": "not_found"}
+    return data
+
+@mcp.tool(name="kb.graph", title="KB: Graph Neighbors")
+async def kb_graph(
+    ctx: Context,
+    node_id: str,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    node_id = (node_id or "").strip()
+    if not node_id:
+        return {"error": "missing_node_id"}
+    data = await asyncio.to_thread(graph_neighbors, node_id, max(1, int(limit)), GRAPH_DB_PATH)
+    if not data.get("node"):
+        return {"error": "not_found"}
+    return data
+
+@mcp.tool(name="kb.promote", title="KB: Promote Doc")
+async def kb_promote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    subjects = get_subjects_from_context(ctx)
+    multiplier = _update_session_prior(subjects, doc_id, abs(weight))
+    key = _session_key(subjects)
+    delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
+    _audit("promote", {
+        "doc_id": doc_id,
+        "delta": delta,
+        "subjects": _audit_subjects(subjects),
+    })
+    return {
+        "doc_id": doc_id,
+        "prior_delta": delta,
+        "multiplier": multiplier,
+    }
+
+@mcp.tool(name="kb.demote", title="KB: Demote Doc")
+async def kb_demote(ctx: Context, doc_id: str, weight: float = 0.2) -> Dict[str, Any]:
+    if not doc_id:
+        return {"error": "missing_doc_id"}
+    subjects = get_subjects_from_context(ctx)
+    multiplier = _update_session_prior(subjects, doc_id, -abs(weight))
+    key = _session_key(subjects)
+    delta = SESSION_PRIORS.get(key, {}).get(str(doc_id), 0.0)
+    _audit("demote", {
+        "doc_id": doc_id,
+        "delta": delta,
+        "subjects": _audit_subjects(subjects),
+    })
+    return {
+        "doc_id": doc_id,
+        "prior_delta": delta,
+        "multiplier": multiplier,
+    }
+
+@mcp.tool(name="kb.collections", title="KB: List Collections")
+async def kb_collections(ctx: Context) -> Dict[str, Any]:
+    """Return the configured collection slugs and their metadata."""
+    entries = []
+    for slug, cfg in SCOPES.items():
+        entries.append({
+            "slug": slug,
+            "collection": cfg.get("collection"),
+            "title": cfg.get("title"),
+        })
+    return {"collections": entries}
+
+@mcp.tool(name="kb.search", title="KB: Search")
+async def kb_search(
+    ctx: Context,
+    query: str,
+    collection: Optional[str] = None,
+    mode: str = "rerank",
+    top_k: int = 8,
+    retrieve_k: int = 24,
+    return_k: int = 8,
+    scope: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Vector search (semantic), rerank, hybrid, sparse, or auto planner."""
+    if not isinstance(query, str) or not query.strip():
+        return [{"error": "empty_query"}]
+    slug, collection_name, _ = _resolve_scope(collection)
+    start_time = time.perf_counter()
+    timings: Dict[str, float] = {}
+    route_retrieve_val = retrieve_k
+    boosts = _parse_scope_boosts(scope)
+    subjects = get_subjects_from_context(ctx)
+
+    def finalize(rows: List[Dict[str, Any]], route_name: str, hyde_used: bool = False) -> List[Dict[str, Any]]:
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        clean_rows = [r for r in rows if isinstance(r, dict) and not r.get("note") and not r.get("abstain")]
+        best_score = _best_score(rows)
+        abstain_flag = ANSWERABILITY_THRESHOLD > 0.0 and best_score < ANSWERABILITY_THRESHOLD
+        payload = {
+            "slug": slug,
+            "collection": collection_name,
+            "mode": mode,
+            "route": route_name,
+            "retrieve_k": route_retrieve_val,
+            "return_k": return_k,
+            "top_k": top_k,
+            "result_count": len(clean_rows),
+            "best_score": best_score,
+            "hyde_used": hyde_used,
+            "duration_ms": round(duration_ms, 3),
+            "thin_payload": THIN_PAYLOAD_ENABLED,
+            "abstain": abstain_flag,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "subjects": [hashlib.sha1(s.encode("utf-8")).hexdigest() for s in subjects if s],
+            "results": [
+                {
+                    "doc_id": row.get("doc_id"),
+                    "element_ids": row.get("element_ids"),
+                    "chunk_id": row.get("chunk_id"),
+                    "score": row.get("score"),
+                }
+                for row in clean_rows[:return_k]
+            ],
+        }
+        if boosts:
+            payload["boosts"] = boosts
+        if abstain_flag:
+            payload.setdefault("reason", "best_score_below_threshold")
+            payload["threshold"] = ANSWERABILITY_THRESHOLD
+        try:
+            _audit("search", payload)
+        except Exception:
+            logger.debug("audit_log_failed", exc_info=True)
+        try:
+            logger.info("search_metrics %s", json.dumps(payload))
+        except Exception:
+            logger.debug("failed to log search metrics", exc_info=True)
+        return rows
+
+    valid_modes = {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert", "auto"}
+    if mode not in valid_modes:
+        return finalize([{"error": f"invalid mode '{mode}', expected one of {sorted(valid_modes)}"}], mode)
+    if not isinstance(top_k, int) or top_k < 1 or top_k > 100:
+        return finalize([{"error": "invalid top_k", "detail": "top_k must be int between 1 and 100"}], mode)
+    if not isinstance(retrieve_k, int) or retrieve_k < 1 or retrieve_k > 256:
+        return finalize([{"error": "invalid retrieve_k", "detail": "retrieve_k must be int between 1 and 256"}], mode)
+    if not isinstance(return_k, int) or return_k < 1 or return_k > retrieve_k:
+        return finalize([{"error": "invalid return_k", "detail": "return_k must be int between 1 and retrieve_k"}], mode)
+
+    route = mode
+    route_retrieve = retrieve_k
+    if mode == "auto":
+        try:
+            planned_route = await plan_route(query)
+        except Exception as exc:
+            logger.debug("plan_route failed, falling back to rerank: %s", exc)
+            planned_route = {}
+        route = str((planned_route or {}).get("route") or "rerank")
+        if route not in {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert"}:
+            route = "rerank"
+        planned_k = (planned_route or {}).get("k")
+        if isinstance(planned_k, int) and 1 <= planned_k <= 256:
+            route_retrieve = planned_k
+    route_retrieve = max(return_k, min(route_retrieve, 256))
+    route_retrieve_val = route_retrieve
+
+    query_vec: List[float] = []
+    if route in {"semantic", "rerank", "hybrid"}:
+        try:
+            embed_start = time.perf_counter()
+            query_vec = await embed_query(query, normalize=True)
+            timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
+        except Exception as exc:
+            return finalize([{ "error": "embedding_failed", "detail": str(exc)}], route)
+
+    rows = await _execute_search(
+        route=route,
+        collection=collection_name,
+        query=query,
+        query_vec=query_vec,
+        retrieve_k=route_retrieve,
+        return_k=return_k,
+        top_k=top_k,
+        subjects=subjects,
+        timings=timings,
+        boosts=boosts,
+    )
+
+    if rows and isinstance(rows[0], dict) and rows[0].get("error"):
+        return finalize(rows, route)
+
+    for row in rows:
+        if isinstance(row, dict) and "route" not in row:
+            row["route"] = route
+
+    best = _best_score(rows)
+    hyde_used = False
+    if ANSWERABILITY_THRESHOLD > 0.0 and best < ANSWERABILITY_THRESHOLD:
+        hypo = await hyde(query)
+        if hypo:
+            hyde_start = time.perf_counter()
+            try:
+                hypo_vec = await embed_query(hypo, normalize=True)
             except Exception as exc:
-                logger.debug("plan_route failed, falling back to rerank: %s", exc)
-                planned_route = {}
-            route = str((planned_route or {}).get("route") or "rerank")
-            if route not in {"semantic", "rerank", "hybrid", "sparse", "sparse_splade", "colbert"}:
-                route = "rerank"
-            planned_k = (planned_route or {}).get("k")
-            if isinstance(planned_k, int) and 1 <= planned_k <= 256:
-                route_retrieve = planned_k
-        route_retrieve = max(return_k, min(route_retrieve, 256))
-        route_retrieve_val = route_retrieve
+                logger.debug("HyDE embed failed: %s", exc)
+                hypo_vec = None
+            if hypo_vec is not None:
+                hyde_rows = await _execute_search(
+                    route="semantic",
+                    collection=collection_name,
+                    query=hypo,
+                    query_vec=hypo_vec,
+                    retrieve_k=min(route_retrieve, 16),
+                    return_k=return_k,
+                    top_k=top_k,
+                    subjects=subjects,
+                    timings=timings,
+                    boosts=boosts,
+                )
+                timings["hyde_ms"] = timings.get("hyde_ms", 0.0) + (time.perf_counter() - hyde_start) * 1000.0
+                if hyde_rows and isinstance(hyde_rows[0], dict) and hyde_rows[0].get("error"):
+                    return finalize(hyde_rows, "semantic")
+                for row in hyde_rows:
+                    if isinstance(row, dict) and "route" not in row:
+                        row["route"] = "semantic"
+                hyde_best = _best_score(hyde_rows)
+                if hyde_best >= ANSWERABILITY_THRESHOLD:
+                    hyde_rows.insert(0, {"note": "HyDE retry satisfied threshold", "base_route": route})
+                    return finalize(hyde_rows, "semantic", hyde_used=True)
+        return finalize([
+            {
+                "abstain": True,
+                "reason": "low_answerability",
+                "top_score": best,
+                "threshold": ANSWERABILITY_THRESHOLD,
+            }
+        ], route)
 
-        query_vec: List[float] = []
-        if route in {"semantic", "rerank", "hybrid"}:
-            try:
-                embed_start = time.perf_counter()
-                query_vec = await embed_query(query, normalize=True)
-                timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
-            except Exception as e:
-                return finalize([
-                    {"error": "embedding_failed", "detail": str(e)}
-                ], route)
-
-        rows = await _execute_search(
-            route=route,
-            collection=collection,
+    if route not in {"sparse", "sparse_splade"} and _should_retry_sparse(query, rows):
+        sparse_rows = await _execute_search(
+            route="sparse",
+            collection=collection_name,
             query=query,
             query_vec=query_vec,
-            retrieve_k=route_retrieve,
+            retrieve_k=max(route_retrieve, 32),
             return_k=return_k,
             top_k=top_k,
             subjects=subjects,
             timings=timings,
             boosts=boosts,
         )
+        if sparse_rows and not sparse_rows[0].get("error"):
+            for row in sparse_rows:
+                if isinstance(row, dict) and "route" not in row:
+                    row["route"] = "sparse"
+            rows = sparse_rows
+            route = "sparse"
 
-        if rows and isinstance(rows[0], dict) and rows[0].get("error"):
-            return finalize(rows, route)
-
-        for row in rows:
-            if isinstance(row, dict) and "route" not in row:
-                row["route"] = route
-
-        best = _best_score(rows)
-        hyde_used = False
-        if ANSWERABILITY_THRESHOLD > 0.0 and best < ANSWERABILITY_THRESHOLD:
-            hypo = await hyde(query)
-            if hypo:
-                hyde_start = time.perf_counter()
-                try:
-                    hypo_vec = await embed_query(hypo, normalize=True)
-                except Exception as exc:
-                    logger.debug("HyDE embed failed: %s", exc)
-                    hypo_vec = None
-                if hypo_vec is not None:
-                    hyde_rows = await _execute_search(
-                        route="semantic",
-                        collection=collection,
-                        query=hypo,
-                        query_vec=hypo_vec,
-                        retrieve_k=min(route_retrieve, 16),
-                        return_k=return_k,
-                        top_k=top_k,
-                        subjects=subjects,
-                        timings=timings,
-                        boosts=boosts,
-                    )
-                    timings["hyde_ms"] = timings.get("hyde_ms", 0.0) + (time.perf_counter() - hyde_start) * 1000.0
-                    if hyde_rows and isinstance(hyde_rows[0], dict) and hyde_rows[0].get("error"):
-                        return finalize(hyde_rows, "semantic")
-                    for row in hyde_rows:
-                        if isinstance(row, dict) and "route" not in row:
-                            row["route"] = "semantic"
-                    hyde_best = _best_score(hyde_rows)
-                    if hyde_best >= ANSWERABILITY_THRESHOLD:
-                        hyde_rows.insert(0, {"note": "HyDE retry satisfied threshold", "base_route": route})
-                        return finalize(hyde_rows, "semantic", hyde_used=True)
-            return finalize(
-                [{"abstain": True, "reason": "low_answerability", "top_score": best, "threshold": ANSWERABILITY_THRESHOLD}],
-                route,
-            )
-
-        if route not in {"sparse", "sparse_splade"} and _should_retry_sparse(query, rows):
-            sparse_rows = await _execute_search(
-                route="sparse",
-                collection=collection,
-                query=query,
-                query_vec=query_vec,
-                retrieve_k=max(route_retrieve, 32),
-                return_k=return_k,
-                top_k=top_k,
-                subjects=subjects,
-                timings=timings,
-                boosts=boosts,
-            )
-            if sparse_rows and not sparse_rows[0].get("error"):
-                for row in sparse_rows:
-                    if isinstance(row, dict) and "route" not in row:
-                        row["route"] = "sparse"
-                rows = sparse_rows
-                route = "sparse"
-
-        return finalize(rows, route, hyde_used)
-
-
-    @mcp.tool(name=f"open_{slug}", title=f"{title or slug}: Open Chunk")
-    async def open_chunk(
-        ctx: Context,
-        chunk_id: Optional[str] = None,
-        element_id: Optional[str] = None,
-        start: Optional[int] = None,
-        end: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        target = chunk_id or _lookup_chunk_by_element(element_id or "")
-        if not target:
-            return {"error": "missing_target", "detail": "Provide chunk_id or element_id"}
-        row = {"id": target}
-        await _ensure_row_texts([row], collection, get_subjects_from_context(ctx))
-        if not row.get("text"):
-            return {"error": "not_found"}
-        if not _is_allowed_path(row.get("path")):
-            _audit("open_denied", {
-                "slug": slug,
-                "doc_id": row.get("doc_id"),
-                "chunk_id": target,
-                "reason": "path_not_allowed",
-                "path": row.get("path"),
-                "subjects": subjects_hash,
-            })
-            return {"error": "forbidden", "detail": "path not allowed"}
-        text = row.get("text", "")
-        if start is not None or end is not None:
-            s = max(0, int(start or 0))
-            e = int(end) if end is not None else len(text)
-            row["text"] = text[s:e]
-            row["slice"] = {"start": s, "end": e}
-        row["chunk_id"] = target
-        subjects_hash = _audit_subjects(get_subjects_from_context(ctx))
-        _audit("open", {
-            "slug": slug,
-            "doc_id": row.get("doc_id"),
-            "chunk_id": target,
-            "subjects": subjects_hash,
-        })
-        return row
-
-
-    @mcp.tool(name=f"neighbors_{slug}", title=f"{title or slug}: Neighbor Chunks")
-    async def neighbor_chunks(
-        ctx: Context,
-        chunk_id: str,
-        n: int = 1,
-    ) -> List[Dict[str, Any]]:
-        if not chunk_id:
-            return [{"error": "missing_chunk_id"}]
-        seed = {"id": chunk_id}
-        subjects_local = get_subjects_from_context(ctx)
-        await _ensure_row_texts([seed], collection, subjects_local)
-        doc_id = seed.get("doc_id")
-        chunk_start = seed.get("chunk_start")
-        if doc_id is None or chunk_start is None:
-            return [{"error": "not_found"}]
-        neighbor_rows_raw = _fts_neighbors(str(doc_id), int(chunk_start), max(1, int(n)))
-        rows = []
-        for raw in neighbor_rows_raw:
-            rows.append({
-                "id": raw.get("chunk_id"),
-                "chunk_id": raw.get("chunk_id"),
-                "doc_id": raw.get("doc_id"),
-                "path": raw.get("path"),
-                "chunk_start": raw.get("chunk_start"),
-                "chunk_end": raw.get("chunk_end"),
-                "text": raw.get("text"),
-                "pages": raw.get("pages"),
-                "section_path": raw.get("section_path"),
-                "element_ids": raw.get("element_ids"),
-            })
-        await _ensure_row_texts(rows, collection, subjects_local)
-        filtered = []
-        for row in rows:
-            if _is_allowed_path(row.get("path")):
-                filtered.append(row)
-        if len(filtered) != len(rows):
-            rows = filtered
-        subjects_hash = _audit_subjects(subjects_local)
-        _audit("neighbors", {
-            "slug": slug,
-            "chunk_id": chunk_id,
-            "count": len(rows),
-            "subjects": subjects_hash,
-        })
-        return rows
-
-
-    @mcp.tool(name=f"summary_{slug}", title=f"{title or slug}: Section Summary")
-    async def summary_tool(
-        ctx: Context,
-        topic: str,
-        limit: int = 3,
-    ) -> List[Dict[str, Any]]:
-        topic = (topic or "").strip()
-        if not topic:
-            return [{"error": "missing_topic"}]
-        results = await asyncio.to_thread(
-            query_summaries,
-            collection,
-            topic,
-            max(1, int(limit)),
-            SUMMARY_DB_PATH,
-        )
-        return results or [{"info": "no_matches"}]
-
-    entities_tool_name = f"entities_{slug}"
-    entities_title = f"{title or slug}: Graph Entities"
-
-    @mcp.tool(name=entities_tool_name, title=entities_title)
-    async def entities_tool(
-        ctx: Context,
-        types: Optional[List[str]] = None,
-        match: Optional[str] = None,
-        limit: int = 50,
-    ) -> Dict[str, Any]:
-        type_filter: List[str] = []
-        if isinstance(types, list):
-            type_filter = [str(t).strip() for t in types if t]
-        data = await asyncio.to_thread(
-            graph_list_entities,
-            collection,
-            type_filter or None,
-            (match or "").strip() or None,
-            max(1, int(limit)),
-            GRAPH_DB_PATH,
-        )
-        return {
-            "collection": collection,
-            "types": type_filter,
-            "match": (match or "").strip() or None,
-            "entities": data,
-        }
-
-    linkouts_tool_name = f"linkouts_{slug}"
-    linkouts_title = f"{title or slug}: Entity Mentions"
-
-    @mcp.tool(name=linkouts_tool_name, title=linkouts_title)
-    async def linkouts_tool(
-        ctx: Context,
-        entity_id: str,
-        limit: int = 25,
-    ) -> Dict[str, Any]:
-        entity_id = (entity_id or "").strip()
-        if not entity_id:
-            return {"error": "missing_entity_id"}
-        data = await asyncio.to_thread(
-            graph_entity_linkouts,
-            entity_id,
-            max(1, int(limit)),
-            GRAPH_DB_PATH,
-        )
-        if not data.get("entity"):
-            return {"error": "not_found"}
-        return data
-
-
-    @mcp.tool(name=f"graph_{slug}", title=f"{title or slug}: Graph Neighbors")
-    async def graph_tool(
-        ctx: Context,
-        node_id: str,
-        limit: int = 20,
-    ) -> Dict[str, Any]:
-        node_id = (node_id or "").strip()
-        if not node_id:
-            return {"error": "missing_node_id"}
-        data = await asyncio.to_thread(graph_neighbors, node_id, max(1, int(limit)), GRAPH_DB_PATH)
-        if not data.get("node"):
-            return {"error": "not_found"}
-        return data
-
-
-for slug, cfg in SCOPES.items():
-    _register_scope(slug, cfg["collection"], cfg.get("title"))
-
+    return finalize(rows, route, hyde_used)
 
 if __name__ == "__main__":
     try:

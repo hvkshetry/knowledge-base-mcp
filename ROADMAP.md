@@ -22,7 +22,7 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Document the ingestion toolchain in `USAGE.md` and provide a minimal MCP client walkthrough covering analyze → extract → chunk → ingest. *(done – see new "MCP Ingestion Workflow" section)*
 
 ## Stage 3 – Retrieval Primitives & Planner Telemetry
-- Add atomic MCP tools `kb.sparse_{slug}`, `kb.dense_{slug}`, `kb.hybrid_{slug}`, `kb.rerank_{slug}`, `kb.open_{slug}`, `kb.neighbors_{slug}`, `kb.batch_{slug}`, and `kb.quality_{slug}` to give clients surgical control. *(done)*
+- Add atomic MCP tools `kb.sparse`, `kb.dense`, `kb.hybrid`, `kb.rerank`, `kb.open`, `kb.neighbors`, `kb.batch`, and `kb.quality` (with `collection=` parameter) to give clients surgical control. *(done)*
 - Return explicit score components plus `why` annotations on every hit, and include them in search telemetry so planners can reason about route quality. *(done)*
 - Replace `_needs_sparse_retry` heuristics with a bounded critic (rule-based or distilled) that decides on the single HyDE retry; log planner decisions and outcomes. *(done – `_should_retry_sparse` critic + telemetry)*
 - Make route-selection weights (`MIX_W_*`) fully env-driven with validation and doc updates, ensuring identical inputs yield identical final scores. *(done)*
@@ -43,13 +43,19 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Wire CI thresholds (`EVAL_MIN_NDCG10`, `EVAL_MIN_RECALL50`, `EVAL_MAX_P90_MS`) so regressions fail builds and publish trend artifacts. *(done – thresholds exposed via CLI flags)*
 - Add lightweight dashboards or reports (CSV → Grafana/static HTML) to visualise quality and latency deltas per release. *(done – JSON/CSV exports from `eval.py`)*
 
-## Stage 6 – Advanced Enhancements *(completed)*
-- SPLADE/uniCOIL sparse expansion wired via `--sparse-expander`; ColBERT routing is available via `COLBERT_URL`/`kb.colbert_*` for question-style queries.
-- MCP client playbooks/prompts documented in `MCP_PLAYBOOKS.md` and `MCP_PROMPTS.md`, encouraging the agent to act as critic/self-rerouter.
-- `graph_builder.py` now attaches measurement nodes and heuristic relations (`feeds`, `discharges_to`, `located_in`) for graph-aware retrieval.
-- `scripts/manage_cache.py` plus new env knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) simplify Docling GPU/caching operations.
-- MCP UX surfaces (playbooks + prompt snippets) highlight graph/summary/neighbor actions for richer planning.
-- Canary-driven quality checks now run during `ingest.assess_quality()` using `config/canaries/*` configs.
+## Stage 6 – Advanced Enhancements *(in progress)*
+- SPLADE/uniCOIL sparse expansion: hooks (`--sparse-expander`, `kb.sparse_splade`) are present, but no SPLADE model is bundled yet.
+- MCP playbooks/prompts documented in `MCP_PLAYBOOKS.md` and `MCP_PROMPTS.md`, encouraging the agent to act as critic/self-rerouter.
+- `graph_builder.py` currently attaches entity → chunk links; richer relations (`feeds`, `discharges_to`, `located_in`) remain on the backlog.
+- `scripts/manage_cache.py` plus new env knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) simplify Docling GPU/caching operations (GPU use remains optional).
+- MCP UX surfaces (playbooks + prompt snippets) highlight graph/summary/neighbor actions for richer planning. (Feature maturity mirrors the notes above.)
+- Canary-driven quality checks run during `ingest.assess_quality()` when `config/canaries/*.json` is populated (defaults are placeholders).
 - `ingest.enhance` implements safe ops (`add_synonyms`, `link_crossrefs`, `fix_table_pages`) for incremental fixes without full re-ingest.
+
+## Known Schema & Tooling Follow-Ups
+- Normalize stored arrays/objects: `element_ids`, `bboxes`, `types`, `source_tools`, `table_headers`, `table_units`, and `doc_metadata` are persisted as Python repr strings in FTS/Qdrant payloads; migrate them to proper JSON structures and backfill existing rows.
+- Table metadata: ensure table headers/units survive extraction before re-enabling the stronger table lookup guarantees (current MCP `kb.table` often returns empty hits).
+- Summary/outline/hint builders: ship the background jobs that populate `summary.db`, outline indices, and richer alias expansions so `kb.summary`, `kb.outline`, and `kb.hint` return real data instead of placeholders.
+- Entity provenance: extend the graph pipeline to retain `doc_id` on entity nodes/edges so `kb.entities` can always surface source documents.
 
 Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
