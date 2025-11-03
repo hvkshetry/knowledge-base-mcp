@@ -94,14 +94,15 @@ The MCP server exposes deterministic ingestion tools that mirror the CLI pipelin
 | `ingest.extract_with_strategy(path, plan)` | Extract structural blocks using the stored or provided plan override. | blocks artifact path |
 | `ingest.chunk_with_guidance(artifact_ref, profile)` | Apply a deterministic chunker (`auto`, `heading_based`, `procedure_block`, `table_row`, `fixed_window`). | chunk artifact, sample chunk previews |
 | `ingest.generate_metadata(doc_id)` | Produce bounded metadata (<=320-char summary, <=8 concepts, typed entities) with guardrails. | doc metadata, metadata bytes/calls |
-| `ingest.assess_quality(doc_id)` | Inspect chunk counts, table-row coverage, metadata status, and warnings. | quality metrics, plan hash |
-| `ingest.enhance(doc_id, op)` | Reserved for future safe adjustments (currently returns `not_implemented`). | — |
+| `ingest.assess_quality(doc_id)` | Inspect chunk counts, table-row coverage, metadata status, and run canary queries. | quality metrics, plan hash, canary results |
+| `ingest.enhance(doc_id, op)` | Apply bounded fixes (add synonyms, link cross-references, adjust table pages). | mutation summary |
 
 ### Guardrails
 
 - `INGEST_MODEL_VERSION` / `INGEST_PROMPT_SHA` annotate every plan and artifact (defaults: `structured_ingest_v1`, `sha_deterministic_chunking_v1`).
 - `MAX_METADATA_BYTES` (default `8192`) rejects metadata that exceeds the byte budget and reports `metadata_bytes_exceeded`.
 - `MAX_METADATA_CALLS_PER_DOC` (default `2`) prevents unbounded metadata regeneration; exceeding it yields `metadata_budget_exceeded`.
+- Canary scenarios live in `config/canaries/<collection>.json`; `ingest.assess_quality` will execute up to `MAX_CANARY_QUERIES` entries per document.
 
 ### Typical Flow
 
@@ -109,7 +110,8 @@ The MCP server exposes deterministic ingestion tools that mirror the CLI pipelin
 2. `ingest.extract_with_strategy` to cache structural blocks.
 3. `ingest.chunk_with_guidance` (`profile="auto"` for most docs, `"table_row"` for tabular-heavy content).
 4. `ingest.generate_metadata` to attach deterministic metadata (fast-fails if size/call limits are hit).
-5. `ingest.assess_quality` to verify chunk density, table coverage, and metadata status before calling the CLI ingest or a custom upsert routine.
+5. `ingest.assess_quality` to verify chunk density, table coverage, metadata status, and canary results before calling the CLI ingest or a custom upsert routine.
+6. Use `ingest.enhance` for targeted fixes (e.g., add synonyms, patch cross-references) without rerunning extraction.
 
 Artifacts are plain JSON, so CI can diff plans, inspect `plan_hash` stability, or replay the same strategy across environments.
 
@@ -598,7 +600,7 @@ score(doc) = Σ [1 / (K + rank_i(doc))]
    python -m fastmcp.client call ingest.generate_metadata doc_id=<uuid>
    python -m fastmcp.client call ingest.assess_quality doc_id=<uuid>
    ```
-   `metadata_calls`, `plan_hash`, and any `metadata_rejects` are persisted under `data/ingest_plans/` for auditing.
+   `metadata_calls`, `plan_hash`, any `metadata_rejects`, and canary pass/fail results are persisted under `data/ingest_plans/` for auditing.
 
 ## Performance Tuning
 

@@ -44,8 +44,8 @@ These playbooks show how an MCP-aware client (Claude Desktop/Code, Codex CLI, et
 2. `ingest.extract_with_strategy` (reuse the stored plan hash, or override routes).
 3. `ingest.chunk_with_guidance` with explicit `profile` (`heading_based`, `procedure_block`, `table_row`).
 4. `ingest.generate_metadata` (respects byte/call limits).
-5. `ingest.assess_quality` to ensure chunk counts, table coverage, and metadata status look healthy.
-6. If adjustments are needed, re-run the sequence; identical inputs always produce the same `plan_hash`.
+5. `ingest.assess_quality` to review chunk stats, metadata status, and canary query outcomes.
+6. If warnings appear, call `ingest.enhance` (`add_synonyms`, `link_crossrefs`, `fix_table_pages`) or rerun earlier steps; identical inputs always produce the same `plan_hash`.
 
 ## 4. Answer Critic Pattern
 

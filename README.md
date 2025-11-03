@@ -13,6 +13,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 - **Sparse Expansion Route**: Optional SPLADE/basic expansions populate a sparse index so acronym-heavy queries can route through `kb.sparse_splade_*` without leaving the MCP workflow.
 - **ColBERT Late Interaction**: Point the server at a ColBERT service via `COLBERT_URL` to unlock the `kb.colbert_*` route for high-precision multi-fact questions.
 - **Operational Tooling**: `scripts/manage_cache.py` helps purge Docling caches or rebuild graph/summary stores; GPU knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) keep heavy PDFs flowing.
+- **Canary QA**: `ingest.assess_quality` runs configurable canary queries (`config/canaries/`) and flags issues before documents reach production.
 - **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface page numbers, section paths, element IDs, table metadata, and original tool provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.

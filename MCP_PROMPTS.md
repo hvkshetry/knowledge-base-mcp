@@ -39,6 +39,15 @@ When handed a new PDF:
 - `ingest.extract_with_strategy` path=<file> plan=@previous_plan
 - `ingest.chunk_with_guidance` artifact_ref=@blocks.json profile=heading_based
 - `ingest.assess_quality` doc_id=<uuid>
+- Review the canary results and warnings; follow up with `ingest.enhance` if needed.
+```
+
+## Targeted Enhancements
+
+```
+- `ingest.enhance` doc_id=<uuid> op=add_synonyms args={"synonyms": {"MLSS": ["mixed liquor"]}}
+- `ingest.enhance` doc_id=<uuid> op=link_crossrefs args={"references": [{"chunk_id": "...", "target": "Table 3-2"}]}
+- `ingest.enhance` doc_id=<uuid> op=fix_table_pages args={"pages": {"tbl_row_3_2": 41}}
 ```
 
 Include these fragments in your system prompt or invocation instructions to make
