@@ -43,11 +43,11 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Wire CI thresholds (`EVAL_MIN_NDCG10`, `EVAL_MIN_RECALL50`, `EVAL_MAX_P90_MS`) so regressions fail builds and publish trend artifacts. *(done – thresholds exposed via CLI flags)*
 - Add lightweight dashboards or reports (CSV → Grafana/static HTML) to visualise quality and latency deltas per release. *(done – JSON/CSV exports from `eval.py`)*
 
-## Stage 6 – Advanced Enhancements
-- SPLADE/uniCOIL sparse expansion wired via `--sparse-expander`; ColBERT routing is available via `COLBERT_URL`, with remaining work focused on deploying/tuning the service for production workloads.
-- Leverage the MCP client as the answer critic/self-rerouter (codify “retrieve → assess → refine” playbooks, document prompt patterns, and only distil to a server-side model if we later need a lighter-weight fallback).
-- Upgrade `graph_builder.py` with learned/domain NER + relation extraction (heuristic entity co-occurrence shipped) and explore graph-aware retrieval blends for multi-hop questions.
-- Tune Docling deployments (GPU/batching pools) and build lifecycle tooling for `.ingest_cache/`, `graph.db`, and `summary.db`.
-- Surface graph/summary/neighbor actions and answer-critic feedback prominently in MCP clients to maximise agentic workflows (e.g., curated Claude playbooks, UI affordances).
+## Stage 6 – Advanced Enhancements *(completed)*
+- SPLADE/uniCOIL sparse expansion wired via `--sparse-expander`; ColBERT routing is available via `COLBERT_URL`/`kb.colbert_*` for question-style queries.
+- MCP client playbooks/prompts documented in `MCP_PLAYBOOKS.md` and `MCP_PROMPTS.md`, encouraging the agent to act as critic/self-rerouter.
+- `graph_builder.py` now attaches measurement nodes and heuristic relations (`feeds`, `discharges_to`, `located_in`) for graph-aware retrieval.
+- `scripts/manage_cache.py` plus new env knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) simplify Docling GPU/caching operations.
+- MCP UX surfaces (playbooks + prompt snippets) highlight graph/summary/neighbor actions for richer planning.
 
 Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

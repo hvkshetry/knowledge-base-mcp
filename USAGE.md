@@ -391,6 +391,12 @@ data/
 - Auto routing (`mode="auto"`) will prefer ColBERT for question-style queries when the service is available; call it explicitly when you want late-interaction reranking.
 - Returned rows include `colbert_score` under `scores.dense`, so quality gates can reason about confidence alongside other routes.
 
+### Docling Operations & GPU Tuning
+
+- `python scripts/manage_cache.py status` shows the size of `.ingest_cache/`, `graph.db`, and `summary.db`; use `clear-ingest-cache`, `clear-graph`, or `clear-summary` to remove them safely.
+- Set `DOCLING_DEVICE` (`cpu` or `cuda`) and `DOCLING_BATCH_SIZE` before ingestion to control Docling execution; default is CPU with batch size 1.
+- `INGEST_CACHE_DIR` overrides the cache location if you prefer a faster disk or shared volume.
+
 ### Neighbor Context Expansion
 
 Automatically includes adjacent chunks for better context.

@@ -2623,12 +2623,12 @@ def _register_scope(slug: str, collection: str, title: Optional[str] = None) -> 
         route_retrieve_val = route_retrieve
 
         query_vec: List[float] = []
-    if route in {"semantic", "rerank", "hybrid"}:
-        try:
-            embed_start = time.perf_counter()
-            query_vec = await embed_query(query, normalize=True)
-            timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
-        except Exception as e:
+        if route in {"semantic", "rerank", "hybrid"}:
+            try:
+                embed_start = time.perf_counter()
+                query_vec = await embed_query(query, normalize=True)
+                timings["embed_ms"] = (time.perf_counter() - embed_start) * 1000.0
+            except Exception as e:
                 return finalize([
                     {"error": "embedding_failed", "detail": str(e)}
                 ], route)

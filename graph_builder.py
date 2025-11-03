@@ -55,6 +55,16 @@ UPPER_ENTITY_RE = re.compile(r"\b([A-Z]{3,}(?:\s+[A-Z0-9]{2,})*)\b")
 MEASUREMENT_RE = re.compile(
     r"(?P<parameter>[A-Za-z][A-Za-z0-9\s/%°\-\(\)]{2,}?)\s*(?:=|:)\s*(?P<value>-?\d+(?:\.\d+)?(?:\s*[x×]\s*10\^\d+)?)\s*(?P<unit>[A-Za-zμ/%°\-\^0-9]+)?"
 )
+RELATION_PATTERNS = [
+    (re.compile(r"(?P<src>[A-Za-z][\w\s/\-\(\)]{2,}?)\s+(feeds|supplies|pumps|returns|sends)\s+(?P<dst>[A-Za-z][\w\s/\-\(\)]{2,})", re.IGNORECASE), "feeds"),
+    (re.compile(r"(?P<src>[A-Za-z][\w\s/\-\(\)]{2,}?)\s+(discharges|drains|flows)\s+(to|into)\s+(?P<dst>[A-Za-z][\w\s/\-\(\)]{2,})", re.IGNORECASE), "discharges_to"),
+    (re.compile(r"(?P<src>[A-Za-z][\w\s/\-\(\)]{2,}?)\s+(located|installed|situated)\s+(in|at|inside)\s+(?P<dst>[A-Za-z][\w\s/\-\(\)]{2,})", re.IGNORECASE), "located_in"),
+]
+
+
+def _normalize_label(label: str) -> str:
+    norm = re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
+    return norm
 
 
 def _ensure_graph(path: Path) -> sqlite3.Connection:
@@ -311,6 +321,7 @@ def update_graph(
         types = chunk.get("types") or []
         chunk_entities = _collect_chunk_entities(chunk, doc_meta)
         parameter_id_lookup: Dict[str, str] = {}
+        entity_lookup: Dict[str, str] = {}
 
         for idx, element_id in enumerate(element_ids):
             if not element_id:
@@ -351,8 +362,11 @@ def update_graph(
                     )
                     seen_edges.add(key)
                 entity_ids_for_chunk.append(entity_id)
-                if etype == "parameter":
-                    parameter_id_lookup[label.lower()] = entity_id
+                norm_label = _normalize_label(label)
+                if norm_label:
+                    entity_lookup.setdefault(norm_label, entity_id)
+                if etype == "parameter" and norm_label:
+                    parameter_id_lookup[norm_label] = entity_id
 
             measurements = []
             text = chunk.get("text") or ""
@@ -365,7 +379,7 @@ def update_graph(
                 measurements.append((parameter, value, unit))
 
             for parameter, value, unit in measurements:
-                norm_param = parameter.lower()
+                norm_param = _normalize_label(parameter)
                 parameter_entity_id = parameter_id_lookup.get(norm_param)
                 if not parameter_entity_id:
                     parameter_entity_id = _node_id_entity(parameter)
@@ -376,8 +390,12 @@ def update_graph(
                         """,
                         (parameter_entity_id, parameter, "parameter", collection, None),
                     )
-                    parameter_id_lookup[norm_param] = parameter_entity_id
-                    entity_ids_for_chunk.append(parameter_entity_id)
+                    if norm_param:
+                        parameter_id_lookup[norm_param] = parameter_entity_id
+                        entity_lookup.setdefault(norm_param, parameter_entity_id)
+                elif norm_param:
+                    entity_lookup.setdefault(norm_param, parameter_entity_id)
+                entity_ids_for_chunk.append(parameter_entity_id)
                 measurement_label = f"{value} {unit or ''}".strip()
                 measurement_node = _measurement_node_id(parameter, value, unit, doc_id, chunk_node)
                 cur.execute(
@@ -408,6 +426,25 @@ def update_graph(
                         (chunk_node, parameter_entity_id, "mentions", collection, doc_id),
                     )
                     seen_edges.add(edge_param_chunk)
+
+            # Heuristic relation extraction between entities in the chunk
+            for pattern, relation in RELATION_PATTERNS:
+                for match in pattern.finditer(text):
+                    src_norm = _normalize_label(match.group("src"))
+                    dst_norm = _normalize_label(match.group("dst"))
+                    if not src_norm or not dst_norm or src_norm == dst_norm:
+                        continue
+                    src_id = entity_lookup.get(src_norm)
+                    dst_id = entity_lookup.get(dst_norm)
+                    if not src_id or not dst_id:
+                        continue
+                    key_rel = (src_id, dst_id, relation)
+                    if key_rel not in seen_edges:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                            (src_id, dst_id, relation, collection, doc_id),
+                        )
+                        seen_edges.add(key_rel)
 
             for left_id, right_id in _co_occurrence_pairs(entity_ids_for_chunk):
                 key = (left_id, right_id, "co_occurs")
