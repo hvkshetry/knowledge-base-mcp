@@ -30,7 +30,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 | Table retrieval | ✅ Working (data-dependent) | Requires tables extracted during ingestion |
 | Canary QA | ⚠️ Requires user config | Default `config/canaries/*.json` are placeholders; add queries to enforce gates |
 | Document summaries / outlines | ⚠️ Client-provided | `ingest.generate_summary` stores semantic summaries with provenance; outlines still require building the heading index |
-| HyDE query expansion | ⚠️ Client-driven | `kb.hyde` returns guidance; generate hypotheses in the MCP client and retry search |
+| HyDE guidance | ⚠️ Client-driven | `kb.hyde` returns guidance only; generate hypotheses in the MCP client before retrying search |
 | MCP upsert pipeline | ✅ Working | `ingest.upsert`, `ingest.upsert_batch`, `ingest.corpus_upsert` |
 | SPLADE sparse expansion | 💤 Planned | `--sparse-expander` hooks are present but no SPLADE model is bundled by default |
 | ColBERT late interaction | 💤 Planned | Requires an external ColBERT service; disabled when `COLBERT_URL` is unset |
@@ -42,7 +42,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 Conventional RAG systems hide retrieval behind a monolithic API. This server embraces the MCP client as a planner:
 
 - **Ingestion as a Toolchain** – `ingest.analyze_document` triages each page (MarkItDown vs Docling) so the client can approve or tweak the plan; `ingest.chunk_with_guidance` switches between enumerated chunkers (`heading_based`, `procedure_block`, `table_row`); `ingest.generate_metadata` enforces byte budgets and prompt hashes. Every step returns artifacts and plan hashes for replayable ingestion.
-- **Retrieval as Composable Primitives** – `kb.sparse`, `kb.dense`, `kb.hybrid`, `kb.rerank`, `kb.hint`, `kb.table_lookup`, `kb.entities`, `kb.linkouts`, `kb.batch`, `kb.quality`, `kb.promote/demote`, plus optional tools such as `kb.hyde` (requires a text-generation model)—each primitive is callable so the MCP client can branch, retry, or fuse strategies mid-conversation.
+- **Retrieval as Composable Primitives** – `kb.sparse`, `kb.dense`, `kb.hybrid`, `kb.rerank`, `kb.hint`, `kb.table_lookup`, `kb.entities`, `kb.linkouts`, `kb.batch`, `kb.quality`, `kb.promote/demote`, plus the guidance-only `kb.hyde` helper. Combine them in your MCP client to branch, retry, or fuse strategies mid-conversation.
 - **Self-Critique with Insight** – Results surface full score vectors (`bm25`, `dense`, `rrf`, `rerank`, `prior`, `decay`) and `why` annotations (matched aliases, headers, table clues), letting the agent reason about confidence before presenting an answer.
 
 Because Claude (or any MCP client) stays in the driver seat, you get agentic retrieval and deterministic ingestion without surrendering provenance or security.
