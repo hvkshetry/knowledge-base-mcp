@@ -26,7 +26,7 @@ This roadmap captures the remaining improvements we plan to tackle after the cur
 - Return explicit score components plus `why` annotations on every hit, and include them in search telemetry so planners can reason about route quality. *(done)*
 - Replace `_needs_sparse_retry` heuristics with a bounded critic (rule-based or distilled) that decides on the single HyDE retry; log planner decisions and outcomes. *(done – `_should_retry_sparse` critic + telemetry)*
 - Make route-selection weights (`MIX_W_*`) fully env-driven with validation and doc updates, ensuring identical inputs yield identical final scores. *(done)*
-- Expose helper tools: `kb.hint` for alias/synonym expansions, and `kb.hyde` to generate hypothetical passages when the planner decides a HyDE retry is warranted. *(done)*
+- Expose helper tools: `kb.hint` for alias/synonym expansions. HyDE retries are now fully client-authored (no server tool). *(done)*
 - Provide `kb.table_lookup` for table/cell retrieval using stored `table_headers`/`table_units` metadata. *(done)*
 - Offer `kb.outline` for document TOCs and `kb.promote`/`kb.demote` APIs to adjust per-session priors on doc_ids. *(done)*
 - Add optional scope/weight controls to search tools and ensure all tools can return `{ "abstain": true, ... }` with reasons so planners can handle insufficent evidence gracefully. *(done)*

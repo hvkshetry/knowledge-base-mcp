@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Character-based sliding window chunking
 - Configurable search parameters (retrieve_k, return_k, top_k)
 
+### Fixed
+- Hardened ingestion MCP tools against path traversal by validating chunk and metadata artifact inputs with `_validate_artifact_path`.
+- Updated agent prompts and documentation to reflect client-authored HyDE retries and hierarchical summary workflows.
+
 ## [1.0.0] - TBD
 
 Initial public release.

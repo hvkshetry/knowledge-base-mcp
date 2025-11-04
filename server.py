@@ -7,7 +7,6 @@ import re
 import hashlib
 import uuid
 from pathlib import Path
-import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -33,7 +32,7 @@ from ingest_blocks import (
 )
 from metadata_schema import generate_metadata
 from ingest_core import upsert_document_artifacts
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 def _env_float(name: str, default: float) -> float:
@@ -41,10 +40,6 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except Exception:
         return default
-
-
-def _utc_iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _env_flag(name: str, *, fallback: Optional[str] = None, default: bool = False) -> bool:
@@ -58,21 +53,20 @@ def _env_flag(name: str, *, fallback: Optional[str] = None, default: bool = Fals
 # ---- Env & config -----------------------------------------------------------
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "snowflake-arctic-embed:xs")
+OLLAMA_LLM = os.getenv("OLLAMA_LLM", os.getenv("OLLAMA_MODEL_GENERATE", "llama3:8b"))
 TEI_RERANK_URL = os.getenv("TEI_RERANK_URL", "http://localhost:8087")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_METRIC = os.getenv("QDRANT_METRIC", "cosine")
 COLBERT_URL = os.getenv("COLBERT_URL")
 COLBERT_TIMEOUT = int(os.getenv("COLBERT_TIMEOUT", "60"))
-COLBERT_LOCAL_ENABLED = os.getenv("COLBERT_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
-COLBERT_LOCAL_WEIGHT = float(os.getenv("COLBERT_LOCAL_WEIGHT", "0.7"))
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "data/fts.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "data/graph.db")
 SUMMARY_DB_PATH = os.getenv("SUMMARY_DB_PATH", "data/summary.db")
 SPARSE_EXPANDER = SparseExpander(os.getenv("SPARSE_EXPANDER", "none"))
 SPARSE_QUERY_TOP_K = int(os.getenv("SPARSE_QUERY_TOP_K", "48"))
 HAVE_SPARSE_SPLADE = SPARSE_EXPANDER.enabled
-HAVE_COLBERT = bool(COLBERT_URL) or COLBERT_LOCAL_ENABLED
+HAVE_COLBERT = bool(COLBERT_URL)
 INGEST_EMBED_BATCH = int(os.getenv("INGEST_EMBED_BATCH", "32"))
 INGEST_EMBED_TIMEOUT = int(os.getenv("INGEST_EMBED_TIMEOUT", "120"))
 INGEST_EMBED_PARALLEL = int(os.getenv("INGEST_EMBED_PARALLEL", "1"))
@@ -94,10 +88,6 @@ qdr = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 mcp = FastMCP(name="knowledge-base", version="1.0.0", instructions="Vector search with Qdrant + Ollama embeddings and TEI reranker")
 doc_store = DocumentStore(FTS_DB_PATH)
 
-_colbert_local_lock = threading.Lock()
-_colbert_local_instance = None
-_colbert_local_disabled = False
-
 ARTIFACT_DIR = Path(os.getenv("INGEST_ARTIFACT_DIR", "data/ingest_artifacts"))
 PLAN_DIR = Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
 INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
@@ -108,25 +98,6 @@ MAX_CANARY_QUERIES = int(os.getenv("MAX_CANARY_QUERIES", "6"))
 CANARY_TIMEOUT = int(os.getenv("CANARY_TIMEOUT", "30"))
 
 SESSION_PRIORS: Dict[str, Dict[str, float]] = {}
-
-
-def _get_colbert_local():
-    global _colbert_local_instance, _colbert_local_disabled
-    if not COLBERT_LOCAL_ENABLED or _colbert_local_disabled:
-        return None
-    with _colbert_local_lock:
-        if _colbert_local_instance is not None:
-            return _colbert_local_instance
-        try:
-            from colbert_local import ColbertLocalReranker  # type: ignore
-
-            _colbert_local_instance = ColbertLocalReranker()
-            logger.info("ColBERT local reranker loaded: %s", _colbert_local_instance.model_name)
-            return _colbert_local_instance
-        except Exception as exc:  # pragma: no cover - optional dependency
-            _colbert_local_disabled = True
-            logger.warning("ColBERT local reranker unavailable: %s", exc)
-            return None
 
 
 def _lookup_chunk_by_element(element_id: str) -> Optional[str]:
@@ -997,7 +968,7 @@ def _record_client_decisions(
                 entry = dict(decision)
             else:
                 entry = {"detail": str(decision)}
-            entry.setdefault("timestamp", _utc_iso_now())
+            entry.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
             entries.append(entry)
     _save_plan(doc_id, plan)
 
@@ -1117,7 +1088,7 @@ async def ingest_validate_extraction(
     try:
         artifact_path = _validate_artifact_path(artifact_ref)
     except ValueError as exc:
-        return {"error": "artifact_not_found", "detail": str(exc)}
+        return {"error": "invalid_artifact_path", "detail": str(exc)}
     data = _read_json(artifact_path)
     if not data:
         return {"error": "artifact_not_found", "detail": f"no artifact at {artifact_path.as_posix()}"}
@@ -1173,7 +1144,10 @@ async def ingest_validate_extraction(
 async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", max_chars: int = 1800, overlap_sentences: int = 1) -> Dict[str, Any]:
     if not artifacts_ref:
         return {"error": "missing_artifact"}
-    artifact_path = Path(artifacts_ref).expanduser()
+    try:
+        artifact_path = _validate_artifact_path(artifacts_ref)
+    except ValueError as exc:
+        return {"error": "invalid_artifact_path", "detail": str(exc)}
     data = _read_json(artifact_path)
     if not data:
         return {"error": "artifact_not_found", "detail": f"no artifact at {artifact_path.as_posix()}"}
@@ -1263,7 +1237,13 @@ async def ingest_chunk(ctx: Context, artifacts_ref: str, profile: str = "auto", 
 async def ingest_generate_metadata(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None, policy: str = "strict_v1") -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
-    chunk_path = Path(artifact_ref).expanduser() if artifact_ref else _chunks_artifact_path(doc_id)
+    if artifact_ref:
+        try:
+            chunk_path = _validate_artifact_path(artifact_ref)
+        except ValueError as exc:
+            return {"error": "invalid_artifact_path", "detail": str(exc)}
+    else:
+        chunk_path = _chunks_artifact_path(doc_id)
     data = _read_json(chunk_path)
     if not data:
         return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
@@ -1317,7 +1297,13 @@ async def ingest_generate_metadata(ctx: Context, doc_id: str, artifact_ref: Opti
 async def ingest_assess_quality(ctx: Context, doc_id: str, artifact_ref: Optional[str] = None) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
-    chunk_path = Path(artifact_ref).expanduser() if artifact_ref else _chunks_artifact_path(doc_id)
+    if artifact_ref:
+        try:
+            chunk_path = _validate_artifact_path(artifact_ref)
+        except ValueError as exc:
+            return {"error": "invalid_artifact_path", "detail": str(exc)}
+    else:
+        chunk_path = _chunks_artifact_path(doc_id)
     data = _read_json(chunk_path)
     if not data:
         return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
@@ -1463,15 +1449,24 @@ async def ingest_upsert_tool(
 ) -> Dict[str, Any]:
     if not doc_id:
         return {"error": "missing_doc_id"}
-    default_chunk_path = _chunks_artifact_path(doc_id)
-    try:
-        chunk_path = _validate_artifact_path(chunks_artifact or default_chunk_path)
-    except ValueError as exc:
-        return {"error": "artifact_not_found", "detail": str(exc)}
-    try:
-        meta_path = _validate_artifact_path(metadata_artifact) if metadata_artifact else None
-    except ValueError as exc:
-        return {"error": "metadata_not_found", "detail": str(exc)}
+    if chunks_artifact:
+        try:
+            chunk_path = _validate_artifact_path(chunks_artifact)
+        except ValueError as exc:
+            return {"error": "invalid_artifact_path", "detail": str(exc)}
+    else:
+        chunk_path = _chunks_artifact_path(doc_id)
+    if not chunk_path.exists():
+        return {"error": "artifact_not_found", "detail": f"no chunk artifact for {doc_id}"}
+    if metadata_artifact:
+        try:
+            meta_path = _validate_artifact_path(metadata_artifact)
+        except ValueError as exc:
+            return {"error": "invalid_metadata_path", "detail": str(exc)}
+    else:
+        meta_path = None
+    if meta_path and not meta_path.exists():
+        return {"error": "metadata_not_found", "detail": f"no metadata artifact at {meta_path.as_posix()}"}
 
     plan = _load_plan(doc_id)
     plan_collection = plan.get("collection") if isinstance(plan, dict) else None
@@ -1609,11 +1604,6 @@ async def ingest_generate_summary_tool(
     client_id: Optional[str] = None,
     client_model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if os.getenv("ENABLE_CLIENT_SUMMARIES", "true").strip().lower() != "true":
-        return {
-            "error": "client_summaries_disabled",
-            "detail": "Set ENABLE_CLIENT_SUMMARIES=true to enable ingest.generate_summary",
-        }
     if not doc_id:
         return {"error": "missing_doc_id"}
     if not isinstance(summary_text, str) or not summary_text.strip():
@@ -1650,7 +1640,7 @@ async def ingest_generate_summary_tool(
         elements = [str(e) for e in element_ids]
 
     metadata = summary_metadata.copy() if isinstance(summary_metadata, dict) else {}
-    metadata.setdefault("timestamp", _utc_iso_now())
+    metadata.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
     if client_id:
         metadata.setdefault("client_id", client_id)
     if client_model:
@@ -1841,22 +1831,10 @@ async def ingest_corpus_upsert(
                 })
                 continue
 
-            try:
-                chunk_path_obj = _validate_artifact_path(chunk_artifact)
-            except ValueError as exc:
-                failures += 1
-                progress_log.append({
-                    "path": path_str,
-                    "doc_id": doc_id,
-                    "status": "error",
-                    "error": {"detail": str(exc)},
-                })
-                continue
-
             upsert_result = await _perform_upsert(
                 doc_id,
                 collection_name,
-                chunk_path_obj,
+                Path(chunk_artifact),
                 thin_payload=thin_payload,
                 skip_vectors=skip_vectors,
                 update_graph_links=update_graph,
@@ -2446,24 +2424,6 @@ async def _run_rerank(
         _annotate_rows(fallback_rows, query)
         return fallback_rows
 
-    colbert_scores: Dict[int, float] = {}
-    if COLBERT_LOCAL_ENABLED:
-        local_model = _get_colbert_local()
-        if local_model is not None:
-            try:
-                local_vals = local_model.score(query, texts)
-                for idx, val in enumerate(local_vals):
-                    if val is None:
-                        continue
-                    colbert_scores[idx] = float(val)
-            except Exception as exc:  # pragma: no cover - optional dependency
-                logger.warning("ColBERT local scoring error: %s", exc)
-    if colbert_scores:
-        weight = max(0.0, min(1.0, COLBERT_LOCAL_WEIGHT))
-        for idx, val in colbert_scores.items():
-            previous = rerank_scores.get(idx, 0.0)
-            rerank_scores[idx] = weight * val + (1.0 - weight) * previous
-
     dense_values = [getattr(h, "score", 0.0) for h in hits]
     dense_stats = (min(dense_values), max(dense_values)) if dense_values else None
     rerank_values = list(rerank_scores.values())
@@ -2525,7 +2485,6 @@ async def _run_rerank(
             "model_version": payload.get("model_version"),
             "prompt_sha": payload.get("prompt_sha"),
             "doc_metadata": payload.get("doc_metadata"),
-            "colbert_local_score": colbert_scores.get(idx),
             "scores": _score_breakdown(
                 bm25=None,
                 dense=dense_val,
@@ -3325,20 +3284,6 @@ async def kb_hint(
         "alias_count": len(ALIASES),
     }
 
-@mcp.tool(name="kb.hyde", title="KB: HyDE Hint")
-async def kb_hyde(ctx: Context, query: str) -> Dict[str, Any]:
-    if not isinstance(query, str) or not query.strip():
-        return {"error": "empty_query"}
-    _audit("hyde_hint", {
-        "query": query,
-        "subjects": _audit_subjects(get_subjects_from_context(ctx)),
-    })
-    return {
-        "query": query,
-        "hypothesis": "",
-        "status": "client_generate",
-        "info": "Generate a context-aware hypothesis in the MCP client and retry search (e.g., via kb.dense).",
-    }
 @mcp.tool(name="kb.table", title="KB: Table Lookup")
 async def kb_table(
     ctx: Context,
@@ -3782,7 +3727,6 @@ async def kb_search(
                 "reason": "low_answerability",
                 "top_score": best,
                 "threshold": ANSWERABILITY_THRESHOLD,
-                "suggestion": "client_generate_hypothesis",
             }
         ], route)
 

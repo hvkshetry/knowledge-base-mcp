@@ -60,7 +60,7 @@ To stay production-safe without training a separate critic:
 2. Call `kb.quality(collection="<slug>", query="<user question>")` to inspect score vectors (`bm25`, `dense`, `rrf`, `rerank`, `prior`, `decay`) and coverage diagnostics.
 3. Use a meta-prompt such as:
    > “Given the evidence and score breakdown, is there enough support to answer? If not, suggest which retrieval tool should run next.”
-4. Based on the LLM’s decision, branch to `kb.hyde`, `kb.sparse`, `kb.batch`, or abstain.
+4. Based on the LLM’s decision, branch to a client-authored HyDE retry (`kb.dense` with your hypothesis), `kb.sparse`, `kb.batch`, or abstain.
 5. Log the decision with the final answer for auditing.
 
 ## 5. Multi-Hop Reasoning

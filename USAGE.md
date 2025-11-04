@@ -315,7 +315,7 @@ All search routes return the same response schema so planners can swap modes wit
 The default MCP mode. Heuristics pick a route based on query shape:
 
 1. Dense or hybrid retrieval runs first.
-2. If the best score is below `ANSWERABILITY_THRESHOLD`, the server abstains and returns telemetry so your MCP client can decide whether to generate a HyDE hypothesis (via `kb.hyde`) or try an alternate phrasing/sparse query.
+2. If the best score is below `ANSWERABILITY_THRESHOLD`, the server abstains and returns telemetry so your MCP client can decide whether to generate a HyDE hypothesis itself (no server tool) or try an alternate phrasing/sparse query.
 
 | Query Type | Suggested Mode |
 |------------|----------------|
@@ -586,7 +586,7 @@ All tools hydrate snippets through the ACL-enforcing document store.
 
 Use the composable tools above to let the MCP client drive retrieval and critique loops. See [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md) for ready-to-run sequences:
 
-- **Retrieve → Assess → Refine**: combine `kb.hybrid`, `kb.quality`, `kb.open`, and `kb.hint` / `kb.hyde` to iterate safely.
+- **Retrieve → Assess → Refine**: combine `kb.hybrid`, `kb.quality`, `kb.open`, `kb.hint`, and client-authored HyDE retries to iterate safely.
 - **Table QA**: pair `kb.table` with `kb.open` and `kb.quality` to guarantee grounded tabular answers.
 - **Graph Walks**: `kb.entities` → `kb.linkouts` → `kb.graph` uncovers multi-hop evidence.
 - **Ingestion QA**: `ingest.analyze_document` → `ingest.extract_with_strategy` → `ingest.chunk_with_guidance` → `ingest.assess_quality` ensures deterministic plans.

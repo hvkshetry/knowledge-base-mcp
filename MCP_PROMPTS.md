@@ -10,7 +10,7 @@ You are connected to the knowledge-base MCP server. Call `kb.collections` if you
 For each user question:
 1. Call `kb.hybrid(collection="daf_kb", retrieve_k=32, return_k=10)`.
 2. Inspect the top hits with `kb.open(collection="daf_kb", chunk_id=...)` and run `kb.quality(collection="daf_kb", query="<user question>", rules={ "min_score": 0.35, "require_metadata": true })`.
-3. If quality fails, optionally call `kb.hyde` for guidance, then decide in the client whether to craft a hypothesis and rerun (e.g., `kb.dense` or `kb.rerank`).
+3. If quality fails, compose your own HyDE hypothesis and rerun with `kb.dense` / `kb.rerank` (there is no server-side HyDE tool).
 4. Include element_ids + page numbers in the final answer; abstain if
    quality never passes.
 ```
