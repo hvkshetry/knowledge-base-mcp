@@ -2,9 +2,7 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -14,47 +12,13 @@ import warnings
 warnings.filterwarnings("ignore", message=r".*SwigPy.*", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=r".*swigvarlink.*", category=DeprecationWarning)
 
-import fitz
-
 os.environ.setdefault("HF_HOME", str(Path(".cache") / "hf"))
 Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
-
-from docling.document_converter import DocumentConverter
 
 from structured_chunk import detect_blocks, _expand_table_block
 
 
-TABLE_TOKEN = re.compile(r"\bTable\s+\d+(\-\d+)?\b", re.IGNORECASE)
-FIGURE_TOKEN = re.compile(r"\b(Fig\.?|Figure)\s+\d+(\-\d+)?\b", re.IGNORECASE)
-
-
-def _calculate_page_confidence(
-    table_tokens: int,
-    text_density: float,
-    multicolumn_score: float,
-    has_images: bool,
-    vector_lines: int,
-) -> float:
-    if table_tokens > 100:
-        return 0.98
-    if vector_lines > 150:
-        return 0.97
-    if text_density > 1400 and table_tokens == 0 and not has_images:
-        return 0.95
-
-    if 50 <= table_tokens <= 100:
-        return 0.75
-    if 120 <= vector_lines <= 150:
-        return 0.70
-
-    if 20 <= table_tokens < 50:
-        return 0.60
-    if has_images and text_density > 1000:
-        return 0.50
-    if 2.0 <= multicolumn_score < 4.0:
-        return 0.65
-
-    return 0.80
+# Docling-only extraction - no routing or triage needed
 
 
 @dataclass
@@ -73,118 +37,18 @@ class Block:
     source_tool: str
 
 
-def _cache_key(path: Path, page: int, route: str) -> Path:
-    root = Path(os.getenv("CACHE_DIR", ".ingest_cache"))
-    key = hashlib.sha1(f"{path.resolve()}::{page}::{route}".encode("utf-8")).hexdigest()
-    return root / f"{key}.json"
-
-
-def triage_pdf(path: Path) -> Dict[str, Any]:
-    doc = fitz.open(path)
-    pages = []
-    for page_index, page in enumerate(doc, start=1):
-        blocks = page.get_text("blocks", flags=fitz.TEXTFLAGS_TEXT)
-        text_chars = sum(len(b[4]) for b in blocks if isinstance(b[4], str))
-        images = len(page.get_images(full=True))
-        drawings = page.get_drawings()
-        vector_lines = sum(
-            1
-            for drawing in drawings
-            for item in drawing.get("items", [])
-            if item and item[0] == "l"
-        )
-
-        centers = [
-            (b[0] + b[2]) / 2
-            for b in blocks
-            if isinstance(b[4], str) and b[4].strip()
-        ]
-        multicolumn_score = 0.0
-        if len(centers) >= 8:
-            centers.sort()
-            gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
-            if gaps:
-                mean_gap = sum(gaps) / len(gaps)
-                if mean_gap:
-                    multicolumn_score = max(gaps) / (mean_gap + 1e-6)
-
-        sample_text = " ".join(
-            (b[4] for b in blocks if isinstance(b[4], str))
-        )[:4000]
-        has_table_token = bool(TABLE_TOKEN.search(sample_text))
-        has_figure_token = bool(FIGURE_TOKEN.search(sample_text))
-        table_token_count = len(TABLE_TOKEN.findall(sample_text))
-        is_scan = text_chars < 200 and images > 0
-        is_tabley = vector_lines > 120 or has_table_token
-        is_multicol = multicolumn_score > float(os.getenv("MULTICOL_GAP_FACTOR", "4.0"))
-
-        route = "markitdown"
-        if (
-            is_scan
-            or is_tabley
-            or is_multicol
-            or has_figure_token
-        ):
-            route = "docling"
-
-        page_text = page.get_text("text") or ""
-        text_density = float(text_chars)
-        confidence = _calculate_page_confidence(
-            table_tokens=table_token_count,
-            text_density=text_density,
-            multicolumn_score=multicolumn_score,
-            has_images=images > 0,
-            vector_lines=vector_lines,
-        )
-        pages.append(
-            {
-                "page": page_index,
-                "route": route,
-                "original_route": route,
-                "text_chars": text_chars,
-                "images": images,
-                "vector_lines": vector_lines,
-                "multicolumn_score": multicolumn_score,
-                "has_table_token": has_table_token,
-                "has_figure_token": has_figure_token,
-                "table_tokens": table_token_count,
-                "text_density": text_density,
-                "confidence": confidence,
-                "has_images": images > 0,
-                "sample_text": page_text[:200],
-                "page_text": page_text,
-            }
-        )
-    doc.close()
-
-    heavy_pages = sum(1 for p in pages if p["route"] == "docling")
-    fraction = heavy_pages / max(len(pages), 1)
-    heavy_threshold = float(os.getenv("ROUTE_HEAVY_FRACTION", "0.30"))
-    small_doc_threshold = int(os.getenv("SMALL_DOC_DOCLING", "8"))
-    if len(pages) <= small_doc_threshold or fraction >= heavy_threshold:
-        for p in pages:
-            p["route"] = "docling"
-
-    confidence_stats = {
-        "high_confidence": sum(1 for p in pages if p.get("confidence", 0.0) >= 0.75),
-        "low_confidence": sum(1 for p in pages if p.get("confidence", 0.0) < 0.75),
-        "total_pages": len(pages),
-    }
-
-    return {"pages": pages, "confidence_stats": confidence_stats}
-
-
 def _init_counters() -> Dict[str, int]:
     return defaultdict(int)
 
 
-DOC_CONVERTER: Optional[DocumentConverter] = None
-DOC_CONVERTER_TIMEOUT = int(os.getenv("DOCLING_TIMEOUT", "45"))
+DOC_CONVERTER: Optional[Any] = None  # Type: DocumentConverter when loaded
 
 
-def _get_docling_converter() -> DocumentConverter:
+def _get_docling_converter():
+    """Lazy-load Docling DocumentConverter to avoid slow startup."""
     global DOC_CONVERTER
     if DOC_CONVERTER is None:
+        from docling.document_converter import DocumentConverter
         DOC_CONVERTER = DocumentConverter()
     return DOC_CONVERTER
 
@@ -215,307 +79,244 @@ def _infer_heading_level(text: str) -> int:
     return 1
 
 
-def _blocks_from_text(
-    doc_id: str,
-    path: Path,
-    page: int,
-    text: str,
-    heading_path: List[str],
-    counters: Dict[str, int],
-    source_tool: str,
-) -> Tuple[List[Block], List[str]]:
-    result: List[Block] = []
-    local_heading = heading_path.copy()
-    text_blocks = detect_blocks(text)
-    for tb in text_blocks:
-        block_text = tb.text.strip()
-        if not block_text:
-            continue
-        span = [tb.start, tb.end]
-        if tb.block_type == "heading":
-            level = tb.heading_level or _infer_heading_level(block_text)
-            local_heading = _update_heading_path(local_heading, block_text, level)
-            element_id = _next_element_id(counters, "heading", page)
-            result.append(
-                Block(
-                    doc_id=doc_id,
-                    path=str(path),
-                    page=page,
-                    type="heading",
-                    text=block_text,
-                    section_path=local_heading.copy(),
-                    element_id=element_id,
-                    bbox=None,
-                    headers=None,
-                    units=None,
-                    span=span,
-                    source_tool=source_tool,
-                )
-            )
-            continue
-
-        if tb.block_type == "table":
-            table_rows = _expand_table_block(tb, local_heading.copy(), counters["table"])
-            if table_rows:
-                counters["table"] += 1
-                for row_idx, row in enumerate(table_rows):
-                    element_id = _next_element_id(counters, "table_row", page)
-                    result.append(
-                        Block(
-                            doc_id=doc_id,
-                            path=str(path),
-                            page=page,
-                            type="table_row",
-                            text=row["text"],
-                            section_path=local_heading.copy(),
-                            element_id=element_id,
-                            bbox=None,
-                            headers=row.get("meta", {}).get("table_headers"),
-                            units=row.get("meta", {}).get("table_units"),
-                            span=[row.get("start"), row.get("end")],
-                            source_tool=source_tool,
-                        )
-                    )
-                continue
-
-        element_id = _next_element_id(counters, tb.block_type, page)
-        block_type = tb.block_type
-        if block_type == "paragraph":
-            block_type = "para"
-        result.append(
-            Block(
-                doc_id=doc_id,
-                path=str(path),
-                page=page,
-                type=block_type,
-                text=block_text,
-                section_path=local_heading.copy(),
-                element_id=element_id,
-                bbox=None,
-                headers=None,
-                units=None,
-                span=span,
-                source_tool=source_tool,
-            )
-        )
-    return result, local_heading
-
-
-def _docling_page_to_blocks(
+def _docling_full_document_to_blocks(
     path: Path,
     doc_id: str,
-    page: int,
-    heading_path: List[str],
-    counters: Dict[str, int],
-) -> Tuple[List[Block], List[str]]:
+) -> Tuple[List[Block], Dict[str, Any]]:
+    """
+    Process entire PDF with Docling in a single call.
+    Returns all blocks and metadata for the document.
+    """
     converter = _get_docling_converter()
-    tmp_pdf = None
+
+    print(f"Converting full document with Docling: {path}")
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp_pdf = Path(tmp.name)
-        original = fitz.open(path)
-        single = fitz.open()
-        single.insert_pdf(original, from_page=page - 1, to_page=page - 1)
-        single.save(tmp_pdf)
-        single.close()
-        original.close()
-
-        def _convert() -> Dict[str, Any]:
-            result = converter.convert(str(tmp_pdf))
-            return result.document.export_to_dict()
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_convert)
-            try:
-                doc_dict = future.result(timeout=DOC_CONVERTER_TIMEOUT)
-            except Exception:
-                doc_dict = None
-    finally:
-        if tmp_pdf:
-            try:
-                tmp_pdf.unlink(missing_ok=True)
-            except Exception:
-                pass
+        result = converter.convert(str(path))
+        doc_dict = result.document.export_to_dict()
+    except Exception as exc:
+        print(f"ERROR: Docling failed for {path}: {exc}")
+        return [], {"error": str(exc), "total_pages": 0}
 
     if not doc_dict:
-        return [], heading_path
+        return [], {"error": "Empty doc_dict", "total_pages": 0}
 
-    blocks: List[Block] = []
-    local_heading = heading_path.copy()
-    tables = doc_dict.get("tables", [])
-    pictures = doc_dict.get("pictures", [])
-    captions = []
+    # Group all content by page for organized processing
+    page_items: Dict[int, Dict[str, List]] = defaultdict(lambda: {"tables": [], "texts": [], "pictures": [], "captions": []})
 
-    for table in tables:
+    # Organize tables by page
+    for table in doc_dict.get("tables", []):
         prov = table.get("prov") or []
-        if not prov or prov[0].get("page_no") != page:
-            continue
-        table_id = _next_element_id(counters, "table", page)
-        captions.extend(table.get("captions", []))
-        cells = table.get("data", {}).get("table_cells", [])
-        rows_map: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
-        headers_map: Dict[int, str] = {}
-        for cell in cells:
-            start_row = cell.get("start_row_offset_idx")
-            start_col = cell.get("start_col_offset_idx")
-            text = (cell.get("text") or "").strip()
-            if text:
-                rows_map[start_row][start_col] = cell
-            if start_row == 0:
-                headers_map[start_col] = text
-        headers = [headers_map[idx] for idx in sorted(headers_map)]
-        for row_idx, col_map in sorted(rows_map.items()):
-            if row_idx == 0:
-                continue
-            parts = []
-            units_map = {}
-            for col_idx, cell in sorted(col_map.items()):
-                header = headers_map.get(col_idx, f"col_{col_idx}")
-                value = cell.get("text", "").strip()
-                if not value:
+        if prov:
+            page_no = prov[0].get("page_no")
+            if page_no:
+                page_items[page_no]["tables"].append(table)
+                page_items[page_no]["captions"].extend(table.get("captions", []))
+
+    # Organize text items by page
+    for item in doc_dict.get("texts", []):
+        prov = item.get("prov") or []
+        if prov:
+            page_no = prov[0].get("page_no")
+            if page_no:
+                page_items[page_no]["texts"].append(item)
+
+    # Organize pictures by page
+    for picture in doc_dict.get("pictures", []):
+        prov = picture.get("prov") or []
+        if prov:
+            page_no = prov[0].get("page_no")
+            if page_no:
+                page_items[page_no]["pictures"].append(picture)
+
+    # Now process all pages in order
+    blocks: List[Block] = []
+    heading_state: List[str] = []
+    counters = _init_counters()
+    total_pages = max(page_items.keys()) if page_items else 0
+
+    for page_num in sorted(page_items.keys()):
+        page_data = page_items[page_num]
+
+        # Process tables first
+        for table in page_data["tables"]:
+            table_id = _next_element_id(counters, "table", page_num)
+            cells = table.get("data", {}).get("table_cells", [])
+            rows_map: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+            headers_map: Dict[int, str] = {}
+
+            for cell in cells:
+                start_row = cell.get("start_row_offset_idx")
+                start_col = cell.get("start_col_offset_idx")
+                text = (cell.get("text") or "").strip()
+                if text:
+                    rows_map[start_row][start_col] = cell
+                if start_row == 0:
+                    headers_map[start_col] = text
+
+            headers = [headers_map[idx] for idx in sorted(headers_map)]
+
+            for row_idx, col_map in sorted(rows_map.items()):
+                if row_idx == 0:
                     continue
-                parts.append(f"{header}: {value}")
-                parts_header = re.match(r"^(?P<name>.+?)\s*\((?P<unit>[^)]+)\)$", header)
-                if parts_header:
-                    units_map[parts_header.group("name")] = parts_header.group("unit")
-            if not parts:
+                parts = []
+                units_map = {}
+                for col_idx, cell in sorted(col_map.items()):
+                    header = headers_map.get(col_idx, f"col_{col_idx}")
+                    value = cell.get("text", "").strip()
+                    if not value:
+                        continue
+                    parts.append(f"{header}: {value}")
+                    parts_header = re.match(r"^(?P<name>.+?)\s*\((?P<unit>[^)]+)\)$", header)
+                    if parts_header:
+                        units_map[parts_header.group("name")] = parts_header.group("unit")
+
+                if not parts:
+                    continue
+
+                bbox = None
+                bboxes = [cell.get("bbox") for cell in col_map.values() if cell.get("bbox")]
+                if bboxes:
+                    left = min(b["l"] for b in bboxes)
+                    top = min(b["t"] for b in bboxes)
+                    right = max(b["r"] for b in bboxes)
+                    bottom = max(b["b"] for b in bboxes)
+                    bbox = [left, top, right, bottom]
+
+                element_id = _next_element_id(counters, "table_row", page_num)
+                blocks.append(
+                    Block(
+                        doc_id=doc_id,
+                        path=str(path),
+                        page=page_num,
+                        type="table_row",
+                        text="; ".join(parts),
+                        section_path=heading_state.copy(),
+                        element_id=element_id,
+                        bbox=bbox,
+                        headers=headers,
+                        units=units_map or None,
+                        span=None,
+                        source_tool="docling",
+                    )
+                )
+
+        # Process text items for this page
+        for item in page_data["texts"]:
+            prov = item.get("prov") or []
+            if not prov:
                 continue
-            bbox = None
-            bboxes = [cell.get("bbox") for cell in col_map.values() if cell.get("bbox")]
-            if bboxes:
-                left = min(b["l"] for b in bboxes)
-                top = min(b["t"] for b in bboxes)
-                right = max(b["r"] for b in bboxes)
-                bottom = max(b["b"] for b in bboxes)
-                bbox = [left, top, right, bottom]
-            element_id = _next_element_id(counters, "table_row", page)
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            bbox_dict = prov[0].get("bbox") or {}
+            bbox = [bbox_dict.get(k) for k in ("l", "t", "r", "b")] if bbox_dict else None
+            span = prov[0].get("charspan")
+            label = item.get("label", "text")
+
+            if label in {"heading", "title"}:
+                level = _infer_heading_level(text)
+                heading_state = _update_heading_path(heading_state, text, level)
+                element_id = _next_element_id(counters, "heading", page_num)
+                blocks.append(
+                    Block(
+                        doc_id=doc_id,
+                        path=str(path),
+                        page=page_num,
+                        type="heading",
+                        text=text,
+                        section_path=heading_state.copy(),
+                        element_id=element_id,
+                        bbox=bbox,
+                        headers=None,
+                        units=None,
+                        span=span,
+                        source_tool="docling",
+                    )
+                )
+                continue
+
+            block_type = "para"
+            if "list" in label:
+                block_type = "list"
+            element_prefix = block_type if block_type != "para" else "para"
+            element_id = _next_element_id(counters, element_prefix, page_num)
             blocks.append(
                 Block(
                     doc_id=doc_id,
                     path=str(path),
-                    page=page,
-                    type="table_row",
-                    text="; ".join(parts),
-                    section_path=heading_path.copy(),
+                    page=page_num,
+                    type=block_type,
+                    text=text,
+                    section_path=heading_state.copy(),
                     element_id=element_id,
                     bbox=bbox,
-                    headers=headers,
-                    units=units_map or None,
+                    headers=None,
+                    units=None,
+                    span=span,
+                    source_tool="docling",
+                )
+            )
+
+        # Process captions for this page
+        for caption in page_data["captions"]:
+            cap_text = (caption.get("text") or "").strip()
+            if not cap_text:
+                continue
+            prov = caption.get("prov") or []
+            bbox = None
+            if prov:
+                b = prov[0].get("bbox") or {}
+                bbox = [b.get("l"), b.get("t"), b.get("r"), b.get("b")] if b else None
+            element_id = _next_element_id(counters, "caption", page_num)
+            blocks.append(
+                Block(
+                    doc_id=doc_id,
+                    path=str(path),
+                    page=page_num,
+                    type="caption",
+                    text=cap_text,
+                    section_path=heading_state.copy(),
+                    element_id=element_id,
+                    bbox=bbox,
+                    headers=None,
+                    units=None,
                     span=None,
                     source_tool="docling",
                 )
             )
 
-    for item in doc_dict.get("texts", []):
-        prov = item.get("prov") or []
-        if not prov:
-            continue
-        page_no = prov[0].get("page_no")
-        if page_no != page:
-            continue
-        text = (item.get("text") or "").strip()
-        if not text:
-            continue
-        bbox_dict = prov[0].get("bbox") or {}
-        bbox = [bbox_dict.get(k) for k in ("l", "t", "r", "b")] if bbox_dict else None
-        span = prov[0].get("charspan")
-        label = item.get("label", "text")
-        if label in {"heading", "title"}:
-            level = _infer_heading_level(text)
-            local_heading = _update_heading_path(local_heading, text, level)
-            element_id = _next_element_id(counters, "heading", page)
+        # Process pictures for this page
+        for picture in page_data["pictures"]:
+            prov = picture.get("prov") or []
+            if not prov:
+                continue
+            bbox_dict = prov[0].get("bbox") or {}
+            bbox = [bbox_dict.get("l"), bbox_dict.get("t"), bbox_dict.get("r"), bbox_dict.get("b")] if bbox_dict else None
+            element_id = _next_element_id(counters, "figure", page_num)
             blocks.append(
                 Block(
                     doc_id=doc_id,
                     path=str(path),
-                    page=page,
-                    type="heading",
-                    text=text,
-                    section_path=local_heading.copy(),
+                    page=page_num,
+                    type="figure",
+                    text="",
+                    section_path=heading_state.copy(),
                     element_id=element_id,
                     bbox=bbox,
                     headers=None,
                     units=None,
-                    span=span,
+                    span=None,
                     source_tool="docling",
                 )
             )
-            continue
 
-        block_type = "para"
-        if "list" in label:
-            block_type = "list"
-        element_prefix = block_type if block_type != "para" else "para"
-        element_id = _next_element_id(counters, element_prefix, page)
-        blocks.append(
-            Block(
-                doc_id=doc_id,
-                path=str(path),
-                page=page,
-                type=block_type,
-                text=text,
-                section_path=local_heading.copy(),
-                element_id=element_id,
-                bbox=bbox,
-                headers=None,
-                units=None,
-                span=span,
-                source_tool="docling",
-            )
-        )
+    metadata = {
+        "total_pages": total_pages,
+        "total_blocks": len(blocks),
+        "extractor": "docling",
+    }
 
-    for caption in captions:
-        cap_text = (caption.get("text") or "").strip()
-        if not cap_text:
-            continue
-        prov = caption.get("prov") or []
-        bbox = None
-        if prov:
-            b = prov[0].get("bbox") or {}
-            bbox = [b.get("l"), b.get("t"), b.get("r"), b.get("b")] if b else None
-        element_id = _next_element_id(counters, "caption", page)
-        blocks.append(
-            Block(
-                doc_id=doc_id,
-                path=str(path),
-                page=page,
-                type="caption",
-                text=cap_text,
-                section_path=heading_path.copy(),
-                element_id=element_id,
-                bbox=bbox,
-                headers=None,
-                units=None,
-                span=None,
-                source_tool="docling",
-            )
-        )
-
-    for picture in pictures:
-        prov = picture.get("prov") or []
-        if not prov or prov[0].get("page_no") != page:
-            continue
-        bbox_dict = prov[0].get("bbox") or {}
-        bbox = [bbox_dict.get("l"), bbox_dict.get("t"), bbox_dict.get("r"), bbox_dict.get("b")] if bbox_dict else None
-        element_id = _next_element_id(counters, "figure", page)
-        blocks.append(
-            Block(
-                doc_id=doc_id,
-                path=str(path),
-                page=page,
-                type="figure",
-                text="",
-                section_path=heading_path.copy(),
-                element_id=element_id,
-                bbox=bbox,
-                headers=None,
-                units=None,
-                span=None,
-                source_tool="docling",
-            )
-        )
-
-    return blocks, local_heading
+    return blocks, metadata
 
 
 def _serialize_blocks(blocks: Iterable[Block]) -> List[Dict[str, Any]]:
@@ -562,71 +363,16 @@ def _deserialize_blocks(items: Iterable[Dict[str, Any]]) -> List[Block]:
     return blocks
 
 
-def _plan_pages_lookup(plan_override: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-    if not plan_override:
-        return {}
-    pages = plan_override.get("pages") if isinstance(plan_override, dict) else None
-    if not pages:
-        return {}
-    lookup: Dict[int, Dict[str, Any]] = {}
-    for entry in pages:
-        if not isinstance(entry, dict):
-            continue
-        page_num = entry.get("page")
-        if isinstance(page_num, int):
-            lookup[page_num] = entry
-    return lookup
-
-
 def extract_document_blocks(
     path: Path,
     doc_id: str,
     plan_override: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Block], Dict[str, Any]]:
-    triage = triage_pdf(path)
-    plan_lookup = _plan_pages_lookup(plan_override)
-    blocks: List[Block] = []
-    heading_state: List[str] = []
-    counters = _init_counters()
-    cache_root = Path(os.getenv("CACHE_DIR", ".ingest_cache"))
-    cache_root.mkdir(parents=True, exist_ok=True)
-    for page_info in triage["pages"]:
-        page_num = page_info["page"]
-        override = plan_lookup.get(page_num) if plan_lookup else None
-        if override and override.get("route"):
-            page_info["route"] = override["route"]
-        route = page_info["route"]
-        cache_file = _cache_key(path, page_num, route)
-        if cache_file.exists():
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            page_blocks = _deserialize_blocks(cached)
-            blocks.extend(page_blocks)
-            if page_blocks:
-                heading_state = page_blocks[-1].section_path.copy()
-            continue
-
-        if route == "docling":
-            page_blocks, heading_state = _docling_page_to_blocks(path, doc_id, page_num, heading_state, counters)
-            if not page_blocks:
-                route = "markitdown"
-        if route != "docling":
-            page_text = page_info.get("page_text") or ""
-            page_blocks, heading_state = _blocks_from_text(
-                doc_id=doc_id,
-                path=path,
-                page=page_num,
-                text=page_text,
-                heading_path=heading_state,
-                counters=counters,
-                source_tool="markitdown",
-            )
-
-        cache_file.write_text(
-            json.dumps(_serialize_blocks(page_blocks), ensure_ascii=False),
-            encoding="utf-8",
-        )
-        blocks.extend(page_blocks)
-    return blocks, triage
+    """
+    Extract blocks from PDF using Docling only - no routing, no triage.
+    Breaking change: always uses Docling for full document processing.
+    """
+    return _docling_full_document_to_blocks(path, doc_id)
 
 
 def chunk_blocks(

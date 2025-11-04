@@ -287,7 +287,7 @@ def main():
     ap.add_argument("--root", required=True, help="directory with source documents")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
     ap.add_argument("--ollama-model", default="snowflake-arctic-embed:xs")
-    ap.add_argument("--extractor", choices=["markitdown", "docling", "auto"], default="markitdown")
+    # NOTE: Extractor removed - ingest_blocks.py now uses Docling-only for all documents
     ap.add_argument("--sparse-expander", choices=["none", "basic", "splade"], default=None, help="Optional sparse expander for SPLADE/uniCOIL-style term weights")
 
     # Metric/normalization
@@ -297,8 +297,8 @@ def main():
     ap.add_argument("--max-chars", type=int, default=1800)
     ap.add_argument("--overlap", type=int, default=150)
 
-    # Embedding batch
-    ap.add_argument("--batch-size", type=int, default=48)
+    # Embedding batch (increased default to 128 for better throughput)
+    ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--parallel", type=int, default=4)
     ap.add_argument("--ollama-threads", type=int, default=8)
     ap.add_argument("--ollama-keepalive", default="1h")
@@ -455,15 +455,19 @@ def main():
                     if qdrant_any_by_filter(qdrant_client, args.qdrant_collection, [{"key": "doc_id", "value": doc_id}]):
                         continue
 
-                # Extract early and apply content filters before heavy work
-                text, extraction_meta = extract_with_fallback(args.extractor, p)
+                # Extract with Docling (content filtering moved to post-extraction)
+                existing_plan = load_ingest_plan(doc_id)
+                plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
+                triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
+
+                # Apply content filters after extraction
+                if not triage_blocks:
+                    continue
+                text = "\n\n".join(b.text for b in triage_blocks if b.text)
                 if not text.strip():
                     continue
                 if args.min_words and alpha_word_count(text) < args.min_words:
                     continue
-                existing_plan = load_ingest_plan(doc_id)
-                plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
-                triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
                 overlap_sentences = max(1, args.overlap // 80 if args.overlap else 1)
                 if plan_override and isinstance(plan_override, dict):
                     # Reuse overlap settings from existing plan if provided

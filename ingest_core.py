@@ -49,7 +49,7 @@ def embed_texts(
     ollama_url: str,
     model: str,
     texts: List[str],
-    batch_size: int = 32,
+    batch_size: int = 128,
     timeout: int = 120,
     normalize: bool = True,
     parallel: int = 1,
