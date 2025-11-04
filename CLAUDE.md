@@ -59,7 +59,6 @@
 - Session controls: `kb.promote`, `kb.demote`, `kb.collections`
 
 ## Reporting & Provenance
-- Append your decisions to the plan (`client_orchestration` or `client_decisions` lists) before upserting.
-- Record the final `plan_hash`, `model_version`, and `prompt_sha` whenever you store metadata/summaries or run upserts.
-- Never bypass budgets, never rewrite chunk text, never insert LLM hallucinations—the server expects determinism.
-- If anything is unclear, stop and escalate rather than guessing.
+- Document your choices (e.g., page overrides, summary model) in `client_orchestration` / `client_decisions` before upserting so plan artifacts explain what changed.
+- The chunk artifacts produced by `ingest.chunk_with_guidance` already carry `plan_hash`, `model_version`, and `prompt_sha`; the server automatically persists them to vector/FTS payloads when you call `ingest.upsert`/`ingest.upsert_batch`.
+- Do not bypass budgets, rewrite chunk text, or invent missing metadata—the server expects deterministic inputs. If something is unclear, stop and escalate rather than guessing.
