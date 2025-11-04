@@ -7,6 +7,7 @@ import re
 import hashlib
 import uuid
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -63,13 +64,15 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_METRIC = os.getenv("QDRANT_METRIC", "cosine")
 COLBERT_URL = os.getenv("COLBERT_URL")
 COLBERT_TIMEOUT = int(os.getenv("COLBERT_TIMEOUT", "60"))
+COLBERT_LOCAL_ENABLED = os.getenv("COLBERT_LOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
+COLBERT_LOCAL_WEIGHT = float(os.getenv("COLBERT_LOCAL_WEIGHT", "0.7"))
 FTS_DB_PATH = os.getenv("FTS_DB_PATH", "data/fts.db")
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "data/graph.db")
 SUMMARY_DB_PATH = os.getenv("SUMMARY_DB_PATH", "data/summary.db")
 SPARSE_EXPANDER = SparseExpander(os.getenv("SPARSE_EXPANDER", "none"))
 SPARSE_QUERY_TOP_K = int(os.getenv("SPARSE_QUERY_TOP_K", "48"))
 HAVE_SPARSE_SPLADE = SPARSE_EXPANDER.enabled
-HAVE_COLBERT = bool(COLBERT_URL)
+HAVE_COLBERT = bool(COLBERT_URL) or COLBERT_LOCAL_ENABLED
 INGEST_EMBED_BATCH = int(os.getenv("INGEST_EMBED_BATCH", "32"))
 INGEST_EMBED_TIMEOUT = int(os.getenv("INGEST_EMBED_TIMEOUT", "120"))
 INGEST_EMBED_PARALLEL = int(os.getenv("INGEST_EMBED_PARALLEL", "1"))
@@ -91,6 +94,10 @@ qdr = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 mcp = FastMCP(name="knowledge-base", version="1.0.0", instructions="Vector search with Qdrant + Ollama embeddings and TEI reranker")
 doc_store = DocumentStore(FTS_DB_PATH)
 
+_colbert_local_lock = threading.Lock()
+_colbert_local_instance = None
+_colbert_local_disabled = False
+
 ARTIFACT_DIR = Path(os.getenv("INGEST_ARTIFACT_DIR", "data/ingest_artifacts"))
 PLAN_DIR = Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
 INGEST_MODEL_VERSION = os.getenv("INGEST_MODEL_VERSION", "structured_ingest_v1")
@@ -101,6 +108,25 @@ MAX_CANARY_QUERIES = int(os.getenv("MAX_CANARY_QUERIES", "6"))
 CANARY_TIMEOUT = int(os.getenv("CANARY_TIMEOUT", "30"))
 
 SESSION_PRIORS: Dict[str, Dict[str, float]] = {}
+
+
+def _get_colbert_local():
+    global _colbert_local_instance, _colbert_local_disabled
+    if not COLBERT_LOCAL_ENABLED or _colbert_local_disabled:
+        return None
+    with _colbert_local_lock:
+        if _colbert_local_instance is not None:
+            return _colbert_local_instance
+        try:
+            from colbert_local import ColbertLocalReranker  # type: ignore
+
+            _colbert_local_instance = ColbertLocalReranker()
+            logger.info("ColBERT local reranker loaded: %s", _colbert_local_instance.model_name)
+            return _colbert_local_instance
+        except Exception as exc:  # pragma: no cover - optional dependency
+            _colbert_local_disabled = True
+            logger.warning("ColBERT local reranker unavailable: %s", exc)
+            return None
 
 
 def _lookup_chunk_by_element(element_id: str) -> Optional[str]:
@@ -2420,6 +2446,24 @@ async def _run_rerank(
         _annotate_rows(fallback_rows, query)
         return fallback_rows
 
+    colbert_scores: Dict[int, float] = {}
+    if COLBERT_LOCAL_ENABLED:
+        local_model = _get_colbert_local()
+        if local_model is not None:
+            try:
+                local_vals = local_model.score(query, texts)
+                for idx, val in enumerate(local_vals):
+                    if val is None:
+                        continue
+                    colbert_scores[idx] = float(val)
+            except Exception as exc:  # pragma: no cover - optional dependency
+                logger.warning("ColBERT local scoring error: %s", exc)
+    if colbert_scores:
+        weight = max(0.0, min(1.0, COLBERT_LOCAL_WEIGHT))
+        for idx, val in colbert_scores.items():
+            previous = rerank_scores.get(idx, 0.0)
+            rerank_scores[idx] = weight * val + (1.0 - weight) * previous
+
     dense_values = [getattr(h, "score", 0.0) for h in hits]
     dense_stats = (min(dense_values), max(dense_values)) if dense_values else None
     rerank_values = list(rerank_scores.values())
@@ -2481,6 +2525,7 @@ async def _run_rerank(
             "model_version": payload.get("model_version"),
             "prompt_sha": payload.get("prompt_sha"),
             "doc_metadata": payload.get("doc_metadata"),
+            "colbert_local_score": colbert_scores.get(idx),
             "scores": _score_breakdown(
                 bm25=None,
                 dense=dense_val,

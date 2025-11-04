@@ -8,3 +8,9 @@ mcp[cli]
 fastmcp>=0.1.0
 pydantic>=2.0.0
 pymupdf
+torch==2.8.0
+transformers>=4.56.0
+sentencepiece
+ragatouille<0.0.10
+langchain<0.2,>=0.1.20
+langchain-community<0.1
