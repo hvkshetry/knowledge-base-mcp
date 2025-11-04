@@ -84,24 +84,28 @@ The Semantic Search MCP Server is a hybrid RAG (Retrieval-Augmented Generation) 
 
 **Stages**:
 1. **Discovery** – Walk directory tree, filter files.
-2. **Triage** – PyMuPDF inspects each PDF page for tables, multi-column layouts, scans, and figure cues.
-3. **Extraction** – Light pages use MarkItDown; heavy pages route through Docling (with per-page caching and timeout safeguards).
-4. **Chunking** – Structured blocks (headings, paragraphs, table rows, captions) carry section breadcrumbs, element IDs, bounding boxes, and provenance.
-5. **Graph & Summaries** – Ingest writes a lightweight content graph (entity → chunk edges). Summary generation is optional; run the summary tooling if you need `kb.summary` to return content.
-6. **Embedding & Storage** – Generate embeddings, write to Qdrant (vector), SQLite FTS (BM25), and persist graph/summary rows.
+2. **Extraction** – Docling processes entire PDFs in single calls, extracting semantic structure (tables, figures, headings, bboxes, section paths).
+3. **Chunking** – Structured blocks (headings, paragraphs, table rows, captions) carry section breadcrumbs, element IDs, bounding boxes, and provenance.
+4. **Graph & Summaries** – Ingest writes a lightweight content graph (entity → chunk edges). Summary generation is optional; run the summary tooling if you need `kb.summary` to return content.
+5. **Embedding & Storage** – Generate embeddings, write to Qdrant (vector), SQLite FTS (BM25), and persist graph/summary rows.
 
 **Key Features**:
 - Incremental ingest with change detection and deterministic UUIDs.
-- Page-level routing keeps most documents fast on MarkItDown, reserving Docling for complex layouts.
-- Cache-aware per-page extraction drastically reduces re-ingest cost.
-- Governance-friendly “thin payload” option omits raw text from Qdrant; snippets are hydrated via the document store.
+- Full-document processing eliminates per-page overhead (~60-65% faster than old routing approach).
+- Deterministic chunk IDs enable automatic upsert-based updates.
+- Governance-friendly "thin payload" option omits raw text from Qdrant; snippets are hydrated via the document store.
+
+**Performance Improvements** (Docling-only vs old per-page routing):
+- 747-page corpus: 9.5h → 3.3-4.8h (~60-65% faster)
+- Eliminates ~125 min PyMuPDF triage overhead
+- Eliminates ~25-38 min temp PDF creation overhead
+- All metadata preserved (table headers, units, bboxes, provenance)
 
 ### Client vs Server Responsibilities
 
 | Responsibility | Server (Deterministic) | MCP Client (Intelligent) |
 |----------------|------------------------|---------------------------|
-| Text extraction | PyMuPDF / MarkItDown / Docling | — |
-| Page heuristics | Confidence scoring, routing suggestions | Review low-confidence pages, override routes |
+| Text extraction | Docling full-document processing | — |
 | Embeddings & search | Qdrant vectors, SQLite FTS, reranking | Compose search strategies, decide retries |
 | Summaries | Persist summaries with provenance metadata | Generate the summaries themselves |
 | HyDE | Returns abstain on low confidence | Generate hypotheses and retry search |

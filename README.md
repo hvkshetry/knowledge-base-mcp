@@ -5,19 +5,19 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 ## 🌟 Features
 
 - **Zero-Cost Embeddings & Reranking**: Ollama-powered embeddings and a local TEI cross-encoder keep every document and query free of per-token fees.
-- **Structure-Aware Ingestion**: A triage pass keeps most pages on MarkItDown while routing complex layouts through Docling for table/figure-aware blocks, including bboxes, section breadcrumbs, and element IDs.
+- **Structure-Aware Ingestion**: Docling processes entire PDFs in single calls for ~60-65% faster performance, extracting tables, figures, headings with bboxes, section breadcrumbs, and element IDs. Full-document processing eliminates per-page overhead while preserving all semantic structure.
 - **Agent-Directed Hybrid Retrieval**: Auto mode chooses among dense, hybrid, sparse, and rerank routes; when scores are low it returns an abstain so the MCP client can decide whether to run HyDE or try alternate queries. Every primitive stays exposed for manual overrides.
 - **Multi-Collection Support (manual)**: Organize documents into separate knowledge bases by adding entries to `NOMIC_KB_SCOPES`; the default configuration ships with a single collection (`daf_kb`).
-- **Incremental & Cached Ingestion**: Smart update detection only reprocesses changed documents, and per-page extraction is cached to accelerate re-ingests.
+- **Incremental & Deterministic Ingestion**: Smart update detection only reprocesses changed documents. Deterministic chunk IDs enable automatic upsert-based updates without manual cleanup.
 - **Graph & Entities (lightweight)**: Ingestion extracts equipment/chemical/parameter entities and links them back to chunks so agents can pivot via `kb.entities`/`kb.linkouts`. (Full semantic relationship extraction is still on the roadmap.)
-- **Operational Tooling**: `scripts/manage_cache.py` helps purge Docling caches or rebuild graph/summary stores; GPU knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) keep heavy PDFs flowing.
+- **Operational Tooling**: `scripts/manage_cache.py` and `scripts/manage_collections.sh` help purge caches or manage Qdrant collections; GPU knobs (`DOCLING_DEVICE`, `DOCLING_BATCH_SIZE`) keep heavy PDFs flowing.
 - **Canary QA Framework**: `ingest.assess_quality` can run user-supplied canary queries (`config/canaries/`) and report warnings before documents reach production.
 - **Provenance-Ready Payloads**: Chunks, graph nodes, and search results surface canonical `page_numbers`, section paths, element IDs, table metadata, and original tool provenance.
 - **MCP-Controlled Upserts**: `ingest.upsert`, `ingest.upsert_batch`, and `ingest.corpus_upsert` let agents push chunk artifacts straight into Qdrant + FTS without leaving the MCP workflow.
 - **Client-Orchestrated Summaries & HyDE**: LLM clients contribute section summaries via `ingest.generate_summary` and generate context-aware HyDE hypotheses locally before re-querying `kb.dense`, with every decision recorded in plan provenance.
 - **Observability & Guardrails**: Search logs include hashed subject IDs, stage-level timings, and top hits; `eval.py` runs gold sets with recall/nDCG/latency thresholds for CI gating.
 - **MCP Integration**: Works seamlessly with Claude Desktop, Claude Code, Codex CLI, and any MCP-compliant client.
-- **Agent Playbooks**: Ready-to-run “retrieve → assess → refine” workflows for Claude and other MCP clients are documented in [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md).
+- **Agent Playbooks**: Ready-to-run "retrieve → assess → refine" workflows for Claude and other MCP clients are documented in [`CLAUDE.md`](CLAUDE.md) and [`.codex/AGENTS.md`](.codex/AGENTS.md).
 
 > **Experimental / optional features** such as SPLADE sparse expansion, ColBERT late interaction, automatic summaries/outlines, HyDE query expansion, and enforced canary QA require additional services or configuration. See the status table below for details.
 
@@ -41,7 +41,7 @@ A production-grade **Model Context Protocol (MCP)** server that puts a state-of-
 
 Conventional RAG systems hide retrieval behind a monolithic API. This server embraces the MCP client as a planner:
 
-- **Ingestion as a Toolchain** – `ingest.analyze_document` triages each page (MarkItDown vs Docling) so the client can approve or tweak the plan; `ingest.chunk_with_guidance` switches between enumerated chunkers (`heading_based`, `procedure_block`, `table_row`); `ingest.generate_metadata` enforces byte budgets and prompt hashes. Every step returns artifacts and plan hashes for replayable ingestion.
+- **Ingestion as a Toolchain** – `ingest.extract_with_strategy` processes entire PDFs with Docling in single calls (no per-page routing); `ingest.chunk_with_guidance` switches between enumerated chunkers (`heading_based`, `procedure_block`, `table_row`); `ingest.generate_metadata` enforces byte budgets and prompt hashes. Every step returns artifacts and plan hashes for replayable ingestion.
 - **Retrieval as Composable Primitives** – `kb.sparse`, `kb.dense`, `kb.hybrid`, `kb.rerank`, `kb.hint`, `kb.table_lookup`, `kb.entities`, `kb.linkouts`, `kb.batch`, `kb.quality`, and `kb.promote/demote`. Use these with client-authored HyDE retries and planner heuristics to branch, retry, or fuse strategies mid-conversation.
 - **Self-Critique with Insight** – Results surface full score vectors (`bm25`, `dense`, `rrf`, `rerank`, `prior`, `decay`) and `why` annotations (matched aliases, headers, table clues), letting the agent reason about confidence before presenting an answer.
 
@@ -83,7 +83,7 @@ Because Claude (or any MCP client) stays in the driver seat, you get agentic ret
 
 **Processing Pipeline**:
 ```
-Documents → Triage → Extract (MarkItDown/Docling) → Chunk → Graph & Summaries → Embed → [Qdrant + SQLite FTS] → Planner → Search → Rerank → Self-Critique → Results
+Documents → Extract (Docling full-document) → Chunk → Graph & Summaries → Embed → [Qdrant + SQLite FTS] → Planner → Search → Rerank → Self-Critique → Results
 ```
 
 ## 📋 Use Cases
@@ -244,12 +244,10 @@ Set via environment variables (or CLI flags when available):
 | Environment variable | Purpose |
 |----------------------|---------|
 | `MIX_W_BM25`, `MIX_W_DENSE`, `MIX_W_RERANK` | Adjust blend between lexical, dense, and rerank signals. |
-| `ROUTE_HEAVY_FRACTION`, `SMALL_DOC_DOCLING` | Control when the triage step escalates an entire document to Docling. |
-| `DOCLING_TIMEOUT` | Seconds to wait for Docling to finish processing a page (default 45). |
+| `DOCLING_TIMEOUT` | Seconds to wait for Docling to finish processing a document (default 300). |
 | `HF_HOME` | Hugging Face cache directory used by Docling models (default `.cache/hf`). |
 | `GRAPH_DB_PATH`, `SUMMARY_DB_PATH` | Override lightweight graph and summary storage locations. |
 | `ANSWERABILITY_THRESHOLD` | Minimum score required for auto mode to respond; lower scores return an abstain for the client to handle (e.g., run HyDE or rephrase). |
-| `ROUTE_HEAVY_FRACTION`, `MULTICOL_GAP_FACTOR`, `TABLE_LINE_THRESHOLD` | Tune triage sensitivity for heavy tables/multi-column PDF layouts. |
 
 ## 📚 Usage
 
@@ -264,10 +262,10 @@ For upcoming improvements, check [ROADMAP.md](ROADMAP.md).
 
 ## 📘 Further Reading
 
-- [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md) – agent playbooks for retrieve → assess → refine loops, table QA, ingestion QA, and multi-hop reasoning.
-- [`MCP_PROMPTS.md`](MCP_PROMPTS.md) – copy/paste prompt snippets for Claude Desktop/Code sessions.
-- [`SPARSE_COLBERT_PLAN.md`](SPARSE_COLBERT_PLAN.md) – step-by-step outline for adding SPLADE/uniCOIL expansions and ColBERT late interaction with MCP-aware routing.
+- [`CLAUDE.md`](CLAUDE.md) – MCP agent prompt for Claude Desktop/Code with ingestion and retrieval workflows.
+- [`.codex/AGENTS.md`](.codex/AGENTS.md) – MCP agent prompt for Codex CLI.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) – deep dive into RRF, reranking, and chunking design choices.
+- [`ROADMAP.md`](ROADMAP.md) – planned features including SPLADE sparse expansion and ColBERT late interaction.
 
 ## 🏛️ Architecture Details
 

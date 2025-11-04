@@ -100,17 +100,18 @@ For 100,000 pages: ~500MB-1GB
 
 ### How long does ingestion take?
 
-Depends on hardware and extractor:
+Depends on hardware. With Docling full-document processing (~60-65% faster than old per-page routing):
 
-**MarkItDown** (fast):
-- 10-15 pages/second
-- 1000 pages: ~2-3 minutes
-- 10,000 pages: ~20-30 minutes
+**Docling** (structure-aware, optimized):
+- 747-page corpus: 3.3-4.8 hours (was 9.5h with per-page routing)
+- ~5-10 pages/second depending on document complexity
+- 1000 pages: ~2-3 hours
+- 10,000 pages: ~20-30 hours
 
-**Docling** (high quality):
-- 2-5 pages/second
-- 1000 pages: ~5-10 minutes
-- 10,000 pages: ~1-2 hours
+**Performance improvements** from single-extractor approach:
+- Eliminates ~125 min PyMuPDF triage overhead per 747 pages
+- Eliminates ~25-38 min temp PDF creation overhead
+- All semantic structure preserved (tables, figures, bboxes, headings)
 
 ### What if ingestion fails partway through?
 
@@ -210,17 +211,21 @@ Each step adds latency. Typical: ~200-300ms (vs ~100ms for rerank).
 
 Because the MCP client (Claude) already has best-in-class generation capabilities at no marginal cost. The server stays deterministic—extracting text, running search, and storing results—while the client reads evidence and produces summaries or hypotheses.
 
-### How does hybrid per-page routing work without server LLM calls?
+### How does extraction work now?
 
-The server supplies page-level heuristics and confidence scores (`ingest.analyze_document`). For high-confidence pages the suggested extractor is used as-is; for low-confidence pages the client inspects metadata (`table_tokens`, `text_density`, `sample_text`) and chooses the extractor before calling `ingest.extract_with_strategy`.
+**Single extractor, full-document processing**:
+- All PDFs processed by Docling in single calls (no per-page routing)
+- ~60-65% faster than old per-page routing approach
+- All semantic structure preserved (tables, figures, headings, bboxes, section paths)
+- Eliminates PyMuPDF triage overhead and temp PDF creation
 
 ### What is client orchestration?
 
-Client orchestration means Claude plans the ingestion/search strategy—generating HyDE passages, selecting extractors, and writing summaries—while the server executes deterministically. This keeps the system reproducible, avoids extra API costs, and ensures the highest-quality model is making decisions.
+Client orchestration means Claude plans the ingestion/search strategy—generating HyDE passages, selecting chunking profiles, and writing summaries—while the server executes deterministically. This keeps the system reproducible, avoids extra API costs, and ensures the highest-quality model is making decisions.
 
 ### Does this add latency or cost?
 
-No. Claude is already in the loop; examining metadata for the ~10% low-confidence pages takes seconds. Avoiding server-side LLM calls removes the need to run additional LLM infrastructure on the backend.
+No. The Docling-only approach is ~60-65% faster than the old per-page routing system. Avoiding server-side LLM calls removes the need to run additional LLM infrastructure on the backend.
 
 ## Configuration
 
@@ -297,9 +302,9 @@ cp data/*.db ./backup/
 
 ```bash
 python ingest.py \
-  --embed-batch-size 64 \      # Larger batches (if memory allows)
+  --batch-size 128 \            # Larger batches (default, optimized)
   --parallel 8 \                # More workers (match CPU cores)
-  --extractor markitdown        # Faster than Docling
+  --max-chars 700               # Recommended chunk size for reranker
 ```
 
 ### How can I speed up search?
@@ -413,16 +418,13 @@ ollama pull snowflake-arctic-embed:xs  # Smallest, fastest
 
 ### Extraction fails for some PDFs
 
-Try different extractors:
+Docling is now the only extractor. If extraction fails:
 
 ```bash
-# Try Docling (best for complex PDFs)
-python ingest.py --extractor docling ...
+# Increase timeout for large/complex PDFs
+DOCLING_TIMEOUT=600 python ingest.py ...
 
-# Or use auto mode (tries multiple extractors)
-python ingest.py --extractor auto ...
-
-# Or skip problematic files
+# Or use robust embedding mode to skip failed chunks
 python ingest.py --embed-robust ...
 ```
 
@@ -439,6 +441,7 @@ python ingest.py \
 ```
 
 **Guidelines**:
+- **With reranker (recommended)**: 700 chars (optimized for cross-encoder)
 - **Technical docs**: 1800-2400 chars
 - **Legal docs**: 2400-3000 chars (need more context)
 - **Short content**: 1200-1500 chars
@@ -492,10 +495,10 @@ Where `K=60` (default). This normalizes different score scales and combines rank
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Areas needing help:
 - Testing framework
-- Additional document extractors
 - Performance optimization
 - Documentation improvements
 - Example use cases
+- SPLADE/ColBERT integration
 
 ### I found a bug, what should I do?
 

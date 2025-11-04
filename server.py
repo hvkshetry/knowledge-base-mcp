@@ -24,7 +24,6 @@ from summary_index import query_summaries, upsert_summary_entry
 from lexical_index import ALIASES, fetch_texts_by_chunk_ids
 from sparse_expansion import SparseExpander
 from ingest_blocks import (
-    triage_pdf,
     extract_document_blocks,
     chunk_blocks,
     _serialize_blocks,
@@ -971,48 +970,6 @@ def _record_client_decisions(
             entry.setdefault("timestamp", datetime.utcnow().isoformat(timespec="seconds") + "Z")
             entries.append(entry)
     _save_plan(doc_id, plan)
-
-
-@mcp.tool(name="ingest.analyze_document", title="Ingest: Analyze Document")
-async def ingest_analyze(ctx: Context, path: str) -> Dict[str, Any]:
-    if not path:
-        return {"error": "missing_path"}
-    path_obj = Path(path).expanduser()
-    if not path_obj.is_file():
-        return {"error": "not_found", "detail": f"file not found: {path_obj.as_posix()}"}
-    try:
-        triage = await asyncio.to_thread(triage_pdf, path_obj)
-    except Exception as exc:
-        return {"error": "triage_failed", "detail": str(exc)}
-
-    doc_id = _doc_id_for_path(path_obj)
-    sanitized = _sanitize_triage_for_plan(triage)
-
-    plan_data = _load_plan(doc_id)
-    plan_data.update({
-        "doc_id": doc_id,
-        "path": path_obj.as_posix(),
-        "triage": sanitized,
-    })
-    _ensure_plan_defaults(plan_data)
-    plan_data.setdefault("chunk_profile", plan_data.get("chunk_profile") or "auto")
-    plan_data.setdefault("chunk_params", plan_data.get("chunk_params") or {})
-    plan_hash = _compute_plan_hash(plan_data)
-    plan_data["plan_hash"] = plan_hash
-    _save_plan(doc_id, plan_data)
-
-    route_counts: Dict[str, int] = {}
-    for page in sanitized.get("pages", []):
-        route = page.get("route") or "markitdown"
-        route_counts[route] = route_counts.get(route, 0) + 1
-
-    return {
-        "doc_id": doc_id,
-        "plan": plan_data,
-        "plan_hash": plan_hash,
-        "page_count": len(sanitized.get("pages", [])),
-        "route_counts": route_counts,
-    }
 
 
 @mcp.tool(name="ingest.extract_with_strategy", title="Ingest: Extract Blocks")

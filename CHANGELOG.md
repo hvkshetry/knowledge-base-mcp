@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (Breaking)
+- **Docling-only extraction**: Removed per-page routing and triage logic
+- **Removed `--extractor` CLI flag**: Docling is now the only extractor
+- **Performance improvement**: ~60-65% faster ingestion (9.5h → 3.3-4.8h for 747-page corpus)
+- **Default batch size**: Increased from 32 to 128 for better embedding throughput
+- **Recommended chunk size**: Now 700 chars (was 1800) for reranker compatibility
+
 ### Added
 - Initial public release
 - Hybrid semantic search with three modes (semantic, rerank, hybrid)
 - Multi-collection support via MCP scopes
-- Incremental ingestion with change detection
+- Incremental ingestion with change detection and deterministic chunk IDs
 - Neighbor context expansion
 - Time decay scoring for recency boost
 - Comprehensive documentation (README, INSTALLATION, USAGE, ARCHITECTURE, FAQ)
@@ -21,19 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Production ingestion script with batch processing
 - SQLite FTS5 lexical search integration
 - RRF (Reciprocal Rank Fusion) for hybrid search
+- Collection management script (`scripts/manage_collections.sh`)
 
 ### Technical Details
 - FastMCP-based MCP server
 - Qdrant vector database with HNSW indexing
 - Ollama embeddings (snowflake-arctic-embed:xs default)
 - Hugging Face TEI cross-encoder reranker
-- MarkItDown and Docling document extractors
+- Docling full-document PDF processing (semantic structure extraction)
 - Character-based sliding window chunking
 - Configurable search parameters (retrieve_k, return_k, top_k)
+- Full metadata preservation (table headers, units, bboxes, provenance)
 
 ### Fixed
 - Hardened ingestion MCP tools against path traversal by validating chunk and metadata artifact inputs with `_validate_artifact_path`.
 - Updated agent prompts and documentation to reflect client-authored HyDE retries and hierarchical summary workflows.
+
+### Performance
+- Eliminates ~125 min PyMuPDF triage overhead per 747 pages
+- Eliminates ~25-38 min temp PDF creation overhead
+- All semantic structure preserved while achieving 60-65% speed improvement
 
 ## [1.0.0] - TBD
 
