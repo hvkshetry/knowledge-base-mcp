@@ -590,6 +590,88 @@ Two lightweight stores are built during ingest:
 
 All tools hydrate snippets through the ACL-enforcing document store.
 
+#### Critical Practice: Always Expand Search Results with kb_neighbors
+
+**With chunk size 700, a single search result chunk is NEVER sufficient for comprehensive answers.** Complete context is always distributed across neighboring chunks. This applies to ALL queries, not just tables.
+
+**Mandatory workflow for every search**:
+1. Get top result(s) from `kb.search()` or `kb.hybrid()`
+2. **ALWAYS call `kb_neighbors(n=10)`** on the top chunk_id
+3. Analyze the full 21-chunk context before answering
+
+#### Example 1: Table Reconstruction
+
+Table references (captions, headings) are separated from data rows. With chunk size 700, use `kb_neighbors(n=10)` to retrieve the complete table:
+
+**Step 1 - Find the reference**:
+```python
+results = await kb.search(collection="daf_kb", query="Table 1.1 gas solubility", mode="hybrid")
+reference_chunk_id = results[0]["chunk_id"]  # e.g., "14f24b1b-c316-5a29-a722-1ab95cced35d"
+```
+
+**Step 2 - Get neighbors (n=10 recommended)**:
+```python
+neighbors = await kb.neighbors(collection="daf_kb", chunk_id=reference_chunk_id, n=10)
+# Returns 21 chunks: 10 before + reference + 10 after
+# Typical response: ~19,000 tokens (safely under 25,000 limit)
+```
+
+**Step 3 - Locate table data**:
+```python
+# Table rows typically 3-10 chunks away from reference
+for chunk in neighbors:
+    if "Gas:" in chunk["text"] or "Temperature:" in chunk["text"]:
+        # Found table data!
+        # chunk_start positions: 201837, 202757, 203720, etc.
+```
+
+**Step 4 - Reconstruct**:
+Parse colon-separated key-value pairs and rebuild the complete table structure.
+
+**Why n=10?**
+- Table data at 700 char/chunk is distributed across 3-10 neighboring chunks
+- n=5 may miss data that's further away
+- n=15 risks exceeding 25,000 token MCP response limit
+- n=10 balances coverage and token limit safety
+
+#### Example 2: Multi-Step Procedures
+
+Procedures are split across chunks. The top search result might hit step 3, but you need steps 1-2 (before) and steps 4-8 (after):
+
+**Step 1 - Search**:
+```python
+results = await kb.search(collection="daf_kb", query="DAF startup procedure", mode="hybrid")
+top_chunk_id = results[0]["chunk_id"]
+```
+
+**Step 2 - Expand (MANDATORY)**:
+```python
+neighbors = await kb.neighbors(collection="daf_kb", chunk_id=top_chunk_id, n=10)
+# Returns: Prerequisites → Step 1 → Step 2 → [HIT: Step 3] → Step 4 → Step 5 → ... → Completion
+```
+
+**Step 3 - Provide complete answer**:
+Now you have the full procedure from prerequisites through completion, not just the isolated step that matched the search query.
+
+#### Example 3: Conceptual Questions
+
+Even conceptual queries benefit from neighbor expansion - definitions, supporting evidence, and examples are distributed:
+
+**Step 1 - Search**:
+```python
+results = await kb.search(collection="daf_kb", query="what is dissolved air flotation", mode="semantic")
+top_chunk_id = results[0]["chunk_id"]
+```
+
+**Step 2 - Expand for full context**:
+```python
+neighbors = await kb.neighbors(collection="daf_kb", chunk_id=top_chunk_id, n=10)
+# Returns: Background → Definition → [HIT: DAF explanation] → Examples → Applications → Advantages
+```
+
+**Without neighbor expansion**: You'd only see the definition
+**With neighbor expansion**: You get background, definition, examples, applications, and advantages
+
 ## MCP Playbooks
 
 Use the composable tools above to let the MCP client drive retrieval and critique loops. See [`MCP_PLAYBOOKS.md`](MCP_PLAYBOOKS.md) for ready-to-run sequences:

@@ -446,6 +446,40 @@ python ingest.py \
 - **Legal docs**: 2400-3000 chars (need more context)
 - **Short content**: 1200-1500 chars
 
+### Should I always expand search results with kb.neighbors?
+
+**YES - ALWAYS.** This is mandatory, not optional.
+
+With chunk size 700, **a single search result chunk never contains complete context**. Critical information is distributed across neighboring chunks.
+
+**Required workflow for ALL searches**:
+1. Run `kb.search()` or `kb.hybrid()` to find the best match
+2. **Immediately call `kb.neighbors(chunk_id=..., n=10)`** on the top result
+3. Analyze the full 21-chunk context before answering
+
+**What gets distributed across neighbors?**
+- **Tables**: Data rows 3-10 chunks away from captions
+- **Procedures**: Multi-step instructions split across chunks
+- **Arguments**: Claims in one chunk, evidence in neighbors
+- **Definitions**: Term definition separated from examples
+- **Context**: Background before, applications after
+
+### What neighbor search radius should I use?
+
+**Default: n=10** for all `kb.neighbors()` calls.
+
+**Why n=10?**
+- **Coverage**: Captures context distributed 3-10 chunks away
+- **Token safety**: Returns ~19,000-20,000 tokens (under 25,000 limit)
+- **n=5 is too small**: Misses critical information
+- **n=15 fails**: Exceeds 25,000 token MCP response limit
+
+**When to adjust**:
+- **n=5**: Only for very short, self-contained content
+- **n=15-20**: Large multi-page tables (watch for token limit warnings)
+
+**Never answer from a single chunk** - you will miss critical context. See USAGE.md for detailed examples.
+
 ### Can I use custom distance metrics?
 
 Yes, specify during ingestion:

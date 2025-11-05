@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Default batch size**: Increased from 32 to 128 for better embedding throughput
 - **Recommended chunk size**: Now 700 chars (was 1800) for reranker compatibility
 
+### Documentation
+- **CRITICAL: Mandatory neighbor expansion for all searches**: Documented that `kb.neighbors(n=10)` is MANDATORY after every search, not optional (CLAUDE.md, AGENTS.md, USAGE.md, FAQ.md)
+- **Context distribution at chunk size 700**: Single chunks are insufficient - context (tables, procedures, definitions, evidence) distributed across 3-10 neighboring chunks
+- **Neighbor search best practices**: Recommended `n=10` default captures distributed context while staying under 25,000 token MCP response limit
+- **Multiple practical examples**: Table reconstruction, multi-step procedures, and conceptual queries all demonstrating kb_search → kb_neighbors(n=10) → comprehensive answer workflow
+- **Token limit guidance**: n=10 returns ~19-20K tokens (safe), n=15 exceeds 25K limit and fails
+- **Provenance enhancements**: Expanded documentation of rich metadata tracking (plan_hash, model_version, prompt_sha, client_decisions, table_headers, table_units, bboxes, page_numbers, section_path, element_ids)
+
 ### Added
 - Initial public release
 - Hybrid semantic search with three modes (semantic, rerank, hybrid)
