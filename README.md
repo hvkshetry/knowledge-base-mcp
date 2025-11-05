@@ -152,11 +152,15 @@ cp .mcp.json.example .mcp.json
 
 6. **Ingest your first documents**:
 ```bash
-python ingest.py \
+.venv/bin/python3 ingest.py \
   --root /path/to/your/documents \
-  --collection my_docs \
-  --ext .pdf,.docx,.txt \
-  --fts-db data/my_docs_fts.db
+  --qdrant-collection my_docs \
+  --max-chars 700 \
+  --batch-size 128 \
+  --parallel 1 \
+  --ollama-threads 4 \
+  --fts-db data/my_docs_fts.db \
+  --fts-rebuild
 ```
 
 7. **Test the search**:
@@ -226,7 +230,7 @@ Default. Heuristics pick among semantic, hybrid, rerank, and sparse routes. When
 | `top_k` | `8` | Final results returned (1–100) |
 | `retrieve_k` | `24` | Initial candidate pool (1–256) |
 | `return_k` | `8` | Post-rerank results (`≤ retrieve_k`) |
-| `neighbor_chunks` | env `NEIGHBOR_CHUNKS` | Additional context stitched onto reranked hits |
+| `n` (for kb.neighbors) | `10` (recommended) | Neighbor radius for context expansion - MANDATORY for comprehensive answers |
 
 ### Parameter Tuning Guide
 
@@ -248,6 +252,7 @@ Set via environment variables (or CLI flags when available):
 | `HF_HOME` | Hugging Face cache directory used by Docling models (default `.cache/hf`). |
 | `GRAPH_DB_PATH`, `SUMMARY_DB_PATH` | Override lightweight graph and summary storage locations. |
 | `ANSWERABILITY_THRESHOLD` | Minimum score required for auto mode to respond; lower scores return an abstain for the client to handle (e.g., run HyDE or rephrase). |
+| **Context Retrieval** | **CRITICAL: Always use kb.neighbors(n=10) after search** - single chunks are insufficient at chunk size 700. |
 
 ## 📚 Usage
 

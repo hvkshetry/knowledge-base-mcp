@@ -301,30 +301,42 @@ cp data/*.db ./backup/
 ### How can I speed up ingestion?
 
 ```bash
-python ingest.py \
-  --batch-size 128 \            # Larger batches (default, optimized)
-  --parallel 8 \                # More workers (match CPU cores)
-  --max-chars 700               # Recommended chunk size for reranker
+.venv/bin/python3 ingest.py \
+  --root /path/to/documents \
+  --qdrant-collection my_collection \
+  --max-chars 700 \
+  --batch-size 128 \
+  --parallel 1 \                # Keep at 1 for stability
+  --ollama-threads 8 \          # Increase for more CPU cores
+  --fts-db data/my_collection_fts.db
 ```
+
+**Note**: `--parallel 1` is recommended for stability. Increase `--ollama-threads` to match CPU cores for faster embedding.
 
 ### How can I speed up search?
 
 1. **Use semantic mode**: Fastest (~100ms)
 2. **Reduce retrieve_k**: Fewer candidates (e.g., 12)
 3. **Reduce return_k**: Less reranking (e.g., 8)
-4. **Disable neighbor expansion**: Set `NEIGHBOR_CHUNKS=0`
+
+**IMPORTANT**: Do NOT disable neighbor expansion - `kb.neighbors(n=10)` is MANDATORY for comprehensive answers at chunk size 700.
 
 ### My system is running out of memory
 
 **During ingestion**:
 ```bash
-python ingest.py \
-  --embed-batch-size 16 \       # Smaller batches
-  --parallel 2 \                 # Fewer workers
-  --max-docs-per-run 50          # Process in batches
+.venv/bin/python3 ingest.py \
+  --root /path/to/documents \
+  --qdrant-collection my_collection \
+  --max-chars 700 \
+  --batch-size 64 \             # Reduced batch size
+  --parallel 1 \
+  --ollama-threads 2 \          # Fewer threads
+  --max-docs-per-run 50 \
+  --fts-db data/my_collection_fts.db
 ```
 
-**During search**: Reduce `retrieve_k` and `return_k`
+**During search**: Reduce `retrieve_k` and `return_k`, but always use `kb.neighbors(n=10)` for context
 
 ### Can I use this for millions of documents?
 

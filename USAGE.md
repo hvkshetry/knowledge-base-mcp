@@ -18,22 +18,42 @@ Comprehensive guide for ingesting documents and searching your knowledge base.
 
 The `ingest.py` script processes documents and creates searchable indexes.
 
-### Basic Ingestion
+### Basic Ingestion (Full Re-ingestion)
 
 ```bash
-python ingest.py \
+.venv/bin/python3 ingest.py \
   --root /path/to/documents \
-  --collection my_collection \
-  --ext .pdf,.docx,.txt
+  --qdrant-collection my_collection \
+  --max-chars 700 \
+  --batch-size 128 \
+  --parallel 1 \
+  --ollama-threads 4 \
+  --fts-db data/my_collection_fts.db \
+  --fts-rebuild
+```
+
+### Incremental Update (Changed/New Only)
+
+```bash
+.venv/bin/python3 ingest.py \
+  --root /path/to/documents \
+  --qdrant-collection my_collection \
+  --max-chars 700 \
+  --batch-size 128 \
+  --parallel 1 \
+  --ollama-threads 4 \
+  --fts-db data/my_collection_fts.db \
+  --changed-only \
+  --delete-changed
 ```
 
 ### Complete Parameter Reference
 
 ```bash
-python ingest.py \
+.venv/bin/python3 ingest.py \
   # Required
   --root /path/to/documents           # Directory to scan
-  --collection my_collection          # Qdrant collection name
+  --qdrant-collection my_collection   # Qdrant collection name
 
   # Document Selection
   --ext .pdf,.docx,.txt               # File extensions (comma-separated)
@@ -51,15 +71,16 @@ python ingest.py \
   --summary-db data/summary.db        # Override summary storage (optional)
 
   # Chunking
-  --chunk-size 1800                   # Characters per chunk
+  --max-chars 700                     # Characters per chunk (recommended for reranker)
   --chunk-overlap 150                 # Overlap between chunks
 
   # Embedding
   --ollama-url http://localhost:11434 # Ollama API endpoint
   --ollama-model snowflake-arctic-embed:xs  # Embedding model
-  --embed-batch-size 48               # Embeddings per batch
+  --batch-size 128                    # Embeddings per batch (new default)
   --embed-robust                      # Skip failed chunks, continue
-  --workers 4                         # Parallel embedding workers
+  --parallel 1                        # Parallel workers (1 for stability)
+  --ollama-threads 4                  # Ollama embedding parallelism
 
   # Qdrant
   --qdrant-url http://localhost:6333  # Qdrant endpoint
@@ -476,29 +497,28 @@ data/
 - Set `DOCLING_DEVICE` (`cpu` or `cuda`) and `DOCLING_BATCH_SIZE` before ingestion to control Docling execution; default is CPU with batch size 1.
 - `INGEST_CACHE_DIR` overrides the cache location if you prefer a faster disk or shared volume.
 
-### Neighbor Context Expansion
+### Neighbor Context Expansion - MANDATORY WORKFLOW
 
-Automatically includes adjacent chunks for better context.
+**CRITICAL**: At chunk size 700, single chunks are NEVER sufficient. You MUST use `kb.neighbors(n=10)` after every search.
 
-**Configuration** (environment variable):
-```bash
-NEIGHBOR_CHUNKS=1  # Include 1 chunk before and after (3 total)
-```
+**Required MCP workflow**:
+1. `kb.search()` or `kb.hybrid()` finds the best matching chunk
+2. **ALWAYS call `kb.neighbors(chunk_id=..., n=10)`** to retrieve context
+3. Analyze the full 21-chunk context (10 before + reference + 10 after)
 
-**How it works**:
-1. Search finds best matching chunk
-2. Retrieves N chunks before and after from same document
-3. Concatenates into single result
+**Why n=10 is mandatory**:
+- Context (tables, procedures, evidence) distributed across 3-10 neighboring chunks
+- n=10 returns ~19-20K tokens (safe under 25K limit)
+- n=5 is insufficient - misses critical information
+- n=15 exceeds 25K token limit and fails
 
-**Use Cases**:
-- Improve context understanding
-- Avoid truncated information
-- Better for Claude to understand full topic
+**What gets distributed**:
+- Tables: Data rows 3-10 chunks from captions
+- Procedures: Multi-step instructions split across chunks
+- Arguments: Claims in one chunk, evidence in neighbors
+- Definitions: Term definition separated from examples
 
-**Trade-offs**:
-- Increases result length
-- May include less relevant content
-- Slightly slower
+See CLAUDE.md for complete guidance on mandatory neighbor expansion.
 
 ### Time Decay Scoring
 

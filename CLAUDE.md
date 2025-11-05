@@ -181,10 +181,11 @@ With the recommended chunk size of 700 characters (optimized for reranker compat
 - **Complex procedures**: Spanning multiple sections
 - **Figure captions + figures**: When figures are on separate pages
 
-### When Smaller Radius is Sufficient
-- **n=5**: Short tables (3-5 rows), single-section content
-- **n=3**: Just for immediate context (paragraph continuity)
-- **n=1**: Default environment variable `NEIGHBOR_CHUNKS=1` (auto-expansion in search results)
+### When Smaller Radius May Be Acceptable (Rare Cases)
+- **n=5**: Very short, self-contained content only
+- **n=3**: Single paragraph lookups (still risks missing context)
+
+**WARNING**: Reducing below n=10 risks incomplete answers. Only reduce if you're certain the content is self-contained.
 
 ### Token Limit Management
 - **MCP response limit**: 25,000 tokens
