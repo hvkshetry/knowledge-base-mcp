@@ -8,11 +8,37 @@
 ## Ingestion Workflow
 
 ### For Large-Scale Ingestion (Recommended)
-For bulk ingestion (10+ documents, large PDFs, or production pipelines), recommend the CLI to the user instead of MCP tools to avoid token costs:
+For bulk ingestion (10+ documents, large PDFs, or production pipelines), recommend the CLI to the user instead of MCP tools to avoid token costs.
+
+#### Full Re-ingestion (Clean Slate)
+Use when rebuilding the collection from scratch or when major changes require complete reprocessing:
 
 ```bash
-.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 700 --batch-size 128 --fts-db data/my_collection_fts.db --fts-rebuild
+.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 700 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --fts-rebuild
 ```
+
+**What this does:**
+- Processes ALL documents in the directory
+- Rebuilds FTS database from scratch (`--fts-rebuild`)
+- Upserts vectors to Qdrant (deterministic chunk IDs mean duplicates are replaced, not added)
+
+#### Incremental Update (Upsert Changed/New Only)
+Use for daily/weekly updates to add new documents and update changed ones WITHOUT reprocessing everything:
+
+```bash
+.venv/bin/python3 ingest.py --root /path/to/documents --qdrant-collection my_collection --max-chars 700 --batch-size 128 --parallel 1 --ollama-threads 4 --fts-db data/my_collection_fts.db --changed-only --delete-changed
+```
+
+**What this does:**
+- Computes SHA256 hash of each document's extracted text
+- Compares with existing chunks in Qdrant
+- **Only processes documents that are new or have changed content**
+- Deletes old chunks before reinserting changed documents (`--delete-changed`)
+- Skips unchanged documents entirely (massive time savings)
+
+**When to use each approach:**
+- **Full re-ingestion**: First-time setup, changing chunk size, major refactoring
+- **Incremental update**: Daily/weekly maintenance, adding new docs to existing collection
 
 **Critical CLI notes for users:**
 - `--fts-db` MUST match collection name (e.g., `data/my_collection_fts.db` for `--qdrant-collection my_collection`)
@@ -20,6 +46,8 @@ For bulk ingestion (10+ documents, large PDFs, or production pipelines), recomme
 - `--extractor` flag removed - Docling is now the only extractor
 - `--batch-size 128` (new default) for better embedding throughput vs old default of 32
 - `--max-chars 700` recommended for reranker compatibility vs old default 1800
+- `--parallel 1` for single-threaded ingestion (safer for large PDFs)
+- `--ollama-threads 4` controls Ollama embedding parallelism (adjust based on CPU cores)
 
 ### For Interactive MCP-Based Ingestion
 Use MCP tools for small-scale interactive work (1-10 documents):
