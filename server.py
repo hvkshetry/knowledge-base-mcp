@@ -85,7 +85,21 @@ logger = logging.getLogger("kb-mcp")
 
 qdr = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 mcp = FastMCP(name="knowledge-base", version="1.0.0", instructions="Vector search with Qdrant + Ollama embeddings and TEI reranker")
-doc_store = DocumentStore(FTS_DB_PATH)
+
+# Collection-specific document stores (replaces global doc_store)
+_doc_stores: Dict[str, DocumentStore] = {}
+
+def _get_doc_store(collection_name: str) -> DocumentStore:
+    """Get or create a DocumentStore for the given collection."""
+    if not collection_name:
+        # If no collection specified, use default from first SCOPE
+        collection_name = next(iter(SCOPES.values()))["collection"]
+
+    if collection_name not in _doc_stores:
+        fts_db_path = _get_fts_db_path(collection_name)
+        _doc_stores[collection_name] = DocumentStore(fts_db_path)
+
+    return _doc_stores[collection_name]
 
 ARTIFACT_DIR = Path(os.getenv("INGEST_ARTIFACT_DIR", "data/ingest_artifacts"))
 PLAN_DIR = Path(os.getenv("INGEST_PLAN_DIR", "data/ingest_plans"))
@@ -99,11 +113,12 @@ CANARY_TIMEOUT = int(os.getenv("CANARY_TIMEOUT", "30"))
 SESSION_PRIORS: Dict[str, Dict[str, float]] = {}
 
 
-def _lookup_chunk_by_element(element_id: str) -> Optional[str]:
+def _lookup_chunk_by_element(element_id: str, fts_db_path: Optional[str] = None) -> Optional[str]:
     if not element_id:
         return None
+    db_path = fts_db_path or FTS_DB_PATH
     try:
-        conn = sqlite3.connect(FTS_DB_PATH)
+        conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute(
             "SELECT chunk_id FROM fts_chunks WHERE element_ids LIKE ? LIMIT 1",
@@ -199,30 +214,32 @@ async def embed_query(text: str, normalize: bool = True) -> List[float]:
 
 
 # ---- Local lexical helpers --------------------------------------------------
-def _fts_search(query: str, limit: int) -> List[Dict[str, Any]]:
-    if not os.path.exists(FTS_DB_PATH):
+def _fts_search(query: str, limit: int, fts_db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    db_path = fts_db_path or FTS_DB_PATH
+    if not os.path.exists(db_path):
         return []
     try:
         from lexical_index import search as fts_search
         try:
-            return fts_search(FTS_DB_PATH, query, limit)
+            return fts_search(db_path, query, limit)
         except Exception as exc:
             if "syntax error" in str(exc).lower():
                 safe = re.sub(r"[\^`~!@#$%&*()+={}[\]|\\:;'<>,.?/]", " ", query).strip()
                 if safe:
-                    return fts_search(FTS_DB_PATH, safe, limit)
+                    return fts_search(db_path, safe, limit)
             raise
     except Exception as e:
         logger.warning("FTS search failed: %s", e)
         return []
 
 
-def _sparse_terms_search(query_terms: Dict[str, float], limit: int) -> List[Dict[str, Any]]:
-    if not os.path.exists(FTS_DB_PATH) or not query_terms:
+def _sparse_terms_search(query_terms: Dict[str, float], limit: int, fts_db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    db_path = fts_db_path or FTS_DB_PATH
+    if not os.path.exists(db_path) or not query_terms:
         return []
     try:
         from lexical_index import sparse_search
-        return sparse_search(FTS_DB_PATH, query_terms, limit)
+        return sparse_search(db_path, query_terms, limit)
     except Exception as exc:
         logger.warning("Sparse-term search failed: %s", exc)
         return []
@@ -246,6 +263,7 @@ async def _run_colbert(
 ) -> List[Dict[str, Any]]:
     if not HAVE_COLBERT:
         return [{"error": "colbert_service_unavailable"}]
+    fts_db_path = _get_fts_db_path(collection)
     limit = max(return_k, min(retrieve_k, 64))
     start = time.perf_counter()
     try:
@@ -290,7 +308,7 @@ async def _run_colbert(
         )
     if not scored:
         return []
-    payload_map = fetch_texts_by_chunk_ids(FTS_DB_PATH, chunk_ids)
+    payload_map = fetch_texts_by_chunk_ids(fts_db_path, chunk_ids)
     col_scores = [row["colbert_score"] for row in scored]
     stats = (min(col_scores), max(col_scores)) if col_scores else None
     rows: List[Dict[str, Any]] = []
@@ -352,11 +370,12 @@ async def _run_colbert(
     return rows
 
 
-def _fts_neighbors(doc_id: str, chunk_start: int, n: int) -> List[Dict[str, Any]]:
-    if n <= 0 or not os.path.exists(FTS_DB_PATH):
+def _fts_neighbors(doc_id: str, chunk_start: int, n: int, fts_db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    db_path = fts_db_path or FTS_DB_PATH
+    if n <= 0 or not os.path.exists(db_path):
         return []
     try:
-        conn = sqlite3.connect(FTS_DB_PATH)
+        conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
@@ -898,6 +917,7 @@ async def _perform_upsert(
     fts_recreate: bool = False,
 ) -> Dict[str, Any]:
     metadata_arg: Optional[str] = metadata_artifact.as_posix() if metadata_artifact else None
+    fts_db_path = _get_fts_db_path(collection_name)
     try:
         result = await asyncio.to_thread(
             upsert_document_artifacts,
@@ -916,7 +936,7 @@ async def _perform_upsert(
             embed_robust=INGEST_EMBED_ROBUST,
             qdrant_client=qdr,
             qdrant_metric=QDRANT_METRIC,
-            fts_db_path=FTS_DB_PATH,
+            fts_db_path=fts_db_path,
             fts_recreate=fts_recreate,
             thin_payload=thin_payload,
             update_graph_links=update_graph_links,
@@ -1841,17 +1861,18 @@ async def ingest_corpus_upsert(
     }
 
 
-async def _fetch_chunks_by_ids(chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+async def _fetch_chunks_by_ids(chunk_ids: List[str], collection_name: str) -> Dict[str, Dict[str, Any]]:
     if not chunk_ids:
         return {}
     try:
-        return await asyncio.to_thread(doc_store.get_records_bulk, chunk_ids)
+        store = _get_doc_store(collection_name)
+        return await asyncio.to_thread(store.get_records_bulk, chunk_ids)
     except Exception as exc:
         logger.debug("fetch_chunk_records failed: %s", exc)
         return {}
 
 
-async def _hydrate_qdrant_hits(hits) -> None:
+async def _hydrate_qdrant_hits(hits, collection_name: str) -> None:
     missing: List[str] = []
     for h in hits or []:
         payload = getattr(h, "payload", None) or {}
@@ -1862,7 +1883,7 @@ async def _hydrate_qdrant_hits(hits) -> None:
             missing.append(chunk_id)
     if not missing:
         return
-    fetched = await _fetch_chunks_by_ids(missing)
+    fetched = await _fetch_chunks_by_ids(missing, collection_name)
     for h in hits or []:
         payload = getattr(h, "payload", None) or {}
         chunk_id = str(getattr(h, "id", None) or payload.get("chunk_id") or "")
@@ -1899,7 +1920,7 @@ async def _ensure_row_texts(
         chunk_id = str(row.get("id") or row.get("chunk_id") or "")
         if chunk_id:
             missing.append(chunk_id)
-    fetched = await _fetch_chunks_by_ids(missing)
+    fetched = await _fetch_chunks_by_ids(missing, collection or "")
     missing_qdrant = [cid for cid in missing if cid not in fetched]
     if missing_qdrant and collection:
         try:
@@ -1919,6 +1940,7 @@ async def _ensure_row_texts(
                 fetched[cid] = payload
         except Exception as exc:
             logger.debug("qdrant retrieve fallback failed: %s", exc)
+    store = _get_doc_store(collection or "")
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1926,8 +1948,8 @@ async def _ensure_row_texts(
         info = fetched.get(chunk_id)
         existing_text = row.pop("text", None)
         doc_id = row.get("doc_id") or (info.get("doc_id") if info else None)
-        allowed = doc_store.is_allowed(str(doc_id) if doc_id else None, collection, subjects)
-        doc_store.build_row(row, info, allowed, include_text=False)
+        allowed = store.is_allowed(str(doc_id) if doc_id else None, collection, subjects)
+        store.build_row(row, info, allowed, include_text=False)
         source_for_pages = info or row
         _set_page_fields(row, source_for_pages)
         if info:
@@ -2092,7 +2114,7 @@ async def _run_semantic(
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
 
-    await _hydrate_qdrant_hits(hits)
+    await _hydrate_qdrant_hits(hits, collection)
     rows: List[Dict[str, Any]] = []
     for h in hits[:return_k]:
         pl = h.payload or {}
@@ -2151,9 +2173,10 @@ async def _run_sparse(
     timings: Dict[str, float],
     boosts: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
+    fts_db_path = _get_fts_db_path(collection)
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     start = time.perf_counter()
-    lexical_hits = await asyncio.to_thread(_fts_search, query, limit)
+    lexical_hits = await asyncio.to_thread(_fts_search, query, limit, fts_db_path)
     timings["fts_ms"] = timings.get("fts_ms", 0.0) + (time.perf_counter() - start) * 1000.0
     bm_values = [row.get("bm25") for row in lexical_hits if row.get("bm25") is not None]
     bm_stats = (min(bm_values), max(bm_values)) if bm_values else None
@@ -2224,6 +2247,7 @@ async def _run_sparse_splade(
 ) -> List[Dict[str, Any]]:
     if not HAVE_SPARSE_SPLADE:
         return [{"error": "sparse_expander_disabled"}]
+    fts_db_path = _get_fts_db_path(collection)
     limit = min(retrieve_k, RERANK_MAX_ITEMS)
     start = time.perf_counter()
     query_weights = _encode_sparse_query(query)
@@ -2231,7 +2255,7 @@ async def _run_sparse_splade(
     if not query_weights:
         return []
     start = time.perf_counter()
-    sparse_hits = await asyncio.to_thread(_sparse_terms_search, query_weights, limit)
+    sparse_hits = await asyncio.to_thread(_sparse_terms_search, query_weights, limit, fts_db_path)
     timings["sparse_terms_ms"] = timings.get("sparse_terms_ms", 0.0) + (time.perf_counter() - start) * 1000.0
     if not sparse_hits:
         return []
@@ -2317,7 +2341,7 @@ async def _run_rerank(
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
 
-    await _hydrate_qdrant_hits(hits)
+    await _hydrate_qdrant_hits(hits, collection)
     texts = [str((h.payload or {}).get("text") or "")[:RERANK_MAX_CHARS] for h in hits]
     try:
         start = time.perf_counter()
@@ -2454,7 +2478,8 @@ async def _run_rerank(
         _set_page_fields(row, payload)
         _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
-            neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
+            fts_db_path = _get_fts_db_path(collection)
+            neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS, fts_db_path=fts_db_path)
             if neigh:
                 ordered = sorted(neigh, key=lambda r: int(r.get("chunk_start", 0) or 0))
                 txt = "\n".join([str(r.get("text") or "") for r in ordered]).strip()
@@ -2493,9 +2518,10 @@ async def _run_hybrid(
     except Exception as exc:
         return [{"error": "qdrant_search_failed", "detail": str(exc)}]
 
-    await _hydrate_qdrant_hits(dense_hits)
+    await _hydrate_qdrant_hits(dense_hits, collection)
+    fts_db_path = _get_fts_db_path(collection)
     start = time.perf_counter()
-    lexical_hits = await asyncio.to_thread(_fts_search, query, limit)
+    lexical_hits = await asyncio.to_thread(_fts_search, query, limit, fts_db_path)
     timings["fts_ms"] = timings.get("fts_ms", 0.0) + (time.perf_counter() - start) * 1000.0
 
     dense_list: List[Dict[str, Any]] = []
@@ -2673,7 +2699,8 @@ async def _run_hybrid(
         _set_page_fields(row, x)
         _ensure_score_bucket(row)["prior"] = prior_mult
         if NEIGHBOR_CHUNKS > 0 and row["doc_id"] and row["chunk_start"] is not None:
-            neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS)
+            fts_db_path = _get_fts_db_path(collection)
+            neigh = _fts_neighbors(row["doc_id"], int(row["chunk_start"]), NEIGHBOR_CHUNKS, fts_db_path=fts_db_path)
             if neigh:
                 ordered = sorted(neigh, key=lambda r: int(r.get("chunk_start", 0) or 0))
                 txt = "\n".join([str(r.get("text") or "") for r in ordered]).strip()
@@ -2733,6 +2760,30 @@ def _resolve_scope(collection: Optional[str]) -> Tuple[str, str, str]:
         raise ValueError(f"Unknown collection '{collection}'. Known entries: {sorted(SCOPES)}")
     slug, cfg = next(iter(SCOPES.items()))
     return slug, cfg["collection"], cfg.get("title") or slug
+
+
+def _get_fts_db_path(collection_name: str) -> str:
+    """
+    Resolve FTS database path for a given Qdrant collection name.
+
+    First checks if an explicit fts_db path is configured in SCOPES,
+    otherwise derives it from collection name: data/{collection_name}_fts.db
+    Falls back to global FTS_DB_PATH if no collection name provided.
+    """
+    if not collection_name:
+        return FTS_DB_PATH
+
+    # Check if any scope explicitly configures fts_db for this collection
+    for slug, cfg in SCOPES.items():
+        if cfg.get("collection") == collection_name:
+            if "fts_db" in cfg:
+                return cfg["fts_db"]
+            # Convention: data/{collection_name}_fts.db
+            return f"data/{collection_name}_fts.db"
+
+    # Fallback: derive from collection name
+    return f"data/{collection_name}_fts.db"
+
 
 # ---- Unified retrieval tools (collection parameter required) --------------
 
@@ -3241,6 +3292,24 @@ async def kb_hint(
         "alias_count": len(ALIASES),
     }
 
+def _expand_table_query(query: str) -> str:
+    """
+    Expand table query from AND (all terms) to OR (any term) for better recall.
+    Falls back to original if expansion returns nothing.
+    """
+    # Tokenize and remove stop words
+    stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "from", "as", "is", "was", "are", "were", "be", "been", "being"}
+    tokens = re.findall(r'\w+', query.lower())
+    meaningful_tokens = [t for t in tokens if t not in stop_words and len(t) > 2]
+
+    if not meaningful_tokens:
+        return query  # No meaningful tokens, use original
+
+    # Build OR query
+    expanded_query = " OR ".join(meaningful_tokens)
+    return expanded_query
+
+
 @mcp.tool(name="kb.table", title="KB: Table Lookup")
 async def kb_table(
     ctx: Context,
@@ -3253,9 +3322,17 @@ async def kb_table(
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
     slug, collection_name, _ = _resolve_scope(collection)
+    fts_db_path = _get_fts_db_path(collection_name)
     limit = max(1, min(int(limit), 50))
     fetch_limit = max(limit * 3, limit)
-    raw_hits = await asyncio.to_thread(_fts_search, query, fetch_limit)
+
+    # Try expanded OR query first for better table row recall
+    expanded_query = _expand_table_query(query)
+    raw_hits = await asyncio.to_thread(_fts_search, expanded_query, fetch_limit, fts_db_path)
+
+    # Fallback to original query if OR returned nothing
+    if not raw_hits:
+        raw_hits = await asyncio.to_thread(_fts_search, query, fetch_limit, fts_db_path)
     filtered: List[Dict[str, Any]] = []
     target_doc = str(doc_id) if doc_id else None
     where_map = where or {}
@@ -3307,7 +3384,8 @@ async def kb_open(
     end: Optional[int] = None,
 ) -> Dict[str, Any]:
     slug, collection_name, _ = _resolve_scope(collection)
-    target = chunk_id or _lookup_chunk_by_element(element_id or "")
+    fts_db_path = _get_fts_db_path(collection_name)
+    target = chunk_id or _lookup_chunk_by_element(element_id or "", fts_db_path=fts_db_path)
     if not target:
         return {"error": "missing_target", "detail": "Provide chunk_id or element_id"}
     row = {"id": target}
@@ -3352,6 +3430,7 @@ async def kb_neighbors(
     if not chunk_id:
         return [{"error": "missing_chunk_id"}]
     slug, collection_name, _ = _resolve_scope(collection)
+    fts_db_path = _get_fts_db_path(collection_name)
     seed = {"id": chunk_id}
     subjects = get_subjects_from_context(ctx)
     await _ensure_row_texts([seed], collection_name, subjects)
@@ -3359,7 +3438,7 @@ async def kb_neighbors(
     chunk_start = seed.get("chunk_start")
     if doc_id is None or chunk_start is None:
         return [{"error": "not_found"}]
-    neighbor_rows_raw = _fts_neighbors(str(doc_id), int(chunk_start), max(1, int(n)))
+    neighbor_rows_raw = _fts_neighbors(str(doc_id), int(chunk_start), max(1, int(n)), fts_db_path=fts_db_path)
     rows: List[Dict[str, Any]] = []
     for raw in neighbor_rows_raw:
         rows.append({
@@ -3412,7 +3491,8 @@ async def kb_outline(ctx: Context, doc_id: str, collection: Optional[str] = None
     if not doc_id:
         return {"error": "missing_doc_id"}
     slug, collection_name, _ = _resolve_scope(collection)
-    conn = sqlite3.connect(FTS_DB_PATH)
+    fts_db_path = _get_fts_db_path(collection_name)
+    conn = sqlite3.connect(fts_db_path)
     try:
         cur = conn.execute(
             "SELECT text, section_path, pages, chunk_start, chunk_end FROM fts_chunks WHERE doc_id = ? AND types LIKE '%heading%' ORDER BY chunk_start",

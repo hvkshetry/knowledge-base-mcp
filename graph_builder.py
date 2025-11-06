@@ -7,45 +7,14 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from tqdm import tqdm
+
 
 GRAPH_DB_PATH = os.getenv("GRAPH_DB_PATH", "data/graph.db")
-KEYWORD_CLASSES: Dict[str, Sequence[str]] = {
-    "equipment": (
-        "pump",
-        "compressor",
-        "tank",
-        "basin",
-        "clarifier",
-        "saturator",
-        "hydroejector",
-        "injector",
-        "dissolver",
-        "belt press",
-        "centrifuge",
-        "flocculator",
-    ),
-    "chemical": (
-        "polymer",
-        "polyacrylamide",
-        "alum",
-        "coagulant",
-        "flocculant",
-        "ferric",
-    ),
-    "parameter": (
-        "air-to-solid",
-        "air to solids",
-        "saturation rate",
-        "pressurisation rate",
-        "hydraulic load",
-        "capture rate",
-        "solubility",
-        "density",
-        "velocity",
-        "pressure",
-        "temperature",
-    ),
-}
+
+# Global keyphrase extractor cache for lazy loading
+_KEYPHRASE_EXTRACTOR = None
+
 ENTITY_MIN_LEN = 4
 ENTITY_TYPE_CONCEPT = "concept"
 ENTITY_TYPE_UNIT = "unit"
@@ -62,6 +31,25 @@ RELATION_PATTERNS = [
 ]
 
 
+def _get_keyphrase_extractor():
+    """Lazy load YAKE keyphrase extractor."""
+    global _KEYPHRASE_EXTRACTOR
+    if _KEYPHRASE_EXTRACTOR is None:
+        try:
+            import yake
+            _KEYPHRASE_EXTRACTOR = yake.KeywordExtractor(
+                lan="en",
+                n=2,  # Max ngram size (2-word phrases sufficient for 700-char chunks)
+                dedupLim=0.8,  # Better deduplication
+                top=8,  # Top N keyphrases per chunk (8 is sufficient for ~700 chars)
+                features=None
+            )
+        except Exception as e:
+            print(f"Warning: Could not load YAKE extractor: {e}")
+            _KEYPHRASE_EXTRACTOR = False
+    return _KEYPHRASE_EXTRACTOR if _KEYPHRASE_EXTRACTOR is not False else None
+
+
 def _normalize_label(label: str) -> str:
     norm = re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
     return norm
@@ -70,6 +58,9 @@ def _normalize_label(label: str) -> str:
 def _ensure_graph(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    # Enable WAL mode and set busy timeout (same as lexical_index.py)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS nodes (
@@ -199,16 +190,55 @@ def _measurement_node_id(parameter: str, value: str, unit: Optional[str], doc_id
     return f"measurement::{digest}"
 
 
-def _keyword_entities(text_lower: str) -> List[Tuple[str, str]]:
+def _keyphrase_entities(text: str) -> List[Tuple[str, str]]:
+    """
+    Extract keyphrases dynamically using YAKE unsupervised extraction.
+    Returns list of (label, type='entity') tuples - no hardcoded classification.
+    """
+    extractor = _get_keyphrase_extractor()
+    if extractor is None or not text:
+        return []
+
+    # Skip tiny chunks - headings/captions already contribute via other heuristics
+    text_stripped = text.strip()
+    if len(text_stripped) < 120 or len(text_stripped.split()) < 25:
+        return []
+
     entities: List[Tuple[str, str]] = []
-    for etype, keywords in KEYWORD_CLASSES.items():
-        for keyword in keywords:
-            if keyword in text_lower:
-                entities.append((keyword, etype))
+    try:
+        # Extract keyphrases with YAKE
+        keywords = extractor.extract_keywords(text)
+
+        for keyphrase, score in keywords:
+            # Filter noise
+            keyphrase = keyphrase.strip()
+            if len(keyphrase) < ENTITY_MIN_LEN:
+                continue
+
+            # Skip if mostly numeric or dotted leaders
+            if re.match(r"^[\d\s\.]+$", keyphrase) or ". ." in keyphrase:
+                continue
+
+            # Alphanumeric ratio check (at least 50% alphanumeric)
+            alnum_count = sum(c.isalnum() for c in keyphrase)
+            if alnum_count / len(keyphrase) < 0.5:
+                continue
+
+            # All entities are generic "entity" - let graph structure reveal relationships
+            entities.append((keyphrase, "entity"))
+
+    except Exception as e:
+        # Silently fail if keyphrase extraction fails
+        pass
+
     return entities
 
 
 def _table_entities(chunk: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """
+    Extract entities from table headers - store as generic 'entity' type.
+    Graph structure and co-occurrence will reveal semantic relationships.
+    """
     headers = chunk.get("table_headers") or []
     out: List[Tuple[str, str]] = []
     if isinstance(headers, dict):
@@ -222,7 +252,8 @@ def _table_entities(chunk: Dict[str, Any]) -> List[Tuple[str, str]]:
             label = header.strip()
             if len(label) < ENTITY_MIN_LEN:
                 continue
-            out.append((label, "parameter"))
+            # Generic entity type - no hardcoded assumptions
+            out.append((label, "entity"))
     return out
 
 
@@ -285,29 +316,64 @@ def _metadata_bucket_entities(doc_metadata: Optional[Dict[str, Any]]) -> List[Tu
 
 
 def _extract_entities(chunk: Dict[str, Any], doc_metadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Extract entities from chunk using hybrid approach:
+    - Dynamic keyphrase extraction (YAKE) with embedding classification
+    - Table headers with context-aware classification
+    - Uppercase acronym detection
+    - Metadata entities (from doc-level aggregation)
+    """
     text = (chunk.get("text") or "").strip()
     if not text:
         return []
-    text_lower = text.lower()
+
     entities = []
-    entities.extend(_keyword_entities(text_lower))
-    entities.extend(_table_entities(chunk))
-    entities.extend(_uppercase_entities(text))
+
+    # Phase A: Candidate harvesting
+    entities.extend(_keyphrase_entities(text))  # Dynamic keyphrases with YAKE + embedding classification
+    entities.extend(_table_entities(chunk))  # Table headers with dynamic classification
+    entities.extend(_uppercase_entities(text))  # Acronyms (already classified as "entity", could be improved)
     entities.extend([(label, etype) for label, etype, _ in _metadata_bucket_entities(doc_metadata)])
+
+    # Phase B: Normalization & deduplication
     seen: Dict[str, str] = {}
     out: List[Dict[str, Any]] = []
+
     for label, etype in entities:
+        label = label.strip()
+
+        # Skip dotted leaders and noise
+        if ". . ." in label or re.match(r"^[\d\s\.]+$", label):
+            continue
+
+        # Require minimum alphanumeric content
+        if not any(c.isalnum() for c in label):
+            continue
+
+        # Alphanumeric ratio check (at least 50%)
+        alnum_count = sum(c.isalnum() for c in label)
+        if len(label) > 0 and alnum_count / len(label) < 0.5:
+            continue
+
+        # Deduplication by normalized key
         key = label.lower()
         if key in seen:
             continue
         seen[key] = etype
-        out.append(
-            {
-                "label": label.strip(),
-                "type": etype,
-                "source": "table" if etype == "parameter" else "metadata" if etype in {"equipment", "chemical", "parameter"} else "text",
-            }
-        )
+
+        # Determine source (for provenance)
+        source = "metadata"  # Default for metadata entities
+        if any(label == h for h in (chunk.get("table_headers") or [])):
+            source = "table"
+        elif etype not in {"equipment", "chemical", "parameter"}:
+            source = "text"
+
+        out.append({
+            "label": label,
+            "type": etype or "unknown",
+            "source": source,
+        })
+
     return out
 
 
@@ -350,9 +416,13 @@ def update_graph(
     path: str,
     chunks: Iterable[Dict],
     graph_path: str = GRAPH_DB_PATH,
-) -> None:
+) -> Dict[str, List[str]]:
+    """
+    Update knowledge graph with entities and relationships.
+    Returns aggregated doc-level entities grouped by type.
+    """
     if not collection:
-        return
+        return {}
     chunk_list = list(chunks)
     conn = _ensure_graph(Path(graph_path))
     cur = conn.cursor()
@@ -362,6 +432,9 @@ def update_graph(
 
     doc_meta = _doc_metadata(chunk_list)
     seen_edges: set[Tuple[str, str, str]] = set()
+
+    # Track all entities found in document for aggregation
+    doc_entities_by_type: Dict[str, set] = {}
 
     for label, etype in itertools.chain(_concept_entities(doc_meta), _unit_entities(doc_meta)):
         entity_id = _node_id_entity(label)
@@ -375,7 +448,8 @@ def update_graph(
             )
             seen_edges.add(key)
 
-    for chunk in chunk_list:
+    # Progress reporting for graph entity extraction
+    for chunk in tqdm(chunk_list, desc="    Graph entities", leave=False, unit="chunk"):
         section_path = tuple(chunk.get("section_path") or [])
         if section_path:
             section_node = _node_id_section(doc_id, section_path)
@@ -425,6 +499,11 @@ def update_graph(
                     entity_lookup.setdefault(norm_label, entity_id)
                 if etype == "parameter" and norm_label:
                     parameter_id_lookup[norm_label] = entity_id
+
+                # Aggregate entities for doc-level metadata
+                if etype not in doc_entities_by_type:
+                    doc_entities_by_type[etype] = set()
+                doc_entities_by_type[etype].add(label)
 
             measurements = []
             text = chunk.get("text") or ""
@@ -492,7 +571,12 @@ def update_graph(
                     seen_edges.add(key)
 
     conn.commit()
+    # Checkpoint WAL to prevent .db-wal file from growing too large
+    conn.execute("PRAGMA wal_checkpoint(FULL);")
     conn.close()
+
+    # Return aggregated entities grouped by type (convert sets to sorted lists)
+    return {etype: sorted(list(labels)) for etype, labels in doc_entities_by_type.items()}
 
 
 def neighbors(

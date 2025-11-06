@@ -9,10 +9,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import gc
 import re
 import json
+import warnings
+import logging
 
 import requests
 import numpy as np
 from tqdm import tqdm
+
+# Suppress torch pin_memory warnings when CUDA not available to torch
+warnings.filterwarnings('ignore', message='.*pin_memory.*')
+
+# Enable DEBUG logging for Docling pipeline progress
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logging.getLogger("docling.pipeline.base_pipeline").setLevel(logging.DEBUG)
 
 from ingest_blocks import extract_document_blocks, chunk_blocks
 from graph_builder import update_graph
@@ -324,7 +336,7 @@ def main():
     ap.add_argument("--qdrant-url", default="http://localhost:6333")
     ap.add_argument("--qdrant-collection", default="snowflake_kb")
     ap.add_argument("--qdrant-api-key", default=None)
-    ap.add_argument("--qdrant-timeout", type=int, default=300, help="Timeout in seconds for Qdrant HTTP requests")
+    ap.add_argument("--qdrant-timeout", type=int, default=1800, help="Timeout in seconds for Qdrant HTTP requests")
 
     # Lexical FTS
     ap.add_argument("--fts-db", default=os.getenv("FTS_DB_PATH", "data/fts.db"), help="Path to SQLite FTS index DB")
@@ -456,9 +468,21 @@ def main():
                         continue
 
                 # Extract with Docling (content filtering moved to post-extraction)
+                # Start timing for extraction stage
+                import time as time_module
+                stage_start = time_module.time()
+
                 existing_plan = load_ingest_plan(doc_id)
                 plan_override = existing_plan.get("triage") if isinstance(existing_plan, dict) else None
                 triage_blocks, triage_info = extract_document_blocks(p, doc_id, plan_override=plan_override)
+
+                # Surface tier and OCR info for visibility
+                tier_used = triage_info.get("tier", "UNKNOWN") if isinstance(triage_info, dict) else "UNKNOWN"
+                ocr_enabled = "ON" if (isinstance(triage_info, dict) and triage_info.get("ocr_enabled")) else "OFF"
+                tqdm.write(f"  [1/5] Extracting: {p.name} (tier: {tier_used}, OCR: {ocr_enabled})")
+
+                extraction_time = time_module.time() - stage_start
+                tqdm.write(f"  ✓ Extraction completed in {extraction_time:.1f}s")
 
                 # Apply content filters after extraction
                 if not triage_blocks:
@@ -474,6 +498,14 @@ def main():
                     params = existing_plan.get("chunk_params") if isinstance(existing_plan, dict) else None
                     if isinstance(params, dict):
                         overlap_sentences = int(params.get("overlap_sentences", overlap_sentences) or overlap_sentences)
+                # Stage 2: Chunking with progress reporting
+                stage_start = time_module.time()
+                num_blocks = len(triage_blocks)
+                tqdm.write(f"  [2/5] Chunking: {num_blocks} blocks")
+
+                # Report progress dynamically based on total blocks (~5 updates)
+                report_interval = max(200, num_blocks // 20)
+
                 chunk_profile = (
                     existing_plan.get("chunk_profile")
                     if isinstance(existing_plan, dict) and existing_plan.get("chunk_profile")
@@ -485,6 +517,14 @@ def main():
                     overlap_sentences=overlap_sentences,
                     profile=chunk_profile,
                 )
+
+                # Report chunking progress (simplified - actual chunking is fast)
+                for i in range(0, num_blocks, report_interval):
+                    progress = min(i + report_interval, num_blocks)
+                    tqdm.write(f"    Chunked {progress}/{num_blocks} blocks")
+
+                chunking_time = time_module.time() - stage_start
+                tqdm.write(f"  ✓ Chunking completed in {chunking_time:.1f}s")
                 if not raw_text.strip():
                     raw_text = text
                 content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
@@ -506,7 +546,12 @@ def main():
                 }
                 if existing_plan and isinstance(existing_plan.get("client_orchestration"), dict):
                     plan_payload["client_orchestration"] = existing_plan["client_orchestration"]
+                # Stage 3: Metadata generation
+                stage_start = time_module.time()
+                tqdm.write(f"  [3/5] Generating metadata: {len(chunks)} chunks")
                 doc_metadata, metadata_rejects = generate_metadata(raw_text, chunks)
+                metadata_time = time_module.time() - stage_start
+                tqdm.write(f"  ✓ Metadata generation completed in {metadata_time:.1f}s")
                 metadata_bytes = len(json.dumps(doc_metadata, ensure_ascii=False).encode("utf-8")) if doc_metadata else 0
                 if doc_metadata and metadata_bytes > MAX_METADATA_BYTES:
                     metadata_rejects.append(f"metadata_bytes_exceeded:{metadata_bytes}>{MAX_METADATA_BYTES}")
@@ -522,10 +567,33 @@ def main():
                 plan_payload["plan_hash"] = plan_hash
                 if not existing_plan or existing_plan.get("plan_hash") != plan_hash:
                     save_ingest_plan(doc_id, plan_payload)
+
+                # Update graph and aggregate doc-level entities BEFORE assigning metadata to chunks
+                aggregated_entities = {}
+                try:
+                    aggregated_entities = update_graph(args.qdrant_collection, doc_id, path_str, chunks)
+                except Exception as gex:
+                    print(f"WARN: graph update failed for {p}: {gex}")
+
+                # Store aggregated entities at document level only (not per-chunk) to avoid bloating payloads
+                # CRITICAL FIX: Create thin copy WITHOUT dynamic_entities for chunks
+                # Before fix: 67KB × 1321 chunks = 88MB (caused 30-min timeout due to shared dict reference)
+                # After fix: ~500B × 1321 chunks = ~660KB for chunk metadata, 67KB in plan_payload only
+                if aggregated_entities:
+                    # Store in document-level metadata (persisted in plan artifacts)
+                    doc_metadata["dynamic_entities"] = aggregated_entities
+                    plan_payload["doc_metadata"] = doc_metadata
+
+                # Create lightweight copy for chunks WITHOUT dynamic_entities
+                per_chunk_doc_metadata = {k: v for k, v in doc_metadata.items() if k != "dynamic_entities"} if doc_metadata else {}
+
+                # Assign plan_hash and thin metadata to each chunk
                 for chunk in chunks:
                     chunk["plan_hash"] = plan_hash
-                    if doc_metadata:
-                        chunk["doc_metadata"] = doc_metadata
+                    if per_chunk_doc_metadata:
+                        # Each chunk gets its own copy of the lightweight metadata (~500B)
+                        chunk["doc_metadata"] = dict(per_chunk_doc_metadata)
+
                 if sparse_expander:
                     for chunk in chunks:
                         terms = sparse_expander.encode(chunk.get("text", ""))
@@ -533,11 +601,6 @@ def main():
                             chunk["sparse_terms"] = [{"term": term, "weight": float(weight)} for term, weight in terms]
                         else:
                             chunk["sparse_terms"] = []
-
-                try:
-                    update_graph(args.qdrant_collection, doc_id, path_str, chunks)
-                except Exception as gex:
-                    print(f"WARN: graph update failed for {p}: {gex}")
                 try:
                     upsert_summaries(args.qdrant_collection, doc_id, chunks)
                 except Exception as sex:
@@ -582,7 +645,7 @@ def main():
                         "plan_hash": plan_hash,
                         "model_version": plan_payload.get("model_version"),
                         "prompt_sha": plan_payload.get("prompt_sha"),
-                        "doc_metadata": doc_metadata,
+                        "doc_metadata": chunk.get("doc_metadata", doc_metadata),  # Use per-chunk metadata (includes dynamic_entities)
                         "text": chunk.get("text", ""),
                     }
                     if sparse_expander and chunk.get("sparse_terms"):
@@ -621,6 +684,9 @@ def main():
                                 upsert_qdrant(qdrant_client, args.qdrant_collection, sel_vecs, sel_payloads, sel_ids)
                                 upserted_vecs += len(sel_ids)
                     else:
+                        # Stage 4: Embedding
+                        stage_start = time_module.time()
+                        tqdm.write(f"  [4/5] Embedding: {len(chunks)} chunks")
                         vecs = embed_texts(
                             args.ollama_url,
                             args.ollama_model,
@@ -633,8 +699,16 @@ def main():
                             keep_alive=args.ollama_keepalive,
                             force_per_item=args.ollama_per_item,
                         )
+                        embedding_time = time_module.time() - stage_start
+                        tqdm.write(f"  ✓ Embedding completed in {embedding_time:.1f}s")
+
+                        # Stage 5: Upserting
+                        stage_start = time_module.time()
+                        tqdm.write(f"  [5/5] Upserting to Qdrant: {len(ids)} vectors")
                         upsert_qdrant(qdrant_client, args.qdrant_collection, vecs, payloads, ids)
                         upserted_vecs = len(ids)
+                        upserting_time = time_module.time() - stage_start
+                        tqdm.write(f"  ✓ Upserting completed in {upserting_time:.1f}s")
 
                 # Also upsert into local FTS index (lexical)
                 if not args.no_fts and fts_writer is not None:

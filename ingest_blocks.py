@@ -42,15 +42,109 @@ def _init_counters() -> Dict[str, int]:
 
 
 DOC_CONVERTER: Optional[Any] = None  # Type: DocumentConverter when loaded
+CONVERTER_CACHE: Dict[Tuple[bool, int], Any] = {}  # Cache: (needs_ocr, timeout) -> DocumentConverter
 
 
-def _get_docling_converter():
-    """Lazy-load Docling DocumentConverter to avoid slow startup."""
-    global DOC_CONVERTER
-    if DOC_CONVERTER is None:
-        from docling.document_converter import DocumentConverter
-        DOC_CONVERTER = DocumentConverter()
-    return DOC_CONVERTER
+def _check_pdf_needs_ocr(pdf_path: Path) -> bool:
+    """Check if PDF has extractable text or needs OCR by sampling across document."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(str(pdf_path))
+        total_pages = len(reader.pages)
+
+        # Sample first, middle, last pages (not just first 3)
+        pages_to_check = [0]  # Always check first page
+        if total_pages > 1:
+            pages_to_check.append(total_pages - 1)  # Last page
+        if total_pages > 2:
+            pages_to_check.append(total_pages // 2)  # Middle page
+        if total_pages > 10:
+            # For larger docs, also check quarter points
+            pages_to_check.append(total_pages // 4)
+            pages_to_check.append(3 * total_pages // 4)
+
+        # Remove duplicates and sort
+        pages_to_check = sorted(set(pages_to_check))
+
+        text_chars = 0
+        for page_idx in pages_to_check:
+            text = reader.pages[page_idx].extract_text() or ""
+            text_chars += len(text.strip())
+
+        # If average < 100 chars per page, likely needs OCR
+        avg_chars = text_chars / len(pages_to_check) if pages_to_check else 0
+        needs_ocr = avg_chars < 100
+
+        print(f"  OCR detection: {avg_chars:.0f} chars/page avg (sampled {len(pages_to_check)}/{total_pages} pages) -> {'needs OCR' if needs_ocr else 'has text'}")
+        return needs_ocr
+    except Exception as e:
+        print(f"  OCR detection failed ({e}), assuming needs OCR")
+        return True
+
+
+def _get_docling_converter(needs_ocr: bool = True, file_size_mb: float = 0):
+    """
+    Get cached Docling converter with 2-tier configuration.
+
+    Tier 1 (HIGH_FIDELITY): OCR OFF, ACCURATE tables, pictures ON
+    Tier 2 (OCR_LEAN): OCR ON, FAST tables, pictures OFF
+
+    Args:
+        needs_ocr: Whether PDF needs OCR (detected via text sniff)
+        file_size_mb: File size in MB for timeout scaling
+    """
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        TableFormerMode,
+        TableStructureOptions,
+    )
+
+    # Determine timeout and tier
+    if needs_ocr:
+        # OCR_LEAN tier: Fixed 2-hour timeout for OCR processing
+        timeout_seconds = 7200
+        tier_name = "OCR_LEAN"
+    else:
+        # HIGH_FIDELITY tier: Scale timeout with file size
+        timeout_seconds = int(1800 + (file_size_mb * 180))
+        timeout_seconds = min(timeout_seconds, 7200)
+        tier_name = "HIGH_FIDELITY"
+
+    # Check cache
+    cache_key = (needs_ocr, timeout_seconds)
+    if cache_key in CONVERTER_CACHE:
+        print(f"  Pipeline: {tier_name} (cached)")
+        return CONVERTER_CACHE[cache_key]
+
+    # Log tier configuration
+    if needs_ocr:
+        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=ON, timeout={timeout_seconds/60:.0f}min)")
+        pdf_opts = PdfPipelineOptions(
+            do_ocr=True,
+            do_picture_description=False,
+            do_picture_classification=False,
+            table_structure_options=TableStructureOptions(mode=TableFormerMode.FAST),
+            document_timeout=timeout_seconds,
+        )
+    else:
+        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=OFF, timeout={timeout_seconds/60:.0f}min)")
+        pdf_opts = PdfPipelineOptions(
+            do_ocr=False,
+            do_picture_description=False,
+            do_picture_classification=False,
+            table_structure_options=TableStructureOptions(mode=TableFormerMode.FAST),
+            document_timeout=timeout_seconds,
+        )
+
+    # Create and cache converter
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
+    )
+    CONVERTER_CACHE[cache_key] = converter
+
+    return converter
 
 
 def _next_element_id(counters: Dict[str, int], prefix: str, page: int) -> str:
@@ -79,6 +173,61 @@ def _infer_heading_level(text: str) -> int:
     return 1
 
 
+# Common engineering units for trailing detection
+KNOWN_UNITS = {
+    # SI base and derived
+    "m", "mm", "cm", "km", "g", "kg", "mg", "L", "mL", "s", "min", "h", "hr", "A", "V", "W", "kW", "MW",
+    "Pa", "kPa", "MPa", "bar", "psi", "psig", "N", "kN", "J", "kJ", "MJ",
+    # Temperature
+    "°C", "°F", "K", "degC", "degF",
+    # Flow and volume
+    "m³", "m3", "gal", "ft³", "ft3", "GPM", "gpm", "LPM", "lpm", "m³/h", "m3/h", "L/s", "m³/s", "m3/s",
+    # Concentration
+    "mg/L", "g/L", "ppm", "ppb", "%", "wt%", "vol%",
+    # Velocity
+    "m/s", "ft/s", "mph", "km/h",
+    # Other
+    "rpm", "Hz", "kHz", "MHz", "Ω", "ohm", "mol", "mmol", "μm", "nm"
+}
+
+
+def _extract_unit_from_header(header: str) -> Tuple[str, Optional[str]]:
+    """
+    Extract parameter name and unit from table header.
+    Handles: (unit), [unit], comma-separated, and trailing known units.
+    Returns: (param_name, unit) or (header, None) if no unit found
+    """
+    header = header.strip()
+
+    # 1. Parentheses: "Parameter (unit)"
+    match = re.match(r"^(?P<name>.+?)\s*\((?P<unit>[^)]+)\)$", header)
+    if match:
+        return match.group("name").strip(), match.group("unit").strip()
+
+    # 2. Square brackets: "Parameter [unit]"
+    match = re.match(r"^(?P<name>.+?)\s*\[(?P<unit>[^\]]+)\]$", header)
+    if match:
+        return match.group("name").strip(), match.group("unit").strip()
+
+    # 3. Comma-separated: "Temperature, °C"
+    match = re.match(r"^(?P<name>.+?)\s*,\s*(?P<unit>.+)$", header)
+    if match:
+        unit_candidate = match.group("unit").strip()
+        # Validate it looks like a unit (short, no long words)
+        if len(unit_candidate) <= 20 and not re.search(r"\s+[a-z]{5,}", unit_candidate):
+            return match.group("name").strip(), unit_candidate
+
+    # 4. Trailing known units: "Flow Rate m³/h"
+    words = header.rsplit(None, 1)  # Split on last whitespace
+    if len(words) == 2:
+        name, potential_unit = words
+        if potential_unit in KNOWN_UNITS or potential_unit.replace("³", "3") in KNOWN_UNITS:
+            return name.strip(), potential_unit
+
+    # No unit found
+    return header, None
+
+
 def _docling_full_document_to_blocks(
     path: Path,
     doc_id: str,
@@ -87,9 +236,13 @@ def _docling_full_document_to_blocks(
     Process entire PDF with Docling in a single call.
     Returns all blocks and metadata for the document.
     """
-    converter = _get_docling_converter()
+    # Detect if OCR is needed and get file size
+    file_size_mb = path.stat().st_size / (1024 * 1024)
+    needs_ocr = _check_pdf_needs_ocr(path)
 
-    print(f"Converting full document with Docling: {path}")
+    converter = _get_docling_converter(needs_ocr=needs_ocr, file_size_mb=file_size_mb)
+
+    print(f"Converting full document with Docling: {path} ({file_size_mb:.1f}MB)")
     try:
         result = converter.convert(str(path))
         doc_dict = result.document.export_to_dict()
@@ -166,9 +319,11 @@ def _docling_full_document_to_blocks(
                     if not value:
                         continue
                     parts.append(f"{header}: {value}")
-                    parts_header = re.match(r"^(?P<name>.+?)\s*\((?P<unit>[^)]+)\)$", header)
-                    if parts_header:
-                        units_map[parts_header.group("name")] = parts_header.group("unit")
+
+                    # Enhanced unit extraction: parentheses, brackets, comma-separated, trailing units
+                    param_name, unit = _extract_unit_from_header(header)
+                    if unit:
+                        units_map[param_name] = unit
 
                 if not parts:
                     continue
@@ -213,7 +368,7 @@ def _docling_full_document_to_blocks(
             span = prov[0].get("charspan")
             label = item.get("label", "text")
 
-            if label in {"heading", "title"}:
+            if label in {"section_header", "title", "heading"}:
                 level = _infer_heading_level(text)
                 heading_state = _update_heading_path(heading_state, text, level)
                 element_id = _next_element_id(counters, "heading", page_num)

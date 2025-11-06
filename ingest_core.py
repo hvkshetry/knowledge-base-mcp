@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
+from tqdm import tqdm
 
 from lexical_index import FTSWriter
 from graph_builder import update_graph
@@ -77,38 +78,43 @@ def embed_texts(
             embeddings.append(vec)
         return l2_normalize(embeddings) if normalize else embeddings
 
+    # Calculate total batches for progress reporting
+    total_batches = (total + batch_size - 1) // batch_size
+
     index = 0
-    while index < total:
-        batch = texts[index:index + batch_size]
-        index += batch_size
-        payload = {
-            "model": model,
-            "input": batch,
-            "keep_alive": keep_alive,
-            "options": {"parallel": parallel, "num_thread": num_threads},
-        }
-        for attempt in range(3):
-            try:
-                r = requests.post(
-                    f"{ollama_url}/api/embed",
-                    json=payload,
-                    timeout=timeout,
-                    headers=headers,
-                )
-                if r.status_code == 404:
-                    raise RuntimeError("/api/embed endpoint unavailable")
-                r.raise_for_status()
-                batch_emb = r.json().get("embeddings")
-                if not isinstance(batch_emb, list):
-                    raise RuntimeError("Unexpected /api/embed response structure")
-                if normalize:
-                    batch_emb = l2_normalize(batch_emb)
-                embeddings.extend(batch_emb)
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                time.sleep(1.5 * (attempt + 1))
+    with tqdm(total=total_batches, desc="Embedding batches", leave=False, unit="batch") as pbar:
+        while index < total:
+            batch = texts[index:index + batch_size]
+            index += batch_size
+            payload = {
+                "model": model,
+                "input": batch,
+                "keep_alive": keep_alive,
+                "options": {"parallel": parallel, "num_thread": num_threads},
+            }
+            for attempt in range(3):
+                try:
+                    r = requests.post(
+                        f"{ollama_url}/api/embed",
+                        json=payload,
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    if r.status_code == 404:
+                        raise RuntimeError("/api/embed endpoint unavailable")
+                    r.raise_for_status()
+                    batch_emb = r.json().get("embeddings")
+                    if not isinstance(batch_emb, list):
+                        raise RuntimeError("Unexpected /api/embed response structure")
+                    if normalize:
+                        batch_emb = l2_normalize(batch_emb)
+                    embeddings.extend(batch_emb)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(1.5 * (attempt + 1))
+            pbar.update(1)
     return embeddings
 
 
@@ -198,11 +204,30 @@ def upsert_qdrant(
     payloads: Sequence[Dict[str, Any]],
     ids: Sequence[str],
 ) -> None:
-    points = [
-        models.PointStruct(id=i, vector=v, payload=p)
-        for i, v, p in zip(ids, vectors, payloads)
-    ]
-    client.upsert(collection_name=collection, points=points)
+    """
+    Upsert vectors to Qdrant with batching for large collections.
+    Batches large upserts into 512-vector chunks with progress reporting.
+    """
+    BATCH_SIZE = 512
+    total_vectors = len(vectors)
+
+    if total_vectors <= BATCH_SIZE:
+        # Fast path for small batches - no progress reporting needed
+        points = [
+            models.PointStruct(id=i, vector=v, payload=p)
+            for i, v, p in zip(ids, vectors, payloads)
+        ]
+        client.upsert(collection_name=collection, points=points)
+    else:
+        # Progress reporting for large batches
+        for i in range(0, total_vectors, BATCH_SIZE):
+            batch_end = min(i + BATCH_SIZE, total_vectors)
+            batch_points = [
+                models.PointStruct(id=ids[j], vector=vectors[j], payload=payloads[j])
+                for j in range(i, batch_end)
+            ]
+            client.upsert(collection_name=collection, points=batch_points)
+            tqdm.write(f"    Upserted {batch_end}/{total_vectors} vectors")
 
 
 def qdrant_any_by_filter(
