@@ -102,14 +102,11 @@ def _get_docling_converter(needs_ocr: bool = True, file_size_mb: float = 0):
     )
 
     # Determine timeout and tier
+    # No timeout - let documents process to completion regardless of size
+    timeout_seconds = None
     if needs_ocr:
-        # OCR_LEAN tier: Fixed 2-hour timeout for OCR processing
-        timeout_seconds = 7200
         tier_name = "OCR_LEAN"
     else:
-        # HIGH_FIDELITY tier: Scale timeout with file size
-        timeout_seconds = int(1800 + (file_size_mb * 180))
-        timeout_seconds = min(timeout_seconds, 7200)
         tier_name = "HIGH_FIDELITY"
 
     # Check cache
@@ -120,7 +117,7 @@ def _get_docling_converter(needs_ocr: bool = True, file_size_mb: float = 0):
 
     # Log tier configuration
     if needs_ocr:
-        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=ON, timeout={timeout_seconds/60:.0f}min)")
+        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=ON, timeout=None)")
         pdf_opts = PdfPipelineOptions(
             do_ocr=True,
             do_picture_description=False,
@@ -129,7 +126,7 @@ def _get_docling_converter(needs_ocr: bool = True, file_size_mb: float = 0):
             document_timeout=timeout_seconds,
         )
     else:
-        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=OFF, timeout={timeout_seconds/60:.0f}min)")
+        print(f"  Pipeline: {tier_name} (Tables=FAST, Pictures=OFF, OCR=OFF, timeout=None)")
         pdf_opts = PdfPipelineOptions(
             do_ocr=False,
             do_picture_description=False,

@@ -40,14 +40,13 @@ Use for daily/weekly updates to add new documents and update changed ones WITHOU
 - **Full re-ingestion**: First-time setup, changing chunk size, major refactoring
 - **Incremental update**: Daily/weekly maintenance, adding new docs to existing collection
 
-**Critical CLI notes for users:**
-- `--fts-db` MUST match collection name (e.g., `data/my_collection_fts.db` for `--qdrant-collection my_collection`)
-- Otherwise data goes to default `data/fts.db` causing confusion
-- `--extractor` flag removed - Docling is now the only extractor
-- `--batch-size 128` (new default) for better embedding throughput vs old default of 32
-- `--max-chars 700` recommended for reranker compatibility vs old default 1800
+**Critical CLI parameters when recommending bulk ingestion:**
+- `--fts-db` MUST match collection name (e.g., `data/my_collection_fts.db` for `--qdrant-collection my_collection`) or data goes to wrong database
+- `--max-file-mb` controls file size limit (default: 64MB). **Always check file sizes and increase to 100-200 for large handbooks** - files exceeding limit are silently skipped without warning
+- `--batch-size 128` for better embedding throughput (new default vs old 32)
+- `--max-chars 700` recommended for reranker compatibility (old default: 1800)
 - `--parallel 1` for single-threaded ingestion (safer for large PDFs)
-- `--ollama-threads 4` controls Ollama embedding parallelism (adjust based on CPU cores)
+- `--ollama-threads 4` controls Ollama embedding parallelism
 
 ### For Interactive MCP-Based Ingestion
 Use MCP tools for small-scale interactive work (1-10 documents):

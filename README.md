@@ -160,8 +160,17 @@ cp .mcp.json.example .mcp.json
   --parallel 1 \
   --ollama-threads 4 \
   --fts-db data/my_docs_fts.db \
-  --fts-rebuild
+  --fts-rebuild \
+  --max-file-mb 100
 ```
+
+**Important CLI Parameters**:
+- `--max-file-mb 100`: Maximum file size to process (default: 64MB). Increase for large handbooks/textbooks.
+- `--fts-db`: **MUST** match collection name (e.g., `data/my_docs_fts.db` for `--qdrant-collection my_docs`)
+- `--max-chars 700`: Recommended chunk size for reranker compatibility (old default: 1800)
+- `--batch-size 128`: Embedding batch size (new default: 128 vs old default: 32)
+- `--fts-rebuild`: Rebuild FTS database from scratch (omit for incremental updates)
+- Document timeouts have been **removed** - all documents process to completion regardless of size
 
 7. **Test the search**:
 ```bash
@@ -248,11 +257,12 @@ Set via environment variables (or CLI flags when available):
 | Environment variable | Purpose |
 |----------------------|---------|
 | `MIX_W_BM25`, `MIX_W_DENSE`, `MIX_W_RERANK` | Adjust blend between lexical, dense, and rerank signals. |
-| `DOCLING_TIMEOUT` | Seconds to wait for Docling to finish processing a document (default 300). |
 | `HF_HOME` | Hugging Face cache directory used by Docling models (default `.cache/hf`). |
 | `GRAPH_DB_PATH`, `SUMMARY_DB_PATH` | Override lightweight graph and summary storage locations. |
 | `ANSWERABILITY_THRESHOLD` | Minimum score required for auto mode to respond; lower scores return an abstain for the client to handle (e.g., run HyDE or rephrase). |
 | **Context Retrieval** | **CRITICAL: Always use kb.neighbors(n=10) after search** - single chunks are insufficient at chunk size 700. |
+
+**Note**: Document timeouts have been removed. All documents process to completion regardless of size.
 
 ## 📚 Usage
 
