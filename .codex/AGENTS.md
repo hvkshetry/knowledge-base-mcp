@@ -175,16 +175,18 @@ With the recommended chunk size of 700 characters (optimized for reranker compat
    → No missing steps or context
 ```
 
-### When to Increase Neighbor Radius
-- **Large multi-page tables**: Try n=15-20 (but check token limit warnings)
-- **Complex procedures**: Spanning multiple sections
-- **Figure captions + figures**: When figures are on separate pages
+### Sliding Window
+If `kb_neighbors(n=10)` incomplete: re-anchor to a chunk near the end (or beginning) of results, repeat. Stays under 25K token limit.
 
-### When Smaller Radius May Be Acceptable (Rare Cases)
-- **n=5**: Very short, self-contained content only
-- **n=3**: Single paragraph lookups (still risks missing context)
+### When to Increase n
+- Only if sliding window impractical
+- **n=15 max** (exceeds 25K tokens)
 
-**WARNING**: Reducing below n=10 risks incomplete answers. Only reduce if you're certain the content is self-contained.
+### When to Decrease n
+- **n=5**: Self-contained content only
+- **n=3**: Single paragraph (risky)
+
+Reducing below n=10 risks incomplete answers.
 
 ### Token Limit Management
 - **MCP response limit**: 25,000 tokens
