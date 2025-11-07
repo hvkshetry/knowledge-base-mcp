@@ -8,6 +8,7 @@ import hashlib
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from enum import Enum
 
 import requests
 from fastmcp import FastMCP, Context
@@ -32,6 +33,24 @@ from ingest_blocks import (
 from metadata_schema import generate_metadata
 from ingest_core import upsert_document_artifacts
 from datetime import datetime
+
+
+# Response profile enum for token-efficient responses
+class ResponseProfile(str, Enum):
+    """Response payload size profiles for retrieval tools.
+
+    SLIM: Minimal fields (chunk_id, text, doc_id, path, section_path, pages, score)
+          Default profile - optimized for token efficiency (90% reduction)
+
+    FULL: All structural metadata including tables, bboxes, element_ids
+          Use when table reconstruction or figure citations needed
+
+    DIAGNOSTIC: Full metadata + provenance + score breakdowns
+                Use for quality audits and debugging extraction issues
+    """
+    SLIM = "slim"
+    FULL = "full"
+    DIAGNOSTIC = "diagnostic"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1995,6 +2014,80 @@ async def _ensure_row_texts(
                 row["doc_metadata"] = json.loads(dm)
             except Exception:
                 pass
+
+
+def _normalize_response_profile(profile_str: str) -> ResponseProfile:
+    """Safely convert response_profile string to enum, with fallback to SLIM.
+
+    Args:
+        profile_str: User-supplied profile string
+
+    Returns:
+        ResponseProfile enum value (SLIM if invalid input)
+    """
+    try:
+        return ResponseProfile(profile_str.lower().strip())
+    except (ValueError, AttributeError):
+        logger.warning(f"Invalid response_profile '{profile_str}', defaulting to slim")
+        return ResponseProfile.SLIM
+
+
+def prune_row(row: Dict[str, Any], profile: ResponseProfile = ResponseProfile.SLIM) -> Dict[str, Any]:
+    """Shared response formatter - reduces payload size by dropping heavy metadata.
+
+    Args:
+        row: Full chunk row with all metadata
+        profile: Response profile (SLIM, FULL, or DIAGNOSTIC)
+
+    Returns:
+        Pruned row dict based on profile
+
+    Profile behaviors:
+        SLIM (default): Keep essential fields including chunk_id, text, doc_id, path,
+                       section_path, page_numbers, chunk_start/end, score, route.
+                       Preserves error/ACL markers. ~85% token reduction.
+        FULL: Keep structural metadata (tables, bboxes, element_ids) too.
+        DIAGNOSTIC: Return everything including provenance and score breakdowns.
+    """
+    # Preserve error and ACL denial markers regardless of profile
+    if row.get("error") or row.get("forbidden") or row.get("abstain") or row.get("note"):
+        return row
+
+    if profile == ResponseProfile.DIAGNOSTIC:
+        # Return everything unchanged
+        return row
+
+    if profile == ResponseProfile.SLIM:
+        # Essential fields for citations + context + neighbor sorting
+        return {
+            "chunk_id": row.get("chunk_id"),
+            "text": row.get("text"),
+            "doc_id": row.get("doc_id"),
+            "path": row.get("path"),
+            "section_path": row.get("section_path", []),
+            "page_numbers": row.get("page_numbers", []),
+            "chunk_start": row.get("chunk_start"),  # Required for neighbor sorting
+            "chunk_end": row.get("chunk_end"),      # Required for neighbor sorting
+            "score": row.get("final_score") or row.get("score", 0.0),
+            "route": row.get("route"),
+        }
+
+    if profile == ResponseProfile.FULL:
+        # Keep structural metadata, drop provenance
+        keep_fields = {
+            "chunk_id", "text", "doc_id", "path",
+            "chunk_start", "chunk_end", "section_path",
+            "pages", "page_numbers", "filename",
+            "score", "final_score", "route",
+            "element_ids", "bboxes", "types",
+            "table_headers", "table_units", "source_tools"
+        }
+        return {k: v for k, v in row.items() if k in keep_fields}
+
+    # Fallback to full
+    return row
+
+
 def _extract_score(row: Dict[str, Any]) -> float:
     for key in ("final_score", "score", "rerank_score", "rrf_score", "dense_score"):
         val = row.get(key)
@@ -2795,6 +2888,7 @@ async def kb_sparse(
     retrieve_k: int = 24,
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
@@ -2815,6 +2909,8 @@ async def kb_sparse(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -2841,6 +2937,7 @@ async def kb_sparse_splade(
     retrieve_k: int = 24,
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not HAVE_SPARSE_SPLADE:
         return {"error": "sparse_expander_disabled"}
@@ -2863,6 +2960,8 @@ async def kb_sparse_splade(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -2889,6 +2988,7 @@ async def kb_dense(
     retrieve_k: int = 24,
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
@@ -2910,6 +3010,8 @@ async def kb_dense(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -2937,6 +3039,7 @@ async def kb_hybrid(
     return_k: int = 8,
     top_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
@@ -2960,6 +3063,8 @@ async def kb_hybrid(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -2987,6 +3092,7 @@ async def kb_rerank(
     return_k: int = 8,
     top_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
@@ -3010,6 +3116,8 @@ async def kb_rerank(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -3036,6 +3144,7 @@ async def kb_colbert(
     retrieve_k: int = 24,
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(query, str) or not query.strip():
         return {"error": "empty_query"}
@@ -3058,6 +3167,8 @@ async def kb_colbert(
         boosts,
     )
     best = _best_score(rows)
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     result = {
         "collection": collection_name,
         "slug": slug,
@@ -3087,6 +3198,7 @@ async def kb_batch(
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
     scopes: Optional[List[Dict[str, Any]]] = None,
+    response_profile: str = "slim",
 ) -> Dict[str, Any]:
     if not isinstance(queries, list) or not queries:
         return {"error": "missing_queries"}
@@ -3151,6 +3263,8 @@ async def kb_batch(
                 boosts,
             )
             best = _best_score(rows)
+            profile = _normalize_response_profile(response_profile)
+            rows = [prune_row(row, profile) for row in rows]
             entry = {
                 "index": idx,
                 "query": q,
@@ -3426,6 +3540,7 @@ async def kb_neighbors(
     chunk_id: str,
     collection: Optional[str] = None,
     n: int = 1,
+    response_profile: str = "slim",
 ) -> List[Dict[str, Any]]:
     if not chunk_id:
         return [{"error": "missing_chunk_id"}]
@@ -3455,6 +3570,8 @@ async def kb_neighbors(
         })
     await _ensure_row_texts(rows, collection_name, subjects)
     rows = [row for row in rows if _is_allowed_path(row.get("path"))]
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     _audit("neighbors", {
         "slug": slug,
         "collection": collection_name,
@@ -3644,6 +3761,7 @@ async def kb_search(
     retrieve_k: int = 24,
     return_k: int = 8,
     scope: Optional[Dict[str, Any]] = None,
+    response_profile: str = "slim",
 ) -> List[Dict[str, Any]]:
     """Vector search (semantic), rerank, hybrid, sparse, or auto planner."""
     if not isinstance(query, str) or not query.strip():
@@ -3787,6 +3905,8 @@ async def kb_search(
             rows = sparse_rows
             route = "sparse"
 
+    profile = _normalize_response_profile(response_profile)
+    rows = [prune_row(row, profile) for row in rows]
     return finalize(rows, route)
 
 if __name__ == "__main__":

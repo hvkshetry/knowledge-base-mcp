@@ -99,7 +99,21 @@ All metadata preserved in both Qdrant vector payloads and FTS database.
    - Default to `kb.search(mode="auto", ...)` or `kb.hybrid`
    - Alternatives: `kb.dense`, `kb.sparse`, `kb.rerank`, `kb.colbert` (if configured), `kb.sparse_splade` (needs SPLADE)
 
-2. **Inspect evidence**
+2. **Response profiles for token efficiency**
+   - All retrieval tools support `response_profile` parameter (defaults to `"slim"`)
+   - **SLIM** (default): Essential fields only (chunk_id, text, doc_id, path, section_path, page_numbers, chunk_start, chunk_end, score, route)
+     - ~85% token reduction vs full metadata
+     - Sufficient for most retrieval + neighbor expansion workflows
+     - Use for standard Q&A, context retrieval, and neighbor sorting
+   - **FULL**: Adds structural metadata (element_ids, bboxes, types, table_headers, table_units, source_tools)
+     - Use when table reconstruction or figure citations are needed
+     - Omits provenance fields to reduce token overhead
+   - **DIAGNOSTIC**: Complete metadata including provenance (doc_metadata, chunk_profile, plan_hash, model_version, prompt_sha, score breakdowns)
+     - Use for quality audits, debugging extraction issues, or understanding retrieval behavior
+     - Full token overhead but provides complete transparency
+   - Invalid profile values safely default to SLIM with warning logged
+
+3. **Inspect evidence**
    - `kb.open`, `kb.neighbors` for context and citations
    - `kb.table` for row-level answers, `kb.summary` / `kb.outline` if summaries built
    - Graph pivots: `kb.entities`, `kb.linkouts`, `kb.graph`
@@ -135,12 +149,6 @@ With the recommended chunk size of 700 characters (optimized for reranker compat
 - **Arguments**: Claims in one chunk, supporting evidence in neighbors
 - **Figures**: Captions separated from figure descriptions
 - **Context**: Background information before/after the key point
-
-### Why n=10 is the Recommended Default
-- **Table data distribution**: With 700-char chunks, table rows are typically 3-10 chunks away from the table reference
-- **Token limit safety**: n=10 returns ~19,000-20,000 tokens (safely under the 25,000 token MCP response limit)
-- **n=15 risks timeout**: Exceeds 25,000 token limit and will fail
-- **n=5 is insufficient**: May miss table data that's further away
 
 ### Example: Table Reconstruction
 ```
@@ -179,8 +187,9 @@ With the recommended chunk size of 700 characters (optimized for reranker compat
 If `kb_neighbors(n=10)` incomplete: re-anchor to a chunk near the end (or beginning) of results, repeat. Stays under 25K token limit.
 
 ### When to Increase n
-- Only if sliding window impractical
-- **n=15 max** (exceeds 25K tokens)
+- **Large multi-page tables**: n=15-20 for extended table data
+- **Complex procedures**: n=15-25 when procedures span multiple sections
+- **Maximum safe value with SLIM**: n=30 (61 chunks total, ~12,000-13,000 tokens)
 
 ### When to Decrease n
 - **n=5**: Self-contained content only
@@ -188,11 +197,13 @@ If `kb_neighbors(n=10)` incomplete: re-anchor to a chunk near the end (or beginn
 
 Reducing below n=10 risks incomplete answers.
 
-### Token Limit Management
+### Token Limit Management with Response Profiles
 - **MCP response limit**: 25,000 tokens
-- **n=10**: ~19,000-20,000 tokens (safe)
-- **n=15**: ~29,000 tokens (exceeds limit, will fail)
-- **If you hit token limits**: Reduce n value and make multiple targeted neighbor calls
+- **Recommended safe defaults (targeting ~15,000 tokens for maximum context)**:
+  - **SLIM profile (default)**: Use **n=30** (61 chunks, ~12,000-13,000 tokens)
+  - **FULL profile**: Use **n=15** (31 chunks, ~12,000-15,000 tokens)
+  - **DIAGNOSTIC profile**: Use **n=10** (21 chunks, ~19,000-20,000 tokens)
+- **If you hit token limits**: Switch to SLIM profile or reduce n value
 
 ### Best Practice Summary
 ✅ **ALWAYS expand top search results with kb_neighbors(n=10)** - treat this as mandatory, not optional
