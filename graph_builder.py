@@ -20,6 +20,14 @@ ENTITY_TYPE_CONCEPT = "concept"
 ENTITY_TYPE_UNIT = "unit"
 ENTITY_TYPE_MEASUREMENT = "measurement"
 
+# Configurable entity extraction parameters
+GRAPH_KEYPHRASE_TOP = int(os.getenv("GRAPH_KEYPHRASE_TOP", "5"))  # Max keyphrases per chunk (default: 5)
+GRAPH_YAKE_SCORE_THRESHOLD = float(os.getenv("GRAPH_YAKE_SCORE_THRESHOLD", "0.15"))  # Lower is better, typical range 0.0-0.3
+MAX_MEASUREMENTS_PER_CHUNK = int(os.getenv("MAX_MEASUREMENTS_PER_CHUNK", "20"))  # Limit measurements to prevent table bloat
+
+# Stopwords to filter (generic non-entities)
+ENTITY_STOPWORDS = {"system", "process", "method", "section", "table", "figure", "chapter", "page", "example"}
+
 UPPER_ENTITY_RE = re.compile(r"\b([A-Z]{3,}(?:\s+[A-Z0-9]{2,})*)\b")
 MEASUREMENT_RE = re.compile(
     r"(?P<parameter>[A-Za-z][A-Za-z0-9\s/%°\-\(\)]{2,}?)\s*(?:=|:)\s*(?P<value>-?\d+(?:\.\d+)?(?:\s*[x×]\s*10\^\d+)?)\s*(?P<unit>[A-Za-zμ/%°\-\^0-9]+)?"
@@ -31,23 +39,37 @@ RELATION_PATTERNS = [
 ]
 
 
-def _get_keyphrase_extractor():
-    """Lazy load YAKE keyphrase extractor."""
+def _get_keyphrase_extractor(top_k: int = None):
+    """
+    Lazy load YAKE keyphrase extractor with configurable top_k.
+
+    Args:
+        top_k: Maximum keyphrases to extract. If None, uses GRAPH_KEYPHRASE_TOP env var (default 5).
+    """
+    if top_k is None:
+        top_k = GRAPH_KEYPHRASE_TOP
+
+    # Cache extractors by top_k value to avoid recreating
     global _KEYPHRASE_EXTRACTOR
     if _KEYPHRASE_EXTRACTOR is None:
+        _KEYPHRASE_EXTRACTOR = {}
+
+    if top_k not in _KEYPHRASE_EXTRACTOR:
         try:
             import yake
-            _KEYPHRASE_EXTRACTOR = yake.KeywordExtractor(
+            _KEYPHRASE_EXTRACTOR[top_k] = yake.KeywordExtractor(
                 lan="en",
                 n=2,  # Max ngram size (2-word phrases sufficient for 700-char chunks)
                 dedupLim=0.8,  # Better deduplication
-                top=8,  # Top N keyphrases per chunk (8 is sufficient for ~700 chars)
+                top=top_k,  # Configurable limit
                 features=None
             )
         except Exception as e:
             print(f"Warning: Could not load YAKE extractor: {e}")
-            _KEYPHRASE_EXTRACTOR = False
-    return _KEYPHRASE_EXTRACTOR if _KEYPHRASE_EXTRACTOR is not False else None
+            _KEYPHRASE_EXTRACTOR[top_k] = False
+
+    extractor = _KEYPHRASE_EXTRACTOR.get(top_k)
+    return extractor if extractor is not False else None
 
 
 def _normalize_label(label: str) -> str:
@@ -192,16 +214,26 @@ def _measurement_node_id(parameter: str, value: str, unit: Optional[str], doc_id
 
 def _keyphrase_entities(text: str) -> List[Tuple[str, str]]:
     """
-    Extract keyphrases dynamically using YAKE unsupervised extraction.
+    Extract keyphrases dynamically using YAKE unsupervised extraction with adaptive limits.
     Returns list of (label, type='entity') tuples - no hardcoded classification.
+
+    Optimizations:
+    - Adaptive top_k: 3 for chunks <=800 chars, 5 for longer chunks
+    - Score threshold: Filters keyphrases with YAKE score > 0.15 (lower is better)
+    - Stopword filtering: Removes generic terms like "system", "process", "method"
     """
-    extractor = _get_keyphrase_extractor()
-    if extractor is None or not text:
+    if not text:
         return []
 
     # Skip tiny chunks - headings/captions already contribute via other heuristics
     text_stripped = text.strip()
     if len(text_stripped) < 120 or len(text_stripped.split()) < 25:
+        return []
+
+    # Adaptive top_k based on chunk length
+    top_k = 3 if len(text_stripped) <= 800 else GRAPH_KEYPHRASE_TOP
+    extractor = _get_keyphrase_extractor(top_k)
+    if extractor is None:
         return []
 
     entities: List[Tuple[str, str]] = []
@@ -210,6 +242,10 @@ def _keyphrase_entities(text: str) -> List[Tuple[str, str]]:
         keywords = extractor.extract_keywords(text)
 
         for keyphrase, score in keywords:
+            # YAKE score threshold (lower is better, typical range 0.0-0.3)
+            if score > GRAPH_YAKE_SCORE_THRESHOLD:
+                continue
+
             # Filter noise
             keyphrase = keyphrase.strip()
             if len(keyphrase) < ENTITY_MIN_LEN:
@@ -222,6 +258,11 @@ def _keyphrase_entities(text: str) -> List[Tuple[str, str]]:
             # Alphanumeric ratio check (at least 50% alphanumeric)
             alnum_count = sum(c.isalnum() for c in keyphrase)
             if alnum_count / len(keyphrase) < 0.5:
+                continue
+
+            # Stopword filtering (generic non-entities)
+            normalized = keyphrase.lower()
+            if normalized in ENTITY_STOPWORDS:
                 continue
 
             # All entities are generic "entity" - let graph structure reveal relationships
@@ -467,6 +508,8 @@ def update_graph(
         parameter_id_lookup: Dict[str, str] = {}
         entity_lookup: Dict[str, str] = {}
 
+        # PHASE 1: Create element-specific chunk nodes and their "contains" edges
+        # This preserves element metadata (table rows, figures, etc.) in the graph
         for idx, element_id in enumerate(element_ids):
             if not element_id:
                 continue
@@ -479,96 +522,128 @@ def update_graph(
                 (parent, chunk_node, "contains", collection, doc_id),
             )
 
-            entity_ids_for_chunk: List[str] = []
-            for entity in chunk_entities:
-                label = entity["label"]
-                etype = entity["type"] or "entity"
-                entity_id = _node_id_entity(label)
-                _upsert_node(cur, entity_id, label, etype, collection, [doc_id])
-                relation = "row_has_parameter" if entity.get("source") == "table" else "mentions"
-                key = (chunk_node, entity_id, relation)
-                if key not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (chunk_node, entity_id, relation, collection, doc_id),
-                    )
-                    seen_edges.add(key)
-                entity_ids_for_chunk.append(entity_id)
-                norm_label = _normalize_label(label)
-                if norm_label:
-                    entity_lookup.setdefault(norm_label, entity_id)
-                if etype == "parameter" and norm_label:
-                    parameter_id_lookup[norm_label] = entity_id
+        # PHASE 2: Pick a single "text carrier" node for entity mentions
+        # FIX: Use first element_id or synthetic chunk node to avoid 5-10x duplication
+        if element_ids:
+            primary_element_id = element_ids[0]
+        else:
+            # Fallback: synthetic chunk node if no element_ids
+            primary_element_id = f"chunk_{chunk.get('chunk_start', 0)}"
 
-                # Aggregate entities for doc-level metadata
-                if etype not in doc_entities_by_type:
-                    doc_entities_by_type[etype] = set()
-                doc_entities_by_type[etype].add(label)
+        primary_chunk_node = _node_id_chunk(doc_id, primary_element_id)
 
-            measurements = []
-            text = chunk.get("text") or ""
-            for match in MEASUREMENT_RE.finditer(text):
-                parameter = match.group("parameter").strip()
-                value = match.group("value").strip()
-                unit = match.group("unit")
-                if len(parameter) < ENTITY_MIN_LEN:
-                    continue
-                measurements.append((parameter, value, unit))
+        # PHASE 3: Extract entities ONCE per chunk (not per element_id)
+        # This fixes the 5-10x entity multiplication bug
+        entity_ids_for_chunk: List[str] = []
+        for entity in chunk_entities:
+            label = entity["label"]
+            etype = entity["type"] or "entity"
+            entity_id = _node_id_entity(label)
+            _upsert_node(cur, entity_id, label, etype, collection, [doc_id])
+            relation = "row_has_parameter" if entity.get("source") == "table" else "mentions"
+            key = (primary_chunk_node, entity_id, relation)
+            if key not in seen_edges:
+                cur.execute(
+                    "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                    (primary_chunk_node, entity_id, relation, collection, doc_id),
+                )
+                seen_edges.add(key)
+            entity_ids_for_chunk.append(entity_id)
+            norm_label = _normalize_label(label)
+            if norm_label:
+                entity_lookup.setdefault(norm_label, entity_id)
+            if etype == "parameter" and norm_label:
+                parameter_id_lookup[norm_label] = entity_id
 
-            for parameter, value, unit in measurements:
-                norm_param = _normalize_label(parameter)
-                parameter_entity_id = parameter_id_lookup.get(norm_param)
-                if not parameter_entity_id:
-                    parameter_entity_id = _node_id_entity(parameter)
-                    _upsert_node(cur, parameter_entity_id, parameter, "parameter", collection, [doc_id])
-                    if norm_param:
-                        parameter_id_lookup[norm_param] = parameter_entity_id
-                        entity_lookup.setdefault(norm_param, parameter_entity_id)
-                elif norm_param:
+            # Aggregate entities for doc-level metadata
+            if etype not in doc_entities_by_type:
+                doc_entities_by_type[etype] = set()
+            doc_entities_by_type[etype].add(label)
+
+        # PHASE 4: Extract measurements using primary chunk node with throttling
+        measurements = []
+        text = chunk.get("text") or ""
+        seen_param_units = set()  # Deduplicate (parameter, unit) pairs within chunk
+
+        for match in MEASUREMENT_RE.finditer(text):
+            parameter = match.group("parameter").strip()
+            value = match.group("value").strip()
+            unit = match.group("unit")
+            if len(parameter) < ENTITY_MIN_LEN:
+                continue
+
+            # Deduplicate by (parameter, unit) to avoid redundant measurements
+            param_unit_key = (parameter.lower(), (unit or "").lower())
+            if param_unit_key in seen_param_units:
+                continue
+            seen_param_units.add(param_unit_key)
+
+            measurements.append((parameter, value, unit))
+
+            # Throttle to prevent table bloat (configurable via MAX_MEASUREMENTS_PER_CHUNK)
+            if len(measurements) >= MAX_MEASUREMENTS_PER_CHUNK:
+                break
+
+        for parameter, value, unit in measurements:
+            norm_param = _normalize_label(parameter)
+            parameter_entity_id = parameter_id_lookup.get(norm_param)
+            if not parameter_entity_id:
+                parameter_entity_id = _node_id_entity(parameter)
+                _upsert_node(cur, parameter_entity_id, parameter, "parameter", collection, [doc_id])
+                if norm_param:
+                    parameter_id_lookup[norm_param] = parameter_entity_id
                     entity_lookup.setdefault(norm_param, parameter_entity_id)
-                entity_ids_for_chunk.append(parameter_entity_id)
-                measurement_label = f"{value} {unit or ''}".strip()
-                measurement_node = _measurement_node_id(parameter, value, unit, doc_id, chunk_node)
-                _upsert_node(cur, measurement_node, measurement_label, ENTITY_TYPE_MEASUREMENT, collection, [doc_id])
-                key_measure = (chunk_node, measurement_node, "mentions")
-                if key_measure not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (chunk_node, measurement_node, "mentions", collection, doc_id),
-                    )
-                    seen_edges.add(key_measure)
-                key_param_link = (parameter_entity_id, measurement_node, "has_measurement")
-                if key_param_link not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (parameter_entity_id, measurement_node, "has_measurement", collection, doc_id),
-                    )
-                    seen_edges.add(key_param_link)
-                edge_param_chunk = (chunk_node, parameter_entity_id, "mentions")
-                if edge_param_chunk not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (chunk_node, parameter_entity_id, "mentions", collection, doc_id),
-                    )
-                    seen_edges.add(edge_param_chunk)
+            elif norm_param:
+                entity_lookup.setdefault(norm_param, parameter_entity_id)
+            entity_ids_for_chunk.append(parameter_entity_id)
+            measurement_label = f"{value} {unit or ''}".strip()
+            measurement_node = _measurement_node_id(parameter, value, unit, doc_id, primary_chunk_node)
+            _upsert_node(cur, measurement_node, measurement_label, ENTITY_TYPE_MEASUREMENT, collection, [doc_id])
+            key_measure = (primary_chunk_node, measurement_node, "mentions")
+            if key_measure not in seen_edges:
+                cur.execute(
+                    "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                    (primary_chunk_node, measurement_node, "mentions", collection, doc_id),
+                )
+                seen_edges.add(key_measure)
+            key_param_link = (parameter_entity_id, measurement_node, "has_measurement")
+            if key_param_link not in seen_edges:
+                cur.execute(
+                    "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                    (parameter_entity_id, measurement_node, "has_measurement", collection, doc_id),
+                )
+                seen_edges.add(key_param_link)
+            edge_param_chunk = (primary_chunk_node, parameter_entity_id, "mentions")
+            if edge_param_chunk not in seen_edges:
+                cur.execute(
+                    "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                    (primary_chunk_node, parameter_entity_id, "mentions", collection, doc_id),
+                )
+                seen_edges.add(edge_param_chunk)
 
-            for src_id, dst_id, relation in _extract_relations(text, entity_lookup):
-                key_rel = (src_id, dst_id, relation)
-                if key_rel not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (src_id, dst_id, relation, collection, doc_id),
-                    )
-                    seen_edges.add(key_rel)
+        # PHASE 5: Extract semantic relations
+        for src_id, dst_id, relation in _extract_relations(text, entity_lookup):
+            key_rel = (src_id, dst_id, relation)
+            if key_rel not in seen_edges:
+                cur.execute(
+                    "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+                    (src_id, dst_id, relation, collection, doc_id),
+                )
+                seen_edges.add(key_rel)
 
-            for left_id, right_id in _co_occurrence_pairs(entity_ids_for_chunk):
-                key = (left_id, right_id, "co_occurs")
-                if key not in seen_edges:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
-                        (left_id, right_id, "co_occurs", collection, doc_id),
-                    )
-                    seen_edges.add(key)
+        # CO-OCCURRENCE EDGES REMOVED
+        # These C(n,2) edges caused 828,755 redundant edges in misc_process_kb (31.8% bloat).
+        # Nothing downstream consumes "co_occurs" edges - all search uses "mentions"/"has_measurement".
+        # Removed based on cleanup_graph_bloat_v2.py results showing 31% size reduction with no functionality loss.
+        # If needed in future, add GRAPH_ADD_COOCC env flag and re-enable selectively.
+        # for left_id, right_id in _co_occurrence_pairs(entity_ids_for_chunk):
+        #     key = (left_id, right_id, "co_occurs")
+        #     if key not in seen_edges:
+        #         cur.execute(
+        #             "INSERT OR IGNORE INTO edges(src, dst, type, collection, doc_id) VALUES(?,?,?,?,?)",
+        #             (left_id, right_id, "co_occurs", collection, doc_id),
+        #         )
+        #         seen_edges.add(key)
 
     conn.commit()
     # Checkpoint WAL to prevent .db-wal file from growing too large

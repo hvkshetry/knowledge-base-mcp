@@ -200,92 +200,124 @@ class FTSWriter:
         cur.execute(SPARSE_CHUNK_INDEX_SQL)
         self.conn.commit()
 
-    def upsert_many(self, rows: Iterable[Dict[str, Any]]) -> int:
+    def upsert_many(self, rows: Iterable[Dict[str, Any]], batch_size: int = 2000, show_progress: bool = False) -> int:
+        """
+        Upsert chunks with batched commits to prevent WAL bloat.
+
+        Args:
+            rows: Chunk rows to upsert
+            batch_size: Number of rows per commit (default 2000, recommended for large docs)
+            show_progress: Show progress bar (useful for large ingestions)
+
+        Returns:
+            Total number of rows upserted
+        """
         rows = [r for r in rows if r.get("text")]
         if not rows:
             return 0
+
         cur = self.conn.cursor()
-        # Delete existing by chunk_id
-        cur.executemany(
-            "DELETE FROM fts_chunks WHERE chunk_id = ?",
-            [(str(r.get("chunk_id")),) for r in rows],
-        )
-        # Insert many
-        cur.executemany(
-            """
-            INSERT INTO fts_chunks (
-                text, chunk_id, doc_id, path, filename,
-                chunk_start, chunk_end, mtime, page_numbers,
-                pages, section_path, element_ids, bboxes,
-                types, source_tools, table_headers, table_units,
-                chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    r.get("text", ""),
-                    str(r.get("chunk_id")),
-                    str(r.get("doc_id")),
-                    str(r.get("path")),
-                    str(r.get("filename")),
-                    int(r.get("chunk_start", 0) or 0),
-                    int(r.get("chunk_end", 0) or 0),
-                    int(r.get("mtime", 0) or 0),
-                    str(r.get("page_numbers", "") or ""),
-                    str(r.get("pages", "") or ""),
-                    str(r.get("section_path", "") or ""),
-                    str(r.get("element_ids", "") or ""),
-                    str(r.get("bboxes", "") or ""),
-                    str(r.get("types", "") or ""),
-                    str(r.get("source_tools", "") or ""),
-                    str(r.get("table_headers", "") or ""),
-                    str(r.get("table_units", "") or ""),
-                    str(r.get("chunk_profile", "") or ""),
-                    str(r.get("plan_hash", "") or ""),
-                    str(r.get("model_version", "") or ""),
-                    str(r.get("prompt_sha", "") or ""),
-                    str(r.get("doc_metadata", "") or ""),
-                )
-                for r in rows
-            ],
-        )
-        sparse_delete = set()
-        sparse_rows: List[Tuple[str, str, str, float]] = []
-        for r in rows:
-            chunk_id = str(r.get("chunk_id"))
-            doc_id = str(r.get("doc_id"))
-            terms = r.get("sparse_terms") or []
-            if not terms:
-                continue
-            sparse_delete.add(chunk_id)
-            for entry in terms:
-                if isinstance(entry, dict):
-                    term = entry.get("term")
-                    weight = entry.get("weight")
-                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    term, weight = entry[0], entry[1]
-                else:
-                    continue
-                if not term:
-                    continue
-                try:
-                    w = float(weight)
-                except Exception:
-                    continue
-                term_norm = str(term).strip().lower()
-                if len(term_norm) < 3:
-                    continue
-                sparse_rows.append((term_norm, chunk_id, doc_id, w))
-        if sparse_delete:
-            cur.executemany("DELETE FROM fts_chunks_sparse WHERE chunk_id = ?", [(cid,) for cid in sparse_delete])
-        if sparse_rows:
+        total_inserted = 0
+
+        # Process in batches with intermediate commits
+        import sys
+        for batch_start in range(0, len(rows), batch_size):
+            batch_end = min(batch_start + batch_size, len(rows))
+            batch = rows[batch_start:batch_end]
+
+            # Delete existing by chunk_id
             cur.executemany(
-                "INSERT OR REPLACE INTO fts_chunks_sparse(term, chunk_id, doc_id, weight) VALUES(?,?,?,?)",
-                sparse_rows,
+                "DELETE FROM fts_chunks WHERE chunk_id = ?",
+                [(str(r.get("chunk_id")),) for r in batch],
             )
-        self.conn.commit()
-        return len(rows)
+
+            # Insert batch
+            cur.executemany(
+                """
+                INSERT INTO fts_chunks (
+                    text, chunk_id, doc_id, path, filename,
+                    chunk_start, chunk_end, mtime, page_numbers,
+                    pages, section_path, element_ids, bboxes,
+                    types, source_tools, table_headers, table_units,
+                    chunk_profile, plan_hash, model_version, prompt_sha, doc_metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        r.get("text", ""),
+                        str(r.get("chunk_id")),
+                        str(r.get("doc_id")),
+                        str(r.get("path")),
+                        str(r.get("filename")),
+                        int(r.get("chunk_start", 0) or 0),
+                        int(r.get("chunk_end", 0) or 0),
+                        int(r.get("mtime", 0) or 0),
+                        str(r.get("page_numbers", "") or ""),
+                        str(r.get("pages", "") or ""),
+                        str(r.get("section_path", "") or ""),
+                        str(r.get("element_ids", "") or ""),
+                        str(r.get("bboxes", "") or ""),
+                        str(r.get("types", "") or ""),
+                        str(r.get("source_tools", "") or ""),
+                        str(r.get("table_headers", "") or ""),
+                        str(r.get("table_units", "") or ""),
+                        str(r.get("chunk_profile", "") or ""),
+                        str(r.get("plan_hash", "") or ""),
+                        str(r.get("model_version", "") or ""),
+                        str(r.get("prompt_sha", "") or ""),
+                        str(r.get("doc_metadata", "") or ""),
+                    )
+                    for r in batch
+                ],
+            )
+
+            # Process sparse terms for this batch
+            sparse_delete = set()
+            sparse_rows: List[Tuple[str, str, str, float]] = []
+            for r in batch:
+                chunk_id = str(r.get("chunk_id"))
+                doc_id = str(r.get("doc_id"))
+                terms = r.get("sparse_terms") or []
+                if not terms:
+                    continue
+                sparse_delete.add(chunk_id)
+                for entry in terms:
+                    if isinstance(entry, dict):
+                        term = entry.get("term")
+                        weight = entry.get("weight")
+                    elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        term, weight = entry[0], entry[1]
+                    else:
+                        continue
+                    if not term:
+                        continue
+                    try:
+                        w = float(weight)
+                    except Exception:
+                        continue
+                    term_norm = str(term).strip().lower()
+                    if len(term_norm) < 3:
+                        continue
+                    sparse_rows.append((term_norm, chunk_id, doc_id, w))
+
+            if sparse_delete:
+                cur.executemany("DELETE FROM fts_chunks_sparse WHERE chunk_id = ?", [(cid,) for cid in sparse_delete])
+            if sparse_rows:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO fts_chunks_sparse(term, chunk_id, doc_id, weight) VALUES(?,?,?,?)",
+                    sparse_rows,
+                )
+
+            # Commit this batch to bound WAL growth
+            self.conn.commit()
+            total_inserted += len(batch)
+
+            # Progress feedback
+            if show_progress:
+                print(f"  FTS upserted {total_inserted}/{len(rows)} chunks", file=sys.stderr, flush=True)
+
+        return total_inserted
 
     def delete_doc(self, doc_id: str) -> None:
         if not doc_id:

@@ -3544,15 +3544,47 @@ async def kb_neighbors(
 ) -> List[Dict[str, Any]]:
     if not chunk_id:
         return [{"error": "missing_chunk_id"}]
-    slug, collection_name, _ = _resolve_scope(collection)
-    fts_db_path = _get_fts_db_path(collection_name)
-    seed = {"id": chunk_id}
+
     subjects = get_subjects_from_context(ctx)
-    await _ensure_row_texts([seed], collection_name, subjects)
-    doc_id = seed.get("doc_id")
-    chunk_start = seed.get("chunk_start")
-    if doc_id is None or chunk_start is None:
-        return [{"error": "not_found"}]
+
+    # If collection specified, use it (current behavior)
+    if collection:
+        slug, collection_name, _ = _resolve_scope(collection)
+        fts_db_path = _get_fts_db_path(collection_name)
+        seed = {"id": chunk_id}
+        await _ensure_row_texts([seed], collection_name, subjects)
+        doc_id = seed.get("doc_id")
+        chunk_start = seed.get("chunk_start")
+        if doc_id is None or chunk_start is None:
+            return [{"error": "not_found"}]
+    else:
+        # Auto-discover: search all collections for the chunk_id
+        collection_name = None
+        slug = None
+        fts_db_path = None
+        seed = None
+
+        for scope_slug, scope_cfg in SCOPES.items():
+            coll = scope_cfg.get("collection")
+            if not coll:
+                continue
+
+            test_seed = {"id": chunk_id}
+            await _ensure_row_texts([test_seed], coll, subjects)
+
+            if test_seed.get("doc_id") is not None and test_seed.get("chunk_start") is not None:
+                # Found it!
+                collection_name = coll
+                slug = scope_slug
+                fts_db_path = _get_fts_db_path(collection_name)
+                seed = test_seed
+                break
+
+        if collection_name is None or seed is None:
+            return [{"error": "not_found_in_any_collection"}]
+
+        doc_id = seed.get("doc_id")
+        chunk_start = seed.get("chunk_start")
     neighbor_rows_raw = _fts_neighbors(str(doc_id), int(chunk_start), max(1, int(n)), fts_db_path=fts_db_path)
     rows: List[Dict[str, Any]] = []
     for raw in neighbor_rows_raw:
